@@ -1,3 +1,0 @@
-[runner] NODE: $(hostname)
-[runner] QUEUE_ROOT=$QUEUE_ROOT
-[runner] RUNNER_ID=$RUNNER_ID
