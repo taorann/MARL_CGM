@@ -1,0 +1,92 @@
+# Graph Planner 项目现状汇总
+
+本文件记录当前代码仓库的整体目标、已实现能力、仍需补齐的信息以及下一步建议，方便后续协作者快速了解进度并补全训练链路。
+> **2025-11-03 审核结论**：文中提到的关键模块（agents/env/runtime/integrations 等）均仍在仓库中；尚缺的部署信息依旧需要外部补全。
+
+
+
+## 项目实现目标
+
+Graph Planner 致力于复现 CGM + Planner 的双智能体代码修复流程：
+
+- **Planner 决策模型**：负责解析容器状态、维护记忆、检索代码子图，并在需要时调用补丁模型；能够基于 R2E/RepoEnv 任务进行多步决策。
+- **CGM 补丁模型**：在 Planner 指示下生成代码补丁；目前仓库保留了规则策略与 CGM 适配器的接口，方便在本地部署 CGM 时直接替换。
+- **强化学习训练**：通过 rLLM/VERL 的 PPO 管线对 Planner 模型进行 on-policy/online 训练，训练过程中可以接入真实容器（RepoEnv/R2E 数据集）。
+- **Rule-based 串联**：为了便于集成测试，规则策略仍可覆盖全部流程，确保在本地模型尚未接入时依旧能跑通完整链路并记录修复日志。
+
+## 当前已有的核心框架
+
+当前仓库已经落实以下框架与配套能力，确保“Planner + CGM” 双智能体流程可以在本地串联、在 rLLM 上训练，并通过规则策略兜底：
+
+1. **Graph Planner 统一包结构**（`graph_planner/`）
+   - `graph_planner.agents`：同时保留规则策略（`rule_based`）与本地模型策略（`model_based`），共享 `agents.common.text_protocol` 定义的 `<function=...>` 文本轨迹协议，方便替换决策模型。
+   - `graph_planner.env`：`PlannerEnv` 封装 R2E/RepoEnv 任务生命周期，负责动作解析、奖励计算与遥测输出。
+   - `graph_planner.runtime`：`SandboxRuntime` 负责在 RepoEnv 与纯 Docker 运行模式间切换，并统一将 lint/test 结果写入日志。【F:graph_planner/runtime/sandbox.py†L60-L276】
+
+2. **rLLM 训练集成**
+   - `graph_planner.integrations.rllm.agent.GraphPlannerRLLMAgent` 将环境观测整理成系统提示，解析模型输出的 `<function=...>` 区块，并在解析失败时回退到规则策略。
+   - `graph_planner.integrations.rllm.env.GraphPlannerRLLMEnv` 将 `PlannerEnv` 暴露给 rLLM，封装奖励、终止条件与 RepoEnv/Sandbox 初始化逻辑。
+   - `graph_planner.integrations.rllm.registry` + `graph_planner.infra.vendor.ensure_rllm_importable` 负责定位子模块 rLLM 并在 Hydra/Verl 注册 Graph Planner 自定义 agent/env。
+   - （重构中）新的训练 CLI 计划复用 `eval_graph_planner_engine.py` 的容器与模型编排逻辑，再接入 rLLM/VERL 执行 GRPO。
+
+3. **本地运行与冒烟测试脚手架**
+   - `scripts/run_eval_graph_planner.sh` + `scripts/eval_graph_planner_engine.py` 负责端到端评测，包含模型服务自动拉起、RepoEnv manifest 修复与 rLLM 执行流程，已取代旧版规则代理冒烟脚本。【F:scripts/run_eval_graph_planner.sh†L1-L31】【F:scripts/eval_graph_planner_engine.py†L468-L720】
+   - `tests/test_reward_manager_loading.py` 保留 rLLM 奖励管理器的加载兜底用例，确保在缺省配置下训练脚本仍能顺利启动；其他历史冒烟测试已迁移为文档中的手动命令。【F:tests/test_reward_manager_loading.py†L1-L45】
+
+4. **补丁生成与护栏**
+   - `graph_planner.agents.rule_based.cgm_adapter` 暴露 CGM 的统一接口，既可调用真实模型，也能在缺席时回退到规则补丁。
+   - `actor.cgm_local.generate` 为 rLLM/Verl 的纯本地兜底，实现不依赖 Ray RPC；在 vLLM 缺席时由 `CGMService` 直接调用，防止递归触发远端适配器。【F:actor/cgm_local.py†L1-L63】【F:rllm/verl/verl/workers/cgm_service.py†L74-L123】
+   - `aci.guard` 提供补丁护栏校验，确保 Planner 与 CGM 输出的 diff 满足安全约束。
+   - `aci` 工具链实现文件查看、编辑、lint/test 等基础能力，供 Sandbox 与训练流程复用。
+
+5. **文档与操作指南**
+   - `docs/graph_planner_architecture_pipeline.md` 汇总项目架构、模块职责以及 CGM/rLLM 训练运行 pipeline，其中包含最新的冒烟测试与训练脚本速查命令（参见第 4.3 节）。【F:docs/graph_planner_architecture_pipeline.md†L120-L214】
+   - `docs/scripts_and_tests_guide.md` 概述脚本入口、测试回归与 ACI/Git/Lint 实现来源。
+   - `README.md` 与本文件提供整体架构、配置方法与现状记录。
+
+## 尚需补齐的关键条件
+
+在当前代码基础上，要真正启动强化学习训练还缺少以下条件或信息：
+
+1. **依赖安装**
+   - `rllm`、`ray`、`r2egym` 等可选依赖未随仓库自动安装；若不提前装好，训练脚本会报 `ImportError`。
+   - 测试环境缺少 `pydantic` 会导致 `pytest` 失败，需要在真实环境中补齐。
+
+2. **容器运行环境**
+   - RepoEnv/R2E 后端需要可访问的 Docker 守护进程，本开发容器无法启用 Docker；实际训练需在具备 Docker 权限的主机上执行。
+   - 样例数据集仅包含演示条目，尚未准备大规模训练任务与对应镜像。
+
+3. **本地模型接入信息**
+   - `.aci/config.json` 中 `planner_model`、`cgm` 默认均为禁用状态，需要提供实际的本地部署端点、模型名、鉴权 token 等信息。
+   - 虽然仓库已预留 `models/Qwen3-14B/` 与 `models/CodeFuse-CGM/` 目录作为默认 checkpoint 路径，但仍需在这些目录内放入真实权重与 tokenizer 才能执行训练或推理。
+
+4. **数据与奖励配置**
+   - 尚未定义更多 RepoEnv/R2E 任务的奖励 shaping、终止条件调整等策略；如需与真实训练目标对齐，需要进一步扩充。
+
+## 建议的补齐步骤
+
+1. **环境准备**
+   - 在目标机器上安装 `rllm>=0.4`、`ray>=2.9`、`r2egym` 以及仓库所需的 Python 依赖；确认 `pytest` 可以在启用 `pydantic` 后成功运行。
+   - 启动 Docker 守护进程，并验证当前用户对 `/var/run/docker.sock` 具备访问权限。
+
+2. **数据与镜像就绪**
+   - 根据训练需求编写 RepoEnv/R2E JSONL 任务描述，并在 `datasets/` 目录下维护。
+   - 预先拉取或构建所有任务对应的 Docker 镜像，保证 `scripts/eval_graph_planner_engine.py` 在 RepoEnv 模式下能够顺利启动容器。
+   - 使用 `scripts/register_graphplanner_dataset.py` 将数据集注册到 rLLM/Verl，确认生成的 parquet 文件可被训练脚本读取。
+
+3. **模型服务配置**
+   - 将 Planner LLM、CGM 的本地推理服务端点填入 `.aci/config.json`（或使用环境变量覆盖），并确保接口遵循 OpenAI / CGM 适配器协议。
+   - 通过 `scripts/eval_graph_planner_engine.py --limit 1 --parallel 1` 配合单容器端口映射进行联调，确认模型输出合法的 `<function=...>` 块，补丁流程可走通。
+
+4. **训练启动**
+   - 将基础 checkpoint 拷贝至 `models/Qwen3-14B/`（以及需要的 `models/CodeFuse-CGM/`），脚本会自动使用这些路径作为默认模型目录。
+   - 根据评测需求编辑 `configs/eval/graph_planner_eval_defaults.yaml`（或使用自定义 YAML），再运行 `scripts/run_eval_graph_planner.sh`；训练入口将在 CLI 重构完成后补充。
+   - 在训练过程中关注 `logs/` 与 Ray dashboard，确保奖励、轨迹记录符合预期。
+
+## 缺失信息登记
+
+- Planner 模型及 CGM 的具体部署方式、接口鉴权信息（需项目维护者补充）。
+- 真实训练数据集的镜像地址、任务描述文件、奖励设计（目前仅有样例占位）。
+- 基础策略的 checkpoint 路径及模型规格（PPO 初始化所需）。
+
+当以上信息补齐后，可直接沿用现有脚本与模块完成端到端训练。

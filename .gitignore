@@ -1,0 +1,26 @@
+# ===== caches & tmp =====
+.cache/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# ===== experiment outputs =====
+outputs/
+wandb/
+logs/
+.aci/backups/
+.aci/subgraphs/
+
+# ===== big local models =====
+models/
+# 如果你想保留模型下面的说明文档，可以单独放开：
+# !models/**/README.md
+# !models/**/.gitattributes
+
+# ===== local configs (你要是只是本机测的就忽略) =====
+# configs/experiments/test1g.yaml
+
+# ===== local data notes (本机用就忽略) =====
+# datasets/swebench/test.jsonl
+# datasets/swebench/docker_images_test.txt

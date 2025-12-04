@@ -1,0 +1,83 @@
+# 工具与提示协议调研（Graph Planner vs. rLLM / R2E-Gym）
+
+## 1. Graph Planner 本地工具实现
+
+> **2025-11-03 审核结论**：表格中的工具实现均在 `graph_planner/` 目录下确认存在，可作为当前提示协议的唯一事实来源。
+
+| 组件 | 作用 | 关键实现 | 当前用途 |
+
+| --- | --- | --- | --- |
+| `graph_planner/core/actions.py` | 定义 Planner 可以下发的 5 类动作（explore/memory/repair/submit/noop），规定每类字段与默认值，是文本协议与环境之间的结构桥梁。 | `ExploreAction`/`MemoryAction`/`RepairAction`/`SubmitAction`/`NoopAction` 模型约束了工具调用所需的 anchors、memory target/scope/intent、plan 等字段。【F:graph_planner/core/actions.py†L1-L40】 | Planner 环境根据动作类型分派到扩展、记忆维护、CGM 修复、提交或显式空操作。 |
+| `graph_planner/memory/anchor_planner.py` | 规则策略使用的锚点/术语/跳数建议器，直接解析 observation pack 并输出 `anchors`、`terms`、`hop` 与 `should_expand`。 | `propose(observation_pack)` 根据 failure frame、issue 文本与 token 预算裁剪 anchors/terms，并在子图稀疏或 tokens 紧张时收紧 hop。【F:graph_planner/memory/anchor_planner.py†L1-L212】 | `PlannerAgent` 与 rLLM 环境在“扩展”阶段复用该启发式，作为本地/远程模型缺席时的兜底策略。 |
+| `graph_planner/agents/rule_based/planner.py` | 规则版 Planner 的状态机入口，封装 expand→memory→read→plan→submit 的流程。 | `_act_expand/_act_read/_act_repair` 调用 `anchor_planner`、`subgraph_store` 与 `cgm_adapter`，在修复失败时回退到重新扩展。【F:graph_planner/agents/rule_based/planner.py†L1-L210】 | 评测脚本及回退逻辑直接使用该代理，替代早期拆散的工具选择/调度模块。 |
+| `graph_planner/env/planner_env.py` | 运行时容器交互层，负责解析动作、执行 Sandbox 操作并回传 Observation。 | `_handle_repair` 先尝试直接应用 Planner 自带 patch，否则构造 `RepairRuntimeState` 调用文本协议修复链，最终把结果合并进 observation。【F:graph_planner/env/planner_env.py†L246-L305】 | 训练与评测时唯一的环境实现，向 rLLM 暴露 `BaseEnv` 接口。 |
+
+## 2. 文本工具调用格式
+
+### 2.1 动作执行映射一览
+
+#### 2.1.1 工具实现文件速查
+
+| 动作 | 数据类定义 | 环境入口 | 依赖工具/模块 | 实现状态 |
+| --- | --- | --- | --- | --- |
+| `explore` | `graph_planner/core/actions.py` → `ExploreAction`【F:graph_planner/core/actions.py†L1-L40】 | `graph_planner/env/planner_env.py` → `_handle_explore`【F:graph_planner/env/planner_env.py†L97-L169】 | `graph_planner/memory/mem_candidates.py`（候选生成）、`graph_planner/memory/graph_adapter.py`（1-hop 扩展与锚点解析）、`graph_planner/runtime/sandbox.py`（读取 repo 内代码片段）【F:graph_planner/memory/mem_candidates.py†L1-L200】【F:graph_planner/memory/graph_adapter.py†L1-L149】【F:graph_planner/runtime/sandbox.py†L60-L214】 | ✅ 已实现，可根据 anchors 与 budget 选择 `find`/`expand`/`read`。 |
+| `memory` | `MemoryAction`【F:graph_planner/core/actions.py†L42-L74】 | `_handle_memory`【F:graph_planner/env/planner_env.py†L214-L241】 | `graph_planner/memory/text_memory.py`（`memory_commit`/`memory_delete`、配额估算）【F:graph_planner/memory/text_memory.py†L1-L407】 | ✅ 已实现，支持 explore/observation 目标、turn/session scope 与 over-budget 拒绝。 |
+| `repair` | `RepairAction`【F:graph_planner/core/actions.py†L76-L118】 | `_handle_repair`【F:graph_planner/env/planner_env.py†L246-L305】 | `graph_planner/agents/common/text_protocol.py`（`handle_planner_repair`、CGM payload）【F:graph_planner/agents/common/text_protocol.py†L148-L396】；`graph_planner/agents/rule_based/cgm_adapter.py`（本地 CGM 客户端）【F:graph_planner/agents/rule_based/cgm_adapter.py†L1-L358】 | ✅ 已实现，Planner 只写 subplan，CGM 生成统一 diff 并可自动测试。 |
+| `submit` | `SubmitAction`【F:graph_planner/core/actions.py†L120-L150】 | `_handle_submit`【F:graph_planner/env/planner_env.py†L306-L309】 | `graph_planner/runtime/sandbox.py` 的 `SandboxRuntime.test/get_patch` 负责运行容器内测试并收集最终 diff。【F:graph_planner/runtime/sandbox.py†L210-L276】 | ✅ 已实现，负责最终测试与 episode 结束。 |
+| `noop` | `NoopAction`【F:graph_planner/core/actions.py†L152-L170】 | `PlannerEnv.step` 顶层判断【F:graph_planner/env/planner_env.py†L61-L95】 | 无（直接回传空 observation） | ✅ 已实现，允许模型显式跳过操作。 |
+
+| 动作 | 触发位置 | 环境/实现 | 说明 |
+| --- | --- | --- | --- |
+| `explore` | Planner 输出 `<function=explore>`；`LocalLLMPlannerAgent._parse_model_response` 解析为 `ExploreAction`。 | `PlannerEnv._handle_explore` 调用锚点扩展、图检索与 snippet 读取。【F:graph_planner/agents/model_based/planner.py†L149-L183】【F:graph_planner/agents/common/chat.py†L106-L123】【F:graph_planner/env/planner_env.py†L97-L169】 | 已实现；支持 `find`/`expand`/`read` 三种 `op`。 |
+| `memory` | `<function=memory>`；解析为 `MemoryAction`。 | `text_memory.memory_commit`/`memory_delete` 根据 target/scope/intent 处理探索候选或工具 observation，`PlannerEnv._handle_memory` 负责调用并持久化子图/文本记忆。【F:graph_planner/memory/text_memory.py†L1-L407】【F:graph_planner/env/planner_env.py†L214-L241】 | 已实现；支持 over-budget 拒绝、commit/delete 版本号递增。 |
+| `repair` | `<function=repair>`；解析为 `RepairAction`。 | `_handle_repair` 若带 patch 则直接应用，否则调用 `text_protocol.handle_planner_repair` → CGM 修复链。【F:graph_planner/env/planner_env.py†L246-L305】 | 已实现；遵循统一 diff 与 Sandbox 测试流程。 |
+| `submit` | `<function=submit>`；解析为 `SubmitAction`。 | `_handle_submit` 运行测试并返回终局结果。【F:graph_planner/env/planner_env.py†L306-L309】 | 已实现；触发奖励与 episode 结束。 |
+| `noop` | `<function=noop>`；解析为 `NoopAction`。【F:graph_planner/agents/common/contracts.py†L337-L341】【F:graph_planner/agents/common/chat.py†L123-L151】 | `PlannerEnv.step` 识别 `NoopAction` 并返回 {"kind": "noop"}，不上链任何容器操作。【F:graph_planner/env/planner_env.py†L61-L95】 | 新增显式空操作，便于模型放弃本轮动作且保持协议一致。 |
+Graph Planner 约定 **单回合仅一个 `<function=...>` 块**，内含多段 `<param>`。`parse_action_block` 会验证起止标签、参数唯一性与合法动作名，一旦违规便抛出带错误码的 `ProtocolError`；`format_action_block` 用于 fallback 再输出同样的文本协议。【F:graph_planner/agents/common/contracts.py†L193-L343】【F:graph_planner/agents/common/text_protocol.py†L37-L54】
+
+Planner 将环境 observation 包装成 `<observation for="{name}">{...JSON...}</observation>`，下一轮模型可直接读取；这一封装由 `emit_observation` 统一实现。【F:graph_planner/agents/common/text_protocol.py†L275-L279】
+
+## 3. 模型提示模板与输出契约
+
+我们用 `PromptContract` 聚合 system prompt、用户分区与响应约定。`PLANNER_CONTRACT` 现要求模型回复单个 `<function=...>` 区块，并给出 `<param name="thought">`、`subplan`（CDATA 包裹）、`focus_ids` 等键；`CGM_CONTRACT` 仍约束补丁响应须包含 `patch.edits[{path,start,end,new_text}]` 等字段。【F:graph_planner/agents/common/contracts.py†L1-L394】
+
+这些常量被 Planner 聊天客户端和 CGM 生成器共享，运行时解析与回包验证直接依赖 `parse_action_block`、`validate_planner_action`、`validate_cgm_patch`，确保训练/推理与文档一致。【F:graph_planner/agents/common/contracts.py†L1-L394】
+
+## 4. CGM 修复链路契约
+
+当 Planner 触发 `repair`，`handle_planner_repair` 会：
+
+1. 校验 `subplan` 非空，标准化 `focus_ids`、`apply`。【F:graph_planner/agents/common/contracts.py†L324-L335】【F:graph_planner/agents/common/text_protocol.py†L331-L355】
+2. `build_cgm_payload` 裁剪子图节点、记忆与关联文件，生成 `plan` 步骤列表，并附带 `constraints.one_file_per_patch=true`。【F:graph_planner/agents/common/text_protocol.py†L148-L170】
+3. 调用 CGM，挑选最高置信度候选。【F:graph_planner/agents/common/text_protocol.py†L174-L188】
+4. `validate_unified_diff` 确认 diff 仅涉及单个文件且包含至少一个 hunk。【F:graph_planner/agents/common/text_protocol.py†L190-L236】
+5. 如 `apply=true`，`try_apply_and_test` 会调用 Sandbox 补丁/重置/测试/Lint，并封装结果 JSON，失败阶段写入 `error`。【F:graph_planner/agents/common/text_protocol.py†L242-L396】
+
+环境侧在 `_handle_repair` 中构造 `RepairRuntimeState`，并把结果写回信息字典，从而与奖励、观测打通。【F:graph_planner/env/planner_env.py†L286-L304】
+
+## 5. 与 rLLM 工具协议的异同
+
+rLLM 默认的 `ToolAgent` 依赖 `ToolParser` 解析模型输出中的 **函数调用 JSON**：模型需生成 `function` 名称与 `arguments` JSON；解析失败会降级成 `finish` 工具调用。【F:graph_planner/rllm/rllm/agents/tool_agent.py†L17-L147】
+
+`ToolParser` 的具体子类（如 `QwenToolParser`/`R1ToolParser`）识别特殊 token 或 ```json``` 片段，从而还原工具参数结构，与我们的单块 `<function=...>` 协议不同，但同样强调“动作必须合法+参数 JSON 解析”。【F:graph_planner/rllm/rllm/parser/tool_parser.py†L1-L160】
+
+两者共同点：
+- 都将合法动作集写死在解析阶段（我们用 `allowed` 集合，rLLM 用 tool schema）。
+- 都会在解析失败时快速失败或降级，避免模型输出污染环境。
+
+差异：
+- Graph Planner 用单块文本标签，更易人工调试；rLLM 依赖模型内置的函数调用 token，利于 OpenAI/Qwen 等兼容。
+- 我们的观测返回 `<observation>` 字符串，而 rLLM `ToolEnvironment` 直接返回 `tool_outputs` dict，由引擎拼成对话消息。【F:graph_planner/rllm/rllm/agents/tool_agent.py†L63-L141】
+
+## 6. 与 R2E-Gym Prompt 的对比
+
+R2E-Gym 的编辑代理配置以 YAML 描述 system/user prompt，并强制“每次回复都要携带函数调用”，强调脚本化 reproduce 步骤与最少修改原则。例如 `edit_fn_calling.yaml` 将 GitHub issue 嵌入 `<github_issue>` 标签，并反复提醒“每轮必须输出 function call”。【F:graph_planner/R2E-Gym/src/r2egym/agenthub/config/r2egym/edit_fn_calling.yaml†L1-L45】
+
+我们的 `PromptContract` 要求 `<function=...>` 文本轨迹，由环境决定是否触发工具；Planner 如果暂时无操作，可输出 `<function=noop></function>` 走空操作。R2E-Gym 更偏向函数调用框架（类似 rLLM ToolAgent），而 Graph Planner 采用轻量文本协议，方便在 CGM 修复管线中插入统一 diff 校验与 Sandbox 回滚。
+
+## 7. 可复用与待留意项
+
+* **可共用理念**：三套体系都把“工具 schema + 严格解析”作为守门人，可互相借鉴；若未来迁移到 rLLM ToolAgent，只需把 `<function>` 协议映射到 `ToolCall` JSON。
+* **提示差异**：R2E-Gym/rLLM 都强调多轮 reasoning + function call，我们在 `PLANNER_CONTRACT` 中同样要求 `thought` 字段，可以吸收其“强制工具调用”策略作为训练约束。
+* **输出契约**：Graph Planner 通过 `CGM_CONTRACT` 与 `validate_unified_diff` 限制单文件补丁，避免模型生成多文件 diff；这与 R2E-Gym 直接允许多工具编辑的策略不同，需要在后续文档中继续强调。
+
