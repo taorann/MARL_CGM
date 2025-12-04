@@ -45,6 +45,8 @@ swe_proxy.py
 稳定映射到某一个 runner（例如 gp-00 / gp-01 / ...）。
 """
 
+import os
+import sys
 import json
 import os
 import sys
@@ -167,8 +169,15 @@ def main() -> int:
     # 多 runner 数量（与 Slurm 启动的 runner 数量保持一致）
     num_runners = int(os.environ.get("GP_NUM_RUNNERS", "1"))
 
+    # 3. 构造 ApptainerQueueRuntime
     queue_root = Path.home() / "gp_queue"
     sif_dir = Path.home() / "sif" / "sweb"
+
+    num_runners_env = os.environ.get("GP_NUM_RUNNERS", "1") or "1"
+    try:
+        num_runners = int(num_runners_env)
+    except ValueError:
+        num_runners = 1
 
     aq = ApptainerQueueRuntime(
         queue_root=queue_root,

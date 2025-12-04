@@ -147,6 +147,12 @@ def _build_sandbox_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     if getattr(args, "sandbox_force_docker_backend", False):
         overrides["force_docker_backend"] = True
         overrides.setdefault("backend", "docker")
+    parallel = getattr(args, "parallel", None)
+    if parallel is not None:
+        try:
+            overrides["num_runners"] = int(parallel)
+        except Exception:
+            pass
     return overrides
 
 
