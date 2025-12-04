@@ -13,6 +13,7 @@ from ..infra import telemetry as telemetry_mod
 
 from .apptainer_queue_runtime import ApptainerQueueRuntime
 from .queue_protocol import ExecResult
+from .remote_swe_session import RemoteSweSession
 
 # R2E 组件（可选）
 try:
@@ -42,7 +43,7 @@ class SandboxConfig:
     pytest_cache_root: Optional[str] = None
     commit_hash: Optional[str] = None
     # 统一后端切换：
-    backend: str = "auto"            # "auto" | "r2e" | "repoenv" | "docker" | "apptainer_queue"
+    backend: str = "auto"            # "auto" | "r2e" | "repoenv" | "docker" | "apptainer_queue" | "remote_swe"
     r2e_ds_json: Optional[str] = None  # 指向一个 JSON 文件，内容是 r2e 期望的 ds dict
     requires_build: bool = False       # SWE-bench 元数据：提示容器是否需要 build
     swebench_spec: Optional[Dict[str, Any]] = None  # 透传 swe-bench 的构建脚本信息
@@ -51,6 +52,12 @@ class SandboxConfig:
     queue_root: Optional[str] = None
     sif_dir: Optional[str] = None
     num_runners: int = 1
+    # remote_swe 后端所需配置（跨机 ssh 到 login24）
+    ssh_target: Optional[str] = None
+    remote_repo: Optional[str] = None
+    remote_python: Optional[str] = None
+    swe_proxy_path: Optional[str] = None
+    runner_manager_path: Optional[str] = None
 
 class SandboxRuntime:
     """
@@ -76,6 +83,7 @@ class SandboxRuntime:
 
         self._env = None  # only populated when using RepoEnv as the backend
         self._aq: Optional[ApptainerQueueRuntime] = None
+        self._remote: Optional[RemoteSweSession] = None
 
         if self._mode == "repoenv":
             try:
@@ -88,6 +96,8 @@ class SandboxRuntime:
             self._init_r2e_backend()
         elif self._mode == "apptainer_queue":
             self._init_apptainer_backend()
+        elif self._mode == "remote_swe":
+            self._init_remote_swe_backend()
         else:
             self._init_docker_backend()
         self._exposed_ports: List[Dict[str, Any]] = getattr(self, "_exposed_ports", [])
@@ -181,6 +191,28 @@ class SandboxRuntime:
         )
         self.workdir = cfg.workdir or "."
         _dbg(f"apptainer_queue backend initialized: workdir={self.workdir!r}")
+
+    def _init_remote_swe_backend(self) -> None:
+        cfg = self.cfg
+        if not cfg.ssh_target or not cfg.remote_repo:
+            raise ValueError("backend='remote_swe' requires ssh_target and remote_repo.")
+        num_runners = int(cfg.num_runners or 1)
+        self._remote = RemoteSweSession(
+            ssh_target=cfg.ssh_target,
+            remote_repo=os.path.expanduser(cfg.remote_repo),
+            image=cfg.docker_image,
+            run_id=self.run_id,
+            remote_python=cfg.remote_python or "python",
+            swe_proxy_path=cfg.swe_proxy_path or "hpc/swe_proxy.py",
+            runner_manager_path=cfg.runner_manager_path or "hpc/ensure_runners.py",
+            num_runners=num_runners,
+            ensure_runners=True,
+        )
+        self.workdir = cfg.workdir or "/testbed"
+        _dbg(
+            f"remote_swe backend initialized: ssh={cfg.ssh_target!r}, "
+            f"repo={cfg.remote_repo!r}, workdir={self.workdir!r}, num_runners={num_runners}"
+        )
 
     # ---------- backend: docker-py（自管容器） ----------
     def _init_docker_backend(self):
@@ -276,6 +308,18 @@ class SandboxRuntime:
 
     # ---------- 通用执行 ----------
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
+        if self._mode == "remote_swe":
+            assert self._remote is not None, "remote_swe backend not initialized"
+            self._remote.start(timeout=timeout)
+            resp = self._remote.exec(
+                cmd,
+                timeout=float(timeout),
+                env=self.cfg.env,
+                cwd=self.workdir,
+            )
+            out = (resp.get("stdout") or "") + (resp.get("stderr") or "")
+            rc = int(resp.get("returncode", 0))
+            return out, rc
         if self._mode == "apptainer_queue":
             q = "'" + cmd.replace("'", "'\"'\"'") + "'"
             exec_cmd = ["bash", "-lc", q]
@@ -448,6 +492,13 @@ class SandboxRuntime:
                     pass
                 self._env = None
             self._rt = None
+        elif self._mode == "remote_swe":
+            try:
+                if self._remote:
+                    self._remote.stop()
+            except Exception:
+                pass
+            self._remote = None
         elif self._mode == "apptainer_queue":
             self._aq = None
         else:

@@ -11,6 +11,7 @@
   - 其他/缺省: 一次性 exec（老行为）
 """
 
+import os
 import sys
 import json
 from pathlib import Path
@@ -45,14 +46,20 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": "missing 'image' in request"}))
         return 1
 
-    # 3. 构造 ApptainerQueueRuntime（和 test_local_aq 保持一致）
+    # 3. 构造 ApptainerQueueRuntime
     queue_root = Path.home() / "gp_queue"
     sif_dir = Path.home() / "sif/sweb"
+
+    num_runners_env = os.environ.get("GP_NUM_RUNNERS", "1") or "1"
+    try:
+        num_runners = int(num_runners_env)
+    except ValueError:
+        num_runners = 1
 
     aq = ApptainerQueueRuntime(
         queue_root=queue_root,
         sif_dir=sif_dir,
-        num_runners=1,
+        num_runners=num_runners,
         default_timeout_sec=timeout,
     )
 
