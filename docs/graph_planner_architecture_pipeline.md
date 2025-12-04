@@ -332,6 +332,7 @@ R2E-Gym 本身提供了 RepoEnv 环境、动作解析与容器运行时等通用
 > 
 
 ## 7. 曙光--北极星容器控制流
+```
 曙光命令行
    └── scripts/run_eval_graph_planner.sh
          └── eval_graph_planner_engine.py（解析 --parallel）
@@ -344,4 +345,5 @@ R2E-Gym 本身提供了 RepoEnv 环境、动作解析与容器运行时等通用
                                             └── ApptainerQueueRuntime(num_runners)
                                                   └── 把不同 run_id 分配给 runner-0..runner-(num_runners-1)
                                                         └── 每个 runner 维护一个长期容器 instance（gp-XX）
+```
 
