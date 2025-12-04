@@ -329,3 +329,19 @@ R2E-Gym 本身提供了 RepoEnv 环境、动作解析与容器运行时等通用
 - `ensure_rllm_importable()` 在导入 rLLM 前会自动调整 `sys.path` 并验证子模块结构；如遇导入失败可检查环境变量 `GRAPH_PLANNER_RLLM_PATH`。【F:graph_planner/infra/vendor.py†L1-L86】
 
 > **Update history**: 本文整合了原 `cgm_rllm_pipeline.md`、`r2e_gym_code_overview.md`、`r2e_training_pipeline.md`、`rllm_integration_report.md` 的内容，并加入最新的本地 LLM、CGM 训练与 rLLM 配置指引。
+> 
+
+## 7. 曙光--北极星容器控制流
+曙光命令行
+   └── scripts/run_eval_graph_planner.sh
+         └── eval_graph_planner_engine.py（解析 --parallel）
+               └── sandbox.overrides["num_runners"] = parallel
+                     └── SandboxConfig(num_runners)
+                           └── SandboxRuntime(backend="remote_swe")
+                                 └── RemoteSweSession(num_runners)
+                                       ├── ssh 调 hpc/ensure_runners.py --target=num_runners
+                                       └── ssh 调 hpc/swe_proxy.py（带 env: GP_NUM_RUNNERS=num_runners）
+                                            └── ApptainerQueueRuntime(num_runners)
+                                                  └── 把不同 run_id 分配给 runner-0..runner-(num_runners-1)
+                                                        └── 每个 runner 维护一个长期容器 instance（gp-XX）
+
