@@ -53,6 +53,7 @@ def _submit_runner(
     runner_script: Path,
     name_prefix: str = _DEF_NAME_PREFIX,
     partition: str | None = None,
+    qos: str | None = None,
 ) -> None:
     """Submit a runner job with the given runner ID."""
     runner_script = runner_script.expanduser().resolve()
@@ -66,6 +67,10 @@ def _submit_runner(
     # If a partition is provided, override the script's default #SBATCH partition.
     if partition:
         cmd.extend(["-p", partition])
+
+    # If a QoS is provided, override the script's default #SBATCH QoS.
+    if qos:
+        cmd.extend(["--qos", qos])
 
     cmd.extend(
         [
@@ -110,6 +115,15 @@ def main() -> None:
             "(currently '#SBATCH -p cn_nl')."
         ),
     )
+    parser.add_argument(
+        "--qos",
+        type=str,
+        default=None,
+        help=(
+            "Override Slurm QOS (--qos=...) for runner jobs. "
+            "If not set, use the QOS specified in the runner script."
+        ),
+    )
     args = parser.parse_args()
 
     target = int(args.target)
@@ -122,6 +136,9 @@ def main() -> None:
 
     # Partition precedence: CLI flag > RUNNER_PARTITION env var > script default.
     partition = args.partition or os.environ.get("RUNNER_PARTITION")
+
+    # QoS precedence: CLI flag > RUNNER_QOS env var > script default.
+    qos = args.qos or os.environ.get("RUNNER_QOS")
 
     existing_ids = _parse_existing_runner_ids(name_prefix=name_prefix)
     current = len(existing_ids)
@@ -145,6 +162,7 @@ def main() -> None:
             runner_script,
             name_prefix=name_prefix,
             partition=partition,
+            qos=qos,
         )
 
     print("[ensure_runners] Done submitting missing runners.")
