@@ -48,20 +48,39 @@ def _parse_existing_runner_ids(name_prefix: str = _DEF_NAME_PREFIX) -> Set[int]:
     return ids
 
 
-def _submit_runner(runner_id: int, runner_script: Path, name_prefix: str = _DEF_NAME_PREFIX) -> None:
+def _submit_runner(
+    runner_id: int,
+    runner_script: Path,
+    name_prefix: str = _DEF_NAME_PREFIX,
+    partition: str | None = None,
+    qos: str | None = None,
+) -> None:
     """Submit a runner job with the given runner ID."""
     runner_script = runner_script.expanduser().resolve()
     if not runner_script.exists():
         raise SystemExit(f"[ensure_runners] runner script not found: {runner_script}")
 
     job_name = f"{name_prefix}{runner_id}"
-    cmd = [
-        "sbatch",
-        "-J",
-        job_name,
-        "--export=ALL,RUNNER_ID={}".format(runner_id),
-        str(runner_script),
-    ]
+
+    cmd: list[str] = ["sbatch"]
+
+    # If a partition is provided, override the script's default #SBATCH partition.
+    if partition:
+        cmd.extend(["-p", partition])
+
+    # If a QoS is provided, override the script's default #SBATCH QoS.
+    if qos:
+        cmd.extend(["--qos", qos])
+
+    cmd.extend(
+        [
+            "-J",
+            job_name,
+            f"--export=ALL,RUNNER_ID={runner_id}",
+            str(runner_script),
+        ]
+    )
+
     print(f"[ensure_runners] Submitting runner RID={runner_id}: {' '.join(cmd)}")
     proc = subprocess.run(cmd, text=True, capture_output=True)
     if proc.returncode != 0:
@@ -86,6 +105,25 @@ def main() -> None:
         default=_DEF_NAME_PREFIX,
         help="Job name prefix used to identify runner jobs.",
     )
+    parser.add_argument(
+        "--partition",
+        type=str,
+        default=None,
+        help=(
+            "Override Slurm partition (-p) for runner jobs. "
+            "If not set, use the partition specified in the runner script "
+            "(currently '#SBATCH -p cn_nl')."
+        ),
+    )
+    parser.add_argument(
+        "--qos",
+        type=str,
+        default=None,
+        help=(
+            "Override Slurm QOS (--qos=...) for runner jobs. "
+            "If not set, use the QOS specified in the runner script."
+        ),
+    )
     args = parser.parse_args()
 
     target = int(args.target)
@@ -95,6 +133,12 @@ def main() -> None:
 
     runner_script = Path(args.runner_script)
     name_prefix = str(args.name_prefix)
+
+    # Partition precedence: CLI flag > RUNNER_PARTITION env var > script default.
+    partition = args.partition or os.environ.get("RUNNER_PARTITION")
+
+    # QoS precedence: CLI flag > RUNNER_QOS env var > script default.
+    qos = args.qos or os.environ.get("RUNNER_QOS")
 
     existing_ids = _parse_existing_runner_ids(name_prefix=name_prefix)
     current = len(existing_ids)
@@ -113,7 +157,13 @@ def main() -> None:
         rid += 1
 
     for rid in candidates:
-        _submit_runner(rid, runner_script, name_prefix=name_prefix)
+        _submit_runner(
+            rid,
+            runner_script,
+            name_prefix=name_prefix,
+            partition=partition,
+            qos=qos,
+        )
 
     print("[ensure_runners] Done submitting missing runners.")
 
