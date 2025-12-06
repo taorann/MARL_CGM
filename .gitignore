@@ -18,9 +18,16 @@ models/
 # !models/**/README.md
 # !models/**/.gitattributes
 
-# ===== local configs (你要是只是本机测的就忽略) =====
-# configs/experiments/test1g.yaml
+# ===== local datasets =====
+# 默认忽略 datasets 下所有内容
+datasets/*
 
-# ===== local data notes (本机用就忽略) =====
-# datasets/swebench/test.jsonl
-# datasets/swebench/docker_images_test.txt
+# 但允许继续遍历子目录
+!datasets/**/
+
+# 只跟踪各处的 split jsonl，其它数据文件都不进 Git
+!datasets/**/test.jsonl
+!datasets/**/val.jsonl
+!datasets/**/eval.jsonl
+
+
