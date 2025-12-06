@@ -139,20 +139,45 @@ def _parse_port_forward_spec(spec: str) -> Dict[str, Any]:
 
 def _build_sandbox_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     overrides: Dict[str, Any] = {}
-    port_specs: List[Dict[str, Any]] = getattr(args, "sandbox_port_forwardings", []) or []
+
+    # === 新增：全局 backend / ssh / repo 覆盖 ===
+    sandbox_backend = getattr(args, "sandbox_backend", None)
+    sandbox_ssh_target = getattr(args, "sandbox_ssh_target", None)
+    sandbox_remote_repo = getattr(args, "sandbox_remote_repo", None)
+
+    # === 端口转发（只对 docker 有意义） ===
+    # 说明：这里用的是 parser 中 dest=... 的名字，如果你原来叫 sandbox_port_forwardings，
+    # 就把下面的 "sandbox_port_forward" 改回你原来的名字即可。
+    port_specs: List[Dict[str, Any]] = getattr(args, "sandbox_port_forward", []) or []
     if port_specs:
         overrides["port_forwards"] = port_specs
-        overrides["force_docker_backend"] = True
-        overrides.setdefault("backend", "docker")
+        # 若用户没有显式指定非 docker backend，则自动切 docker
+        if not sandbox_backend or sandbox_backend == "docker":
+            overrides["force_docker_backend"] = True
+            overrides.setdefault("backend", "docker")
+
+    # 显式 --sandbox-force-docker-backend：同样只在 backend 未指定或为 docker 时生效
     if getattr(args, "sandbox_force_docker_backend", False):
-        overrides["force_docker_backend"] = True
-        overrides.setdefault("backend", "docker")
+        if not sandbox_backend or sandbox_backend == "docker":
+            overrides["force_docker_backend"] = True
+            overrides.setdefault("backend", "docker")
+
+    # === 并行度 → num_runners（给 remote_swe / apptainer_queue 用） ===
     parallel = getattr(args, "parallel", None)
     if parallel is not None:
         try:
             overrides["num_runners"] = int(parallel)
         except Exception:
             pass
+
+    # === 新增：backend / ssh_target / remote_repo 的统一覆盖 ===
+    if sandbox_backend:
+        overrides["backend"] = sandbox_backend
+    if sandbox_ssh_target:
+        overrides["ssh_target"] = sandbox_ssh_target
+    if sandbox_remote_repo:
+        overrides["remote_repo"] = sandbox_remote_repo
+
     return overrides
 
 
@@ -957,6 +982,32 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--sandbox-backend",
+        default=None,
+        choices=["auto", "r2e", "repoenv", "docker", "apptainer_queue", "remote_swe"],
+        help=(
+            "Override sandbox backend for all tasks. "
+            "If set, this value replaces the 'backend' field in each task's sandbox config."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-ssh-target",
+        default=None,
+        help=(
+            "SSH target (e.g. 'user@login24') for the remote_swe backend. "
+            "If set, overrides the 'ssh_target' field in each task's sandbox config."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-remote-repo",
+        default=None,
+        help=(
+            'Remote repo path on the SSH host for the remote_swe backend '
+            "(e.g. '/appsnew/home/.../MARL_CGM'). "
+            "If set, overrides the 'remote_repo' field in each task's sandbox config."
+        ),
+    )
+    parser.add_argument(
         "--sandbox-force-docker-backend",
         action="store_true",
         help=(
@@ -1037,6 +1088,7 @@ def _parse_args() -> argparse.Namespace:
         except ValueError as exc:
             raise SystemExit(f"Invalid --sandbox-port-forward value {spec!r}: {exc}") from exc
     args.sandbox_port_forwardings = port_forwardings
+    args.sandbox_port_forward = port_forwardings
 
     missing = [field for field in ("dataset", "planner_model", "cgm_model_path") if getattr(args, field) is None]
     if missing:
