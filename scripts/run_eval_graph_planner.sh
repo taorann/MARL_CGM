@@ -10,6 +10,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_CONFIG="${ROOT_DIR}/configs/eval/graph_planner_eval_defaults.yaml"
 
+# ======== remote_swe backend configuration ========
+SSH_TARGET="chongbin_cls@login24"
+REMOTE_REPO="/appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM"
+# ==================================================
+
 CONFIG_FLAG_PRESENT=0
 for arg in "$@"; do
   if [[ "$arg" == --config || "$arg" == --config=* ]]; then
@@ -28,4 +33,8 @@ fi
 
 PYTHONPATH="${PYTHONPATH:-${ROOT_DIR}}" \
 TOKENIZERS_PARALLELISM="false" \
-python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" "$@"
+python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" \
+  "$@" \
+  --sandbox-backend remote_swe \
+  --sandbox-ssh-target "${SSH_TARGET}" \
+  --sandbox-remote-repo "${REMOTE_REPO}"
