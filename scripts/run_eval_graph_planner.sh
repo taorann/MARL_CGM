@@ -34,7 +34,4 @@ fi
 PYTHONPATH="${PYTHONPATH:-${ROOT_DIR}}" \
 TOKENIZERS_PARALLELISM="false" \
 python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" \
-  "$@" \
-  --sandbox-backend remote_swe \
-  --sandbox-ssh-target "${SSH_TARGET}" \
-  --sandbox-remote-repo "${REMOTE_REPO}"
+  "$@"
