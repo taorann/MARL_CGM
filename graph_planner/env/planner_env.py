@@ -7,6 +7,13 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from types import SimpleNamespace
 
+DEBUG = bool(os.environ.get("DEBUG"))
+
+
+def _dbg(msg: str) -> None:
+    if DEBUG:
+        print(f"[planner_env] {msg}")
+
 from difflib import unified_diff
 
 try:  # pragma: no cover - optional runtime dependency
@@ -224,6 +231,15 @@ class PlannerEnv:
                 raise
         else:
             action_obj = action
+
+        # 这里已经有规范化后的 action_obj 了
+        try:
+            a_type = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
+            a_dict = getattr(action_obj, "__dict__", {}) or {}
+        except Exception:
+            a_type = None
+            a_dict = {}
+        _dbg(f"step: action_type={a_type}, action={a_dict}")
             if self._strict_io:
                 try:
                     payload = self._serialise_action_for_validation(action_obj)
@@ -291,6 +307,20 @@ class PlannerEnv:
     # ------------------------------------------------------------------
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "explore", "op": act.op}
+        node = None
+        try:
+            node = self._resolve_node(act)  # type: ignore[arg-type]
+        except Exception:
+            node = None
+        if node is None and getattr(act, "nodes", None):
+            try:
+                node = self._resolve_node(act.nodes[0])
+            except Exception:
+                node = None
+        if node is not None:
+            _dbg(
+                f"_handle_explore: node_id={getattr(node, 'id', None) or node.get('id')} path={node.get('path')}"
+            )
 
         if act.op == "find":
             nodes: List[Dict[str, Any]] = []
@@ -577,6 +607,10 @@ class PlannerEnv:
         pad = 3
         start0 = max(1, start - pad)
         end0 = end + pad
+        _dbg(
+            f"_read_node_snippet: path={path}, span={span}, "
+            f"start0={start0}, end0={end0}"
+        )
 
         payload = json.dumps(
             {
@@ -605,7 +639,9 @@ class PlannerEnv:
             "print(json.dumps({'path': str(path), 'start': start, 'end': min(end, len(text)), 'snippet': snippet}))\n"
             "PY"
         )
+        _dbg("[_read_node_snippet] invoking sandbox.run(...)")
         out, rc = self.box.run(script, timeout=30)
+        _dbg(f"[_read_node_snippet] sandbox.run rc={rc}, out_head={repr(out[:200])}")
         if rc != 0:
             return None
         try:
