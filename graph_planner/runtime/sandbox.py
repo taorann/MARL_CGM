@@ -310,7 +310,8 @@ class SandboxRuntime:
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         if self._mode == "remote_swe":
             assert self._remote is not None, "remote_swe backend not initialized"
-            self._remote.start(timeout=timeout)
+            start_timeout = max(float(timeout), 300.0)
+            self._remote.start(timeout=start_timeout)
             resp = self._remote.exec(
                 cmd,
                 timeout=float(timeout),

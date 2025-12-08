@@ -72,10 +72,15 @@ class RemoteSweSession:
         if not self.ensure_runners or self.num_runners <= 0 or self._runners_ensured:
             return
 
-        cd_cmd = f"cd {shlex.quote(self.remote_repo)}"
+        repo = shlex.quote(self.remote_repo)
+        cd_cmd = f"cd {repo}"
         py = shlex.quote(self.remote_python or "python")
         manager = shlex.quote(self.runner_manager_path or "hpc/ensure_runners.py")
-        remote_cmd = f"{cd_cmd} && {py} {manager} --target {int(self.num_runners)}"
+        env_prefix = (
+            f"GP_NUM_RUNNERS={int(self.num_runners)} "
+            f"PYTHONPATH=$PYTHONPATH:{repo}"
+        )
+        remote_cmd = f"{cd_cmd} && {env_prefix} {py} {manager} --target {int(self.num_runners)}"
 
         proc = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", self.ssh_target, remote_cmd],
@@ -91,13 +96,16 @@ class RemoteSweSession:
 
     def start(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         self._ensure_remote_runners()
+        # Allow plenty of time for the initial container bootstrap even if callers
+        # pass a smaller timeout (e.g., snippet-level defaults).
+        effective_timeout = max(float(timeout or 0.0), 300.0)
         payload: Dict[str, Any] = {
             "op": "start",
             "run_id": self.run_id,
             "image": self.image,
-            "timeout": timeout or 600.0,
+            "timeout": effective_timeout,
         }
-        return self._call_proxy(payload, timeout=timeout)
+        return self._call_proxy(payload, timeout=effective_timeout)
 
     def exec(
         self,
