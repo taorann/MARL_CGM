@@ -220,6 +220,7 @@ class PlannerEnv:
         validation_meta: Dict[str, Any] = {}
         action_obj: ActionUnion
 
+        # 先做基础的 action 校验 / 反序列化
         if isinstance(action, Mapping):
             try:
                 action_obj = validate_planner_action(action)
@@ -232,7 +233,7 @@ class PlannerEnv:
         else:
             action_obj = action
 
-        # 这里已经有规范化后的 action_obj 了
+        # 这里已经有规范化后的 action_obj 了，打印一份 debug
         try:
             a_type = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
             a_dict = getattr(action_obj, "__dict__", {}) or {}
@@ -240,19 +241,22 @@ class PlannerEnv:
             a_type = None
             a_dict = {}
         _dbg(f"step: action_type={a_type}, action={a_dict}")
-            if self._strict_io:
-                try:
-                    payload = self._serialise_action_for_validation(action_obj)
-                except Exception as exc:
-                    info = {"error": "invalid-action", "detail": str(exc)}
-                    return self._obs(), -0.05, False, info
-                try:
-                    action_obj = validate_planner_action(payload)
-                    validation_meta = getattr(action_obj, "_meta", {}) or {}
-                except ProtocolError as exc:
-                    info = {"error": exc.code, "detail": exc.detail}
-                    return self._obs(), -0.05, False, info
 
+        # 如果 strict_io，走一遍“序列化再校验”的路径
+        if self._strict_io:
+            try:
+                payload = self._serialise_action_for_validation(action_obj)
+            except Exception as exc:
+                info = {"error": "invalid-action", "detail": str(exc)}
+                return self._obs(), -0.05, False, info
+            try:
+                action_obj = validate_planner_action(payload)
+                validation_meta = getattr(action_obj, "_meta", {}) or {}
+            except ProtocolError as exc:
+                info = {"error": exc.code, "detail": exc.detail}
+                return self._obs(), -0.05, False, info
+
+        # 按类型分发到各个 handler
         if isinstance(action_obj, ExploreAction):
             info = self._handle_explore(action_obj)
         elif isinstance(action_obj, MemoryAction):
@@ -266,31 +270,24 @@ class PlannerEnv:
         else:
             info = {"kind": "noop"}
 
-        if validation_meta.get("capped"):
-            info["capped"] = True
-            capped_fields = validation_meta.get("capped_fields") or {}
-            if capped_fields:
-                info["capped_fields"] = capped_fields
-        warnings = validation_meta.get("warnings")
-        if warnings:
-            existing = info.get("warnings")
-            if isinstance(existing, list):
-                info["warnings"] = existing + [w for w in warnings if w not in existing]
-            else:
-                info["warnings"] = list(warnings)
+        # 把校验信息合并进 info（如果有）
+        if validation_meta:
+            meta = info.get("_meta", {})
+            meta.update(validation_meta)
+            info["_meta"] = meta
 
-        if self.memory_state:
-            kind = info.get("kind")
-            if kind == "explore":
-                self.memory_state.latest_explore = info
-            elif kind and kind != "memory":
-                self.memory_state.latest_observation = info
+        kind = info.get("kind")
+        if kind == "explore":
+            self.memory_state.latest_explore = info
+        elif kind and kind != "memory":
+            self.memory_state.latest_observation = info
 
         reward = 1.0 if info.get("submit") and info.get("tests", {}).get("passed") else 0.0
         done = bool(info.get("submit"))
         self.steps += 1
         self.last_info = info
         return self._obs(), reward, done, info
+
 
     @staticmethod
     def _serialise_action_for_validation(action: ActionUnion) -> Dict[str, Any]:

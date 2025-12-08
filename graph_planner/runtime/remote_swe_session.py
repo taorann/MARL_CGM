@@ -32,12 +32,21 @@ class RemoteSweSession:
     _runners_ensured: bool = False
 
     def _build_ssh_cmd(self) -> list[str]:
-        cd_cmd = f"cd {shlex.quote(self.remote_repo)}"
-        env_prefix = f"GP_NUM_RUNNERS={int(self.num_runners)}"
+        repo = shlex.quote(self.remote_repo)
+    
+        cd_cmd = f"cd {repo}"
+        env_prefix = (
+            f"GP_NUM_RUNNERS={int(self.num_runners)} "
+            f"PYTHONPATH=$PYTHONPATH:{repo}"
+        )
+    
         py = shlex.quote(self.remote_python or "python")
         proxy = shlex.quote(self.swe_proxy_path or "hpc/swe_proxy.py")
+    
         remote_cmd = f"{cd_cmd} && {env_prefix} {py} {proxy}"
+    
         return ["ssh", "-o", "BatchMode=yes", self.ssh_target, remote_cmd]
+
 
     def _call_proxy(self, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
         proc = subprocess.run(
