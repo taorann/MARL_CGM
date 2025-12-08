@@ -112,7 +112,7 @@ class PlannerAgent:
         )
         if not sorted_cands:
             self.state.phase = "plan"
-            return self._wrap_action(ExploreAction(op="read", nodes=[], limit=0))
+            return self._wrap_action(ExploreAction(op="read", nodes=[], limit=1))
         top_ids = [c["id"] for c in sorted_cands[:3]]
         self.state.phase = "plan"
         return self._wrap_action(ExploreAction(op="read", nodes=top_ids, limit=len(top_ids)))
