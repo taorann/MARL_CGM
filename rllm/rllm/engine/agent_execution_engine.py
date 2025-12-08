@@ -5,6 +5,8 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+import os
+import json
 
 import numpy as np
 import openai
@@ -26,6 +28,8 @@ from rllm.parser.chat_template.parser import ChatTemplateParser
 from rllm.router.router import Router
 
 logger = logging.getLogger(__name__)
+
+DEBUG = bool(os.environ.get("DEBUG"))
 
 
 class _FallbackChatParser:
@@ -300,6 +304,17 @@ class AgentExecutionEngine:
                 )
 
         for step_idx in range(self.max_steps):
+            if DEBUG:
+                cur = agent.get_current_state()
+                cur_info = (cur.info if cur is not None else {}) or {}
+                print(
+                    f"[engine] traj={idx} step={step_idx} "
+                    f"total_time={total_time:.2f}s "
+                    f"last_reward={getattr(cur, 'reward', None)} "
+                    f"last_done={getattr(cur, 'done', None)} "
+                    f"last_info_kind={cur_info.get('kind')} "
+                    f"last_info_op={cur_info.get('op')}"
+                )
             # Get action from agent
             prompt_messages = agent.chat_completions.copy()
             # Max remaining tokens left for the response
@@ -329,6 +344,12 @@ class AgentExecutionEngine:
             delta_time = time.time() - start_time
             llm_time += delta_time
             total_time += delta_time
+            if DEBUG:
+                # 不要一次性打太长，截断一下
+                resp_preview = repr(response)
+                if len(resp_preview) > 600:
+                    resp_preview = resp_preview[:600] + "...<truncated>"
+                print(f"[engine] traj={idx} step={step_idx} model_response={resp_preview}")
             # Update steps
             prompt_response_pair = {
                 "prompt": self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True),
@@ -339,12 +360,22 @@ class AgentExecutionEngine:
             # Update agent with model response
             action: Action = agent.update_from_model(response)
             action = action.action
+            if DEBUG:
+                try:
+                    action_json = json.dumps(action, ensure_ascii=False)
+                except Exception:
+                    action_json = repr(action)
+                if len(action_json) > 600:
+                    action_json = action_json[:600] + "...<truncated>"
+                print(f"[engine] traj={idx} step={step_idx} parsed_action={action_json}")
 
             # Take step in environment using the executor
             start_time = time.time()
 
             try:
-                next_observation, reward, done, info = await asyncio.wait_for(loop.run_in_executor(self.executor, env.step, action), timeout=(self.trajectory_timeout - total_time))
+                next_observation, reward, done, info = await asyncio.wait_for(
+                    loop.run_in_executor(self.executor, env.step, action), timeout=(self.trajectory_timeout - total_time)
+                )
             except asyncio.TimeoutError:
                 termination_reason = "ENV_TIMEOUT"
                 if step_idx == 0:
@@ -355,6 +386,15 @@ class AgentExecutionEngine:
                 done = True
                 cur_step.done = done
                 break
+            else:
+                if DEBUG:
+                    info_keys = list((info or {}).keys())
+                    kind = (info or {}).get("kind")
+                    op = (info or {}).get("op")
+                    print(
+                        f"[engine] traj={idx} step={step_idx} env.step done: "
+                        f"reward={reward} done={done} kind={kind} op={op} info_keys={info_keys}"
+                    )
 
             delta_time = time.time() - start_time
             env_time += delta_time

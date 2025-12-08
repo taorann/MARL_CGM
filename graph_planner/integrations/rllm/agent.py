@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
+import os
+import json
 
 from ...infra.vendor import ensure_rllm_importable
 
@@ -74,6 +76,8 @@ else:
         plan_targets: List[Dict[str, Any]] = field(default_factory=list)
         plan_text: str = ""
 
+    DEBUG = bool(os.environ.get("DEBUG"))
+
     @dataclass
     class GraphPlannerRLLMAgent(BaseAgent):
         """面向 rLLM 的 Graph Planner 代理封装。"""
@@ -110,6 +114,13 @@ else:
             """根据环境返回的观察值更新轨迹和内部状态。"""
 
             info = info or {}
+            if DEBUG:
+                kind = info.get("kind")
+                op = info.get("op")
+                print(
+                    f"[gp-agent] step={self._step_index} update_from_env: "
+                    f"reward={reward} done={done} kind={kind} op={op}"
+                )
             text, metadata = summarise_observation(observation, reward, done, info)
             if self._trajectory.steps:
                 prior = self._trajectory.steps[-1]
@@ -129,6 +140,19 @@ else:
             if self._cur_step is None:
                 raise RuntimeError("update_from_env must be called before update_from_model")
             thought, action_obj, assistant_msg, parser_meta = self._parse_model_response(response)
+            if DEBUG:
+                tp = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
+                try:
+                    action_json = json.dumps(action_obj.__dict__, ensure_ascii=False, default=str)
+                except Exception:
+                    action_json = repr(action_obj)
+                if len(action_json) > 600:
+                    action_json = action_json[:600] + "...<truncated>"
+                thought_preview = thought if len(thought) <= 400 else thought[:400] + "...<truncated>"
+                print(
+                    f"[gp-agent] step={self._step_index} parsed_from_model: "
+                    f"type={tp} thought={thought_preview!r} action={action_json}"
+                )
             self._messages.append({"role": "assistant", "content": assistant_msg})
 
             self._cur_step.thought = thought
