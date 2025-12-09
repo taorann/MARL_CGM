@@ -191,9 +191,9 @@ def main() -> int:
     # ---------------------------------------------------------------
     # 1) 长期 instance 模式：显式带 op = start / exec / stop
     # ---------------------------------------------------------------
-    if op in {"start", "exec", "stop"}:
-        if op in {"start", "exec"} and not image:
-            print(json.dumps({"ok": False, "error": "image is required for op=start/exec"}))
+    if op in {"start", "exec", "stop", "build_graph"}:
+        if op in {"start", "exec", "build_graph"} and not image:
+            print(json.dumps({"ok": False, "error": "image is required for op=start/exec/build_graph"}))
             return 1
 
         if op == "start":
@@ -217,6 +217,29 @@ def main() -> int:
                 run_id=run_id,
                 image=str(image),
                 cmd=str(cmd),
+                timeout=timeout,
+                env=env,
+                cwd=cwd,
+            )
+        elif op == "build_graph":
+            issue_id = str(req.get("issue_id") or "")
+            if not issue_id:
+                print(json.dumps({"ok": False, "error": "issue_id is required for op=build_graph"}))
+                return 1
+
+            cmd = (
+                "PYTHONPATH=$PYTHONPATH:/gp "
+                "python -m graph_planner.tools.swe_build_graph "
+                "--repo /repo "
+                f"--issue-id {issue_id}"
+            )
+
+            resp = _instance_roundtrip(
+                aq,
+                op_type="instance_exec",
+                run_id=run_id,
+                image=str(image),
+                cmd=cmd,
                 timeout=timeout,
                 env=env,
                 cwd=cwd,

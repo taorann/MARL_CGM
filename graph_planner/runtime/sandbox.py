@@ -58,6 +58,8 @@ class SandboxConfig:
     remote_python: Optional[str] = None
     swe_proxy_path: Optional[str] = None
     runner_manager_path: Optional[str] = None
+    # host-side repo root for graph scanning (multi-repo)
+    repo_root_host: Optional[str] = None
 
 class SandboxRuntime:
     """
