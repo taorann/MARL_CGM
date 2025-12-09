@@ -135,3 +135,34 @@ class RemoteSweSession:
             "timeout": timeout or 600.0,
         }
         return self._call_proxy(payload, timeout=timeout)
+
+    def build_graph(
+        self,
+        issue_id: str,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Construct an issue-specific code subgraph inside the remote SWE container."""
+
+        payload: Dict[str, Any] = {
+            "op": "build_graph",
+            "run_id": self.run_id,
+            "image": self.image,
+            "issue_id": issue_id,
+            "timeout": timeout or 600.0,
+        }
+        resp = self._call_proxy(payload, timeout=timeout)
+        if not resp.get("ok", False):
+            raise RuntimeError(
+                f"remote build_graph failed (rc={resp.get('returncode')}). "
+                f"stderr={resp.get('stderr', '')}"
+            )
+
+        raw = (resp.get("stdout") or "").strip()
+        if not raw:
+            raise RuntimeError("remote build_graph returned empty stdout")
+        try:
+            return json.loads(raw)
+        except Exception as exc:  # pragma: no cover - passthrough
+            raise RuntimeError(
+                f"failed to parse build_graph stdout as JSON: {raw[:200]!r}"
+            ) from exc

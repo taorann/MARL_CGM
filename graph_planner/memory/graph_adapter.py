@@ -35,6 +35,25 @@ from aci._utils import repo_root, list_text_files, safe_read_text
 from .types import Node, Edge, Anchor, DocChunk
 
 
+_REPO_ROOT_OVERRIDE: Optional[str] = None
+
+
+def set_repo_root(root: Optional[str]) -> None:
+    """
+    Override the repository root used by GraphAdapter.
+
+    Passing ``None`` clears the override and restores default repo_root() lookup.
+    The override is module-level; concurrent multi-repo usage should set and reset
+    appropriately per environment.
+    """
+
+    global _REPO_ROOT_OVERRIDE
+    if root:
+        _REPO_ROOT_OVERRIDE = os.path.abspath(root)
+    else:
+        _REPO_ROOT_OVERRIDE = None
+
+
 def _norm_posix(path: str | None) -> str:
     return (path or "").replace("\\", "/")
 
@@ -102,7 +121,7 @@ def connect(handle_or_path: Optional[str] = None) -> GraphHandle:
     node 至少包含：id, kind, path?, name?, span?
     edge：src, dst, etype
     """
-    root = repo_root()
+    root = _REPO_ROOT_OVERRIDE or repo_root()
     gh = GraphHandle(root=root)
 
     # Try external

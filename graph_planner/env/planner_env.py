@@ -143,6 +143,8 @@ class PlannerEnv:
         self.steps: int = 0
         self.last_info: Dict[str, Any] = {}
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
+        # Optional host repo root for per-env graph scanning.
+        self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
 
         self.subgraph: WorkingSubgraph = subgraph_store.new()
@@ -162,6 +164,8 @@ class PlannerEnv:
         self.last_info = {"reset": True}
 
         # 准备图句柄与子图
+        if hasattr(graph_adapter, "set_repo_root"):
+            graph_adapter.set_repo_root(self.repo_root_host)
         graph_adapter.connect()
         try:
             self.subgraph = subgraph_store.load(self.issue_id)
