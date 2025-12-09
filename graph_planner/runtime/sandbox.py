@@ -434,13 +434,43 @@ class SandboxRuntime:
         _dbg(f"pytest cmd: {cmd}")
         start = time.time()
         out, rc = self._exec(cmd, timeout=timeout)
-        duration = time.time() - start
+            duration = time.time() - start
         result = {"mode": "pytest", "passed": rc == 0, "rc": rc, "stdout": out}
         return self._finalize_test_result(
             result,
             command=cmd,
             selector=selector_tuple,
             duration=duration,
+        )
+
+    def build_issue_subgraph(
+        self,
+        issue_id: str,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        """
+        使用当前 sandbox backend 为指定 issue 构建“工作子图”。
+
+        - backend == "remote_swe":
+            * 先通过 RemoteSweSession.start() 确保容器已启动（幂等）；
+            * 再调用 RemoteSweSession.build_graph()，在容器内 /repo 上构图；
+            * 返回的是容器侧 swe_build_graph 打印的 JSON 对象。
+        - 其它 backend 当前不支持，由上层按原有本地 ACI 流程处理。
+        """
+        if self._mode != "remote_swe":
+            raise RuntimeError(
+                f"build_issue_subgraph is only supported for backend='remote_swe', got {self._mode!r}"
+            )
+        if not self._remote:
+            raise RuntimeError("remote_swe backend is not initialized")
+
+        start_timeout = max(float(timeout), 300.0)
+        # 这里会调用 ensure_runners + start(instance)，是幂等的
+        self._remote.start(timeout=start_timeout)
+
+        return self._remote.build_graph(
+            issue_id=issue_id,
+            timeout=float(timeout),
         )
 
     def reset_soft(self) -> None:

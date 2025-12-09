@@ -163,14 +163,30 @@ class PlannerEnv:
         self.steps = 0
         self.last_info = {"reset": True}
 
-        # 准备图句柄与子图
-        if hasattr(graph_adapter, "set_repo_root"):
-            graph_adapter.set_repo_root(self.repo_root_host)
-        graph_adapter.connect()
-        try:
-            self.subgraph = subgraph_store.load(self.issue_id)
-        except Exception:
-            self.subgraph = subgraph_store.new()
+        # 根据 backend 类型决定如何初始化工作子图
+        backend_mode = getattr(self.box, "_mode", None)
+
+        # === 1) remote_swe：通过远程容器构图 ===
+        if backend_mode == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
+            try:
+                _dbg(f"reset(): building remote subgraph for issue_id={self.issue_id!r}")
+                subgraph_json = self.box.build_issue_subgraph(self.issue_id)
+                # 容器返回的是 JSON，对应 wrap() 之后变成 WorkingSubgraph
+                self.subgraph = subgraph_store.wrap(subgraph_json)
+            except Exception as exc:
+                _dbg(f"remote build_issue_subgraph failed: {exc!r}; using empty subgraph")
+                self.subgraph = subgraph_store.new()
+
+        # === 2) 其它 backend：沿用原来的本地图逻辑 ===
+        else:
+            # Optional per-env host repo root（多 repo 并行）
+            if hasattr(graph_adapter, "set_repo_root"):
+                graph_adapter.set_repo_root(self.repo_root_host)
+            graph_adapter.connect()
+            try:
+                self.subgraph = subgraph_store.load(self.issue_id)
+            except Exception:
+                self.subgraph = subgraph_store.new()
 
         self.memory_graph_store = text_memory.WorkingGraphStore(self.subgraph)
         self.memory_text_store = text_memory.NoteTextStore()

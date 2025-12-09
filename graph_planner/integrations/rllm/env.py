@@ -237,11 +237,21 @@ else:
             issue = deepcopy(self.entry.get("issue") or {})
             original_id = str(issue.get("id") or "")
             issue.setdefault("metadata", {})
-            issue["metadata"]["source_issue_id"] = original_id or issue.get("metadata", {}).get("source_issue_id") or ""
+            issue["metadata"]["source_issue_id"] = (
+                original_id
+                or issue.get("metadata", {}).get("source_issue_id")
+                or ""
+            )
+
+            # 为远程容器 / RemoteSweSession 定义一个稳定的 run_id
+            task_id = str(self.entry.get("task_id") or "").strip()
+            if task_id:
+                # 一条 SWE 任务 ↔ 一个 run_id
+                issue.setdefault("run_id", f"gp-{task_id}")
 
             parts = [
                 original_id or None,
-                str(self.entry.get("task_id") or ""),
+                task_id or None,
                 f"pid{os.getpid()}",
                 self._issue_uid,
             ]
