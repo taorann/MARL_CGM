@@ -37,6 +37,11 @@ engine_name: openai
 gamma: 0.2
 retry_limit: 3
 api_retries: 3
-trajectory_timeout: 180
+trajectory_timeout: 300
 max_workers: 64
 repo_op_limit: 40
+# ===== remote_swe backend settings =====
+sandbox_backend: remote_swe          # 也可以继续在命令行写，这里是默认值
+sandbox_ssh_target: chongbin_cls@login24
+sandbox_remote_repo: /appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM
+# ======================================
