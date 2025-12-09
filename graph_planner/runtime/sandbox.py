@@ -353,6 +353,22 @@ class SandboxRuntime:
         out = (out or b"") + (err or b"")
         return out.decode("utf-8", errors="ignore"), rc
 
+    def build_issue_subgraph(self, issue_id: str, timeout: int = 600) -> Dict[str, Any]:
+        """
+        Build the working subgraph for an issue via the active sandbox backend.
+
+        Currently only supported for the ``remote_swe`` backend, which proxies the
+        request to the remote SWE container through :class:`RemoteSweSession`.
+        """
+
+        if self._mode != "remote_swe":
+            raise RuntimeError(
+                f"build_issue_subgraph is only supported for backend='remote_swe', got {self._mode!r}"
+            )
+        if not self._remote:
+            raise RuntimeError("remote_swe backend is not initialized")
+        return self._remote.build_graph(issue_id=issue_id, timeout=timeout)
+
     # ---------- ACI 接口 ----------
     def run(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         return self._exec(cmd, timeout)

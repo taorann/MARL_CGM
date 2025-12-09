@@ -239,9 +239,13 @@ else:
             issue.setdefault("metadata", {})
             issue["metadata"]["source_issue_id"] = original_id or issue.get("metadata", {}).get("source_issue_id") or ""
 
+            task_id = str(self.entry.get("task_id") or "").strip()
+            if task_id:
+                issue.setdefault("run_id", f"gp-{task_id}")
+
             parts = [
                 original_id or None,
-                str(self.entry.get("task_id") or ""),
+                task_id or None,
                 f"pid{os.getpid()}",
                 self._issue_uid,
             ]

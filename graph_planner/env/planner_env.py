@@ -163,14 +163,25 @@ class PlannerEnv:
         self.steps = 0
         self.last_info = {"reset": True}
 
+        backend = getattr(self.sandbox_cfg, "backend", None) or "auto"
+
         # 准备图句柄与子图
-        if hasattr(graph_adapter, "set_repo_root"):
-            graph_adapter.set_repo_root(self.repo_root_host)
-        graph_adapter.connect()
-        try:
-            self.subgraph = subgraph_store.load(self.issue_id)
-        except Exception:
-            self.subgraph = subgraph_store.new()
+        if backend == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
+            try:
+                _dbg(f"reset(): building remote subgraph for issue_id={self.issue_id!r}")
+                subgraph_json = self.box.build_issue_subgraph(self.issue_id)
+                self.subgraph = subgraph_store.wrap(subgraph_json)
+            except Exception as exc:
+                _dbg(f"remote build_issue_subgraph failed: {exc!r}; using empty subgraph")
+                self.subgraph = subgraph_store.new()
+        else:
+            if hasattr(graph_adapter, "set_repo_root"):
+                graph_adapter.set_repo_root(self.repo_root_host)
+            graph_adapter.connect()
+            try:
+                self.subgraph = subgraph_store.load(self.issue_id)
+            except Exception:
+                self.subgraph = subgraph_store.new()
 
         self.memory_graph_store = text_memory.WorkingGraphStore(self.subgraph)
         self.memory_text_store = text_memory.NoteTextStore()
