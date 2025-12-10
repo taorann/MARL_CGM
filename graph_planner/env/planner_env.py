@@ -148,11 +148,17 @@ class PlannerEnv:
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
 
-        # === 图记忆相关 ===
-        # 记忆子图：跨 step 一直累积的那张图（“memory graph”）
+        # === 图状态：三张图 ===
+        # 完整仓库图：只读，一次构好，用于所有 anchor / 节点查询
+        self.repo_graph: Optional[WorkingSubgraph] = None
+        self._repo_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        self._repo_edges: List[Dict[str, Any]] = []
+
+        # 长期记忆子图：只在 Memory 动作时更新 & reset/load 时初始化
         self.memory_subgraph: WorkingSubgraph = subgraph_store.new()
-        # 查询子图：最近一次 graph 查询得到的临时子图（本步 observation 用）
-        self.last_query_subgraph: Optional[WorkingSubgraph] = None
+
+        # 工作 / 观测子图：每次 explore 合并查询结果；Memory 后重置为 memory_subgraph 的拷贝
+        self.working_subgraph: WorkingSubgraph = subgraph_store.new()
         self.last_candidates: List[Dict[str, Any]] = []
         self.last_reads: List[Dict[str, Any]] = []
         raw_caps = dict(getattr(self.config, "memory_caps", {}) or {})
@@ -171,36 +177,48 @@ class PlannerEnv:
     def reset(self) -> Dict[str, Any]:
         self.steps = 0
         self.last_info = {"reset": True}
-
-        # 每次 episode 开始时，清空“最近查询子图”
-        self.last_query_subgraph = None
-
-        # 根据 backend 类型决定如何初始化工作子图
         backend_mode = getattr(self.box, "_mode", None)
 
-        # === 1) remote_swe：通过远程容器构图 ===
+        # === 1) 构建完整仓库图 repo_graph ===
         if backend_mode == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
+            # 约定：remote_swe 下 build_issue_subgraph 返回的是“完整仓库代码图”
             try:
-                _dbg(f"reset(): building remote subgraph for issue_id={self.issue_id!r}")
-                subgraph_json = self.box.build_issue_subgraph(self.issue_id)
-                # 容器返回的是 JSON，对应 wrap() 之后变成 WorkingSubgraph
-                self.memory_subgraph = subgraph_store.wrap(subgraph_json)
+                _dbg(f"reset(): building remote repo_graph for issue_id={self.issue_id!r}")
+                repo_json = self.box.build_issue_subgraph(self.issue_id)
+                self.repo_graph = subgraph_store.wrap(repo_json)
             except Exception as exc:
-                _dbg(f"remote build_issue_subgraph failed: {exc!r}; using empty subgraph")
-                self.memory_subgraph = subgraph_store.new()
-
-        # === 2) 其它 backend：沿用原来的本地图逻辑 ===
+                _dbg(f"remote build_issue_subgraph failed: {exc!r}; using empty repo_graph")
+                self.repo_graph = subgraph_store.new()
         else:
-            # Optional per-env host repo root（多 repo 并行）
+            # 本地 backend：先把 host 侧 repo_root 注入到 graph_adapter，再连上 ACI
             if hasattr(graph_adapter, "set_repo_root"):
                 graph_adapter.set_repo_root(self.repo_root_host)
             graph_adapter.connect()
             try:
-                self.memory_subgraph = subgraph_store.load(self.issue_id)
+                self.repo_graph = subgraph_store.load(self.issue_id)
             except Exception:
-                self.memory_subgraph = subgraph_store.new()
+                self.repo_graph = subgraph_store.new()
 
-        # 初始化记忆模块（基于记忆子图）
+        # 为 repo_graph 建索引
+        self._repo_nodes_by_id = {}
+        self._repo_edges = []
+        if self.repo_graph is not None:
+            for n in getattr(self.repo_graph, "nodes", []):
+                nid = n.get("id")
+                if isinstance(nid, str):
+                    self._repo_nodes_by_id[nid] = n
+            self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
+
+        # === 2) 初始化 memory_subgraph（长期记忆） ===
+        try:
+            self.memory_subgraph = subgraph_store.load(self.issue_id)
+        except Exception:
+            self.memory_subgraph = subgraph_store.new()
+
+        # === 3) 工作图 = 记忆图的拷贝（起点一致） ===
+        self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
+
+        # === 4) 初始化 text_memory（基于 memory_subgraph） ===
         self.memory_graph_store = text_memory.WorkingGraphStore(self.memory_subgraph)
         self.memory_text_store = text_memory.NoteTextStore()
         self.memory_state = text_memory.TurnState(
@@ -377,8 +395,9 @@ class PlannerEnv:
             max_per_anchor = max(1, int(act.limit or self.config.max_nodes_per_anchor))
             total_limit = int(self.config.candidate_total_limit)
             dir_k = int(self.config.dir_diversity_k)
+            base_graph = self.repo_graph or self.working_subgraph
             candidates = mem_candidates.build_mem_candidates(
-                subgraph=self.memory_subgraph,
+                subgraph=base_graph,
                 anchors=act.anchors,
                 max_nodes_per_anchor=max_per_anchor,
                 total_limit=total_limit,
@@ -386,7 +405,13 @@ class PlannerEnv:
             )
             self.last_candidates = candidates
             info["candidates"] = candidates
-            info["subgraph_stats"] = subgraph_store.stats(self.memory_subgraph)
+            # 把候选节点合并进 working_subgraph（探索状态）
+            candidate_ids = [
+                c.get("id") for c in candidates
+                if isinstance(c.get("id"), str)
+            ]
+            self._merge_repo_nodes_into_working(candidate_ids, status="explored")
+            info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
         if act.op == "read":
@@ -402,6 +427,12 @@ class PlannerEnv:
                     snippets.append(snippet)
             self.last_reads = snippets
             info["snippets"] = snippets
+            # 把被读取的节点也合并进 working_subgraph
+            resolved_ids = [
+                n.get("id") for n in resolved
+                if isinstance(n.get("id"), str)
+            ]
+            self._merge_repo_nodes_into_working(resolved_ids, status="explored")
             return info
 
         info["warning"] = f"unknown explore op: {act.op}"
@@ -428,14 +459,37 @@ class PlannerEnv:
             return info
 
         info.update(result)
-        # 统计的是“记忆子图”的状态
+        # === 解析 selector，找到要“记住”的节点 id 列表 ===
+        selected_ids: List[str] = []
+        try:
+            sel = act.selector or {}
+            if isinstance(sel, Mapping):
+                nodes_field = sel.get("nodes")
+            else:
+                nodes_field = getattr(sel, "nodes", None)
+            if isinstance(nodes_field, Sequence):
+                for nid in nodes_field:
+                    if isinstance(nid, str):
+                        selected_ids.append(nid)
+        except Exception:
+            selected_ids = []
+
+        # === 把这些节点从 working_subgraph 写入 memory_subgraph ===
+        if selected_ids:
+            self._merge_working_nodes_into_memory(selected_ids, status="remembered")
+
         info["subgraph_stats"] = subgraph_store.stats(self.memory_subgraph)
         if info.get("ok"):
             try:
-                # 把当前记忆子图作为 issue 的 snapshot 持久化
                 subgraph_store.save(self.issue_id, self.memory_subgraph)
             except Exception:
                 pass
+
+        # === Memory 动作之后：工作图重置为记忆图（丢弃未记忆的探索节点） ===
+        try:
+            self._reset_working_from_memory()
+        except Exception:
+            pass
         return info
 
     # ------------------------------------------------------------------
@@ -469,7 +523,7 @@ class PlannerEnv:
             info["applied"] = bool(apply_result.get("success"))
             info["priority_tests"] = prioritize_tests(
                 self._observation_pack(),
-                subgraph=self.memory_subgraph,
+                subgraph=self.working_subgraph,
             ).get("priority_tests", [])
             return info
 
@@ -581,7 +635,7 @@ class PlannerEnv:
         info["tests"] = tests_report
         info["priority_tests"] = prioritize_tests(
             self._observation_pack(),
-            subgraph=self.memory_subgraph,
+            subgraph=self.working_subgraph,
         ).get("priority_tests", [])
 
         return info
@@ -592,49 +646,151 @@ class PlannerEnv:
         return {"submit": True, "tests": tests, "patch": patch_text}
 
     # ------------------------------------------------------------------
+    # 图合并辅助：repo -> working；working -> memory；重置 working
+    # ------------------------------------------------------------------
+    def _merge_repo_nodes_into_working(
+        self,
+        node_ids: Sequence[str],
+        *,
+        status: str = "explored",
+    ) -> None:
+        """从 repo_graph 中取若干节点及其相关边，合并进 working_subgraph。"""
+        if not node_ids or not self.repo_graph:
+            return
+
+        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.working_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                working_nodes_by_id[nid] = n
+
+        working_edges_set = set()
+        for e in getattr(self.working_subgraph, "edges", []) or []:
+            key = (e.get("src"), e.get("dst"), e.get("kind"))
+            working_edges_set.add(key)
+
+        # 1) 合并节点
+        for nid in node_ids:
+            repo_node = self._repo_nodes_by_id.get(nid)
+            if repo_node is None:
+                continue
+
+            if nid not in working_nodes_by_id:
+                new_node = dict(repo_node)
+                tags = set(new_node.get("tags") or [])
+                tags.add(status)
+                new_node["tags"] = sorted(tags)
+                prev_status = str(new_node.get("status") or "").strip().lower()
+                if prev_status != "remembered":
+                    new_node["status"] = status
+                self.working_subgraph.nodes.append(new_node)
+                working_nodes_by_id[nid] = new_node
+            else:
+                existing = working_nodes_by_id[nid]
+                prev_status = str(existing.get("status") or "").strip().lower()
+                # 记忆优先级：remembered > explored
+                if prev_status != "remembered":
+                    existing["status"] = status
+                tags = set(existing.get("tags") or [])
+                tags.add(status)
+                existing["tags"] = sorted(tags)
+
+        # 2) 合并边：只要 src/dst 都已经在 working 中就拉进来
+        working_ids = set(working_nodes_by_id.keys())
+        for e in self._repo_edges:
+            src_id = e.get("src")
+            dst_id = e.get("dst")
+            key = (src_id, dst_id, e.get("kind"))
+            if src_id in working_ids and dst_id in working_ids and key not in working_edges_set:
+                self.working_subgraph.edges.append(dict(e))
+                working_edges_set.add(key)
+
+    def _merge_working_nodes_into_memory(
+        self,
+        node_ids: Sequence[str],
+        *,
+        status: str = "remembered",
+    ) -> None:
+        """把 working_subgraph 中的若干节点及其边合并进 memory_subgraph。"""
+        if not node_ids:
+            return
+
+        mem_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.memory_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                mem_nodes_by_id[nid] = n
+
+        mem_edges_set = set()
+        for e in getattr(self.memory_subgraph, "edges", []) or []:
+            key = (e.get("src"), e.get("dst"), e.get("kind"))
+            mem_edges_set.add(key)
+
+        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.working_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                working_nodes_by_id[nid] = n
+
+        # 1) 合并节点
+        for nid in node_ids:
+            wnode = working_nodes_by_id.get(nid)
+            if wnode is None:
+                continue
+
+            if nid not in mem_nodes_by_id:
+                new_node = dict(wnode)
+                tags = set(new_node.get("tags") or [])
+                tags.add(status)
+                new_node["tags"] = sorted(tags)
+                new_node["status"] = status
+                self.memory_subgraph.nodes.append(new_node)
+                mem_nodes_by_id[nid] = new_node
+            else:
+                existing = mem_nodes_by_id[nid]
+                existing["status"] = status
+                tags = set(existing.get("tags") or [])
+                tags.add(status)
+                existing["tags"] = sorted(tags)
+
+        # 2) 合并相关边：只要 src/dst 都在 memory_subgraph，就从 working 中拎过去
+        mem_ids = set(mem_nodes_by_id.keys())
+        for e in getattr(self.working_subgraph, "edges", []) or []:
+            src_id = e.get("src")
+            dst_id = e.get("dst")
+            key = (src_id, dst_id, e.get("kind"))
+            if src_id in mem_ids and dst_id in mem_ids and key not in mem_edges_set:
+                self.memory_subgraph.edges.append(dict(e))
+                mem_edges_set.add(key)
+
+    def _reset_working_from_memory(self) -> None:
+        """Memory 动作之后，把工作图重置为记忆图。"""
+        self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
+
+    # ------------------------------------------------------------------
     # 辅助函数
     # ------------------------------------------------------------------
     def _obs(self) -> Dict[str, Any]:
-        # 记忆子图的统计与 JSON 视图
-        mem_stats = subgraph_store.stats(self.memory_subgraph)
-        mem_json = self.memory_subgraph.to_json_obj()
-
-        # 最近一次“查询子图”的统计与 JSON 视图（可能不存在）
-        if self.last_query_subgraph is not None:
-            query_stats = subgraph_store.stats(self.last_query_subgraph)
-            query_json = self.last_query_subgraph.to_json_obj()
-        else:
-            query_stats = None
-            query_json = None
+        """构造给 LLM 的 observation：仅暴露 working_subgraph。"""
+        working_stats = subgraph_store.stats(self.working_subgraph)
+        working_json = self.working_subgraph.to_json_obj()
+        memory_stats = subgraph_store.stats(self.memory_subgraph)
 
         return {
             "issue": self.issue,
             "steps": self.steps,
-
-            # === 兼容老字段：subgraph 仍然存在，但含义固定为“记忆子图” ===
-            "subgraph": mem_json,
-            "subgraph_stats": mem_stats,
-
-            # === 新字段：显式区分 memory vs query ===
-            "memory_subgraph": mem_json,
-            "memory_subgraph_stats": mem_stats,
-            "query_subgraph": query_json,
-            "query_subgraph_stats": query_stats,
-
             "last_info": self.last_info,
-            "observation_pack": self._observation_pack(
-                mem_stats=mem_stats,
-                query_stats=query_stats,
-            ),
+            # LLM 看到的是“当前工作图”，里面节点已经带 status/tags（explored/remembered）
+            "subgraph": working_json,
+            "subgraph_stats": working_stats,
+            # 记忆图的统计信息（可选）
+            "memory_stats": memory_stats,
+            "text_memory": text_memory.snapshot(self.memory_state) if self.memory_state else {},
             "reset": bool(self.last_info.get("reset")),
         }
 
     def _log_step_graphs(self) -> None:
-        """将当前 step 的记忆子图和本步查询子图落盘，便于后续回放整个 trajectory。
-
-        - memory_subgraph：跨 step 累积的记忆图；
-        - last_query_subgraph：本步刚刚查询得到的临时子图（如果有）。
-        """
+        """将当前 step 的工作图 & 记忆图落盘，便于回放 trajectory。"""
         try:
             issue_id = (
                 self.issue_id
@@ -649,7 +805,6 @@ class PlannerEnv:
         try:
             traj_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            # 日志失败不能影响正常执行
             return
 
         step_idx = int(self.steps)
@@ -657,28 +812,13 @@ class PlannerEnv:
 
         try:
             mem_path = traj_dir / f"{step_prefix}.memory.json"
-            mem_json = self.memory_subgraph.to_json_obj()
-            mem_path.write_text(
-                json.dumps(mem_json, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            _dbg(
-                f"_log_step_graphs: failed to write memory_subgraph for {issue_id!r}, step={step_idx}: {exc!r}"
-            )
-
-        if self.last_query_subgraph is not None:
-            try:
-                query_path = traj_dir / f"{step_prefix}.query.json"
-                query_json = self.last_query_subgraph.to_json_obj()
-                query_path.write_text(
-                    json.dumps(query_json, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception as exc:
-                _dbg(
-                    f"_log_step_graphs: failed to write query_subgraph for {issue_id!r}, step={step_idx}: {exc!r}"
-                )
+            with mem_path.open("w", encoding="utf-8") as f:
+                json.dump(self.memory_subgraph.to_json_obj(), f, ensure_ascii=False, indent=2)
+            work_path = traj_dir / f"{step_prefix}.working.json"
+            with work_path.open("w", encoding="utf-8") as f:
+                json.dump(self.working_subgraph.to_json_obj(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            return
 
     def _observation_pack(
         self,
@@ -717,9 +857,13 @@ class PlannerEnv:
     def _resolve_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         if not node_id:
             return None
-        node = self.memory_subgraph.get_node(node_id)
+        node = self.working_subgraph.get_node(node_id)
         if node:
             return dict(node)
+        if self.repo_graph:
+            repo_node = self._repo_nodes_by_id.get(node_id)
+            if repo_node:
+                return dict(repo_node)
         for cand in self.last_candidates:
             if cand.get("id") == node_id:
                 return dict(cand)
