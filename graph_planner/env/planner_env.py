@@ -309,7 +309,14 @@ class PlannerEnv:
             cgm_tokens_est=int(caps.get("cgm_tokens", DEFAULT_MEMORY_CAPS["cgm_tokens"])),
         )
 
-        return self._obs()
+        # 在 reset 时记录一次三图状态（如果配置了 GRAPH_PLANNER_TRACE_DIR）
+        obs = self._obs()
+        try:
+            self._log_step_graphs()
+        except Exception:
+            pass
+
+        return obs
 
     def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """单步：接受一个 action 字典，返回 (obs, reward, done, info)。"""
@@ -323,7 +330,12 @@ class PlannerEnv:
             action_obj = self._parse_action(action)
         except ProtocolError as exc:
             info = {"error": exc.code, "detail": exc.detail}
-            return self._obs(), -0.05, False, info
+            obs = self._obs()
+            try:
+                self._log_step_graphs()
+            except Exception:
+                pass
+            return obs, -0.05, False, info
 
         # 按类型分发
         if isinstance(action_obj, ExploreAction):
@@ -349,7 +361,14 @@ class PlannerEnv:
         reward = self._compute_reward(info)
         done = bool(info.get("done"))
 
-        return self._obs(), reward, done, info
+        obs = self._obs()
+        # 每一步动作之后记录一次三图状态
+        try:
+            self._log_step_graphs()
+        except Exception:
+            pass
+
+        return obs, reward, done, info
 
     # ------------------------------------------------------------------
     # Action 解析与 reward
@@ -380,8 +399,7 @@ class PlannerEnv:
             return -0.1
         return -0.01
 
-
-# ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Explore / Memory
     # ------------------------------------------------------------------
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
@@ -635,9 +653,7 @@ class PlannerEnv:
             return {"success": False, "error": f"apply-error:{exc}"}
         return dict(result or {})
 
-    #
-
-------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 辅助函数
     # ------------------------------------------------------------------
     def _obs(self) -> Dict[str, Any]:
