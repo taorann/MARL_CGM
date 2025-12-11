@@ -57,83 +57,80 @@ def _resolve_actor(name: str) -> Any:
 
 
 def generate(
-    *,
-    collated: Dict[str, Any],
-    plan: str,
+    subgraph_linearized: Optional[List[Dict[str, Any]]],
+    plan: Plan,
     constraints: Optional[Dict[str, Any]] = None,
-    run_id: str,
+    snippets: Optional[List[Dict[str, Any]]] = None,
+    plan_text: Optional[str] = None,
     issue: Optional[Dict[str, Any]] = None,
-    actor_name: Optional[str] = None,
-) -> Dict[str, Any]:
-    """调用远程 CGM 生成补丁。
+) -> Patch:
+    """生成补丁：优先调用 CodeFuse CGM 客户端或本地 CGM Runtime。
 
-    Args
-    ----
-    collated:
-        由 collater 输出的上下文，形如 {"chunks": [...], "meta": {...}}。
-    plan:
-        文本形式的修复计划，通常来自 RepairAction.plan。
-    constraints:
-        限制条件，例如 {"max_edits": 3} 等。
-    run_id:
-        当前 run 的标识，用于日志/跟踪。
-    issue:
-        原始 issue 信息（标题、描述、失败栈等），供 CGM 做上下文增强。
-    actor_name:
-        Ray actor 名称；若 None 则使用环境变量 CODEFUSE_CGM_ACTOR 或默认值。
-
-    Returns
-    -------
-    patch: dict
-        CodeFuse-CGM 风格的补丁结构，至少包含 "edits" 字段。
-
-    Raises
-    ------
-    RuntimeError:
-        - Ray 不可用；
-        - 找不到指定 actor；
-        - 远程调用失败或返回非法类型。
+    更新语义：
+        - 不再回退到本地“规则打标记”补丁（_generate_local_patch）。
+        - 如果 HTTP 客户端和本地 Runtime 都不可用或均失败，则直接抛出 RuntimeError，
+          由调用方（PlannerEnv / service 等）自己决定怎么处理。
     """
-    constraints = constraints or {}
-    issue = issue or {}
-    actor_name = actor_name or _DEFAULT_ACTOR_NAME
+    client = _get_client()
+    runtime = _get_local_runtime()
+    last_exc: Optional[Exception] = None
 
-    # 1) 确认 Ray 环境可用
-    if ray is None:
+    # 1) 优先远程 CodeFuse CGM HTTP 服务
+    if client is not None:
+        try:
+            return client.generate_patch(
+                issue=issue,
+                plan=plan,
+                plan_text=plan_text,
+                subgraph_linearized=subgraph_linearized,
+                snippets=snippets,
+                metadata={"constraints": constraints or {}},
+            )
+        except Exception as exc:  # pragma: no cover
+            last_exc = exc
+            telemetry.log_event(
+                {
+                    "kind": "cgm",
+                    "ok": False,
+                    "error": str(exc),
+                    "endpoint": getattr(client, "endpoint", ""),
+                }
+            )
+
+    # 2) 其次尝试本地 CGM Runtime（本地 Seq2Seq 模型）
+    if runtime is not None:
+        try:
+            patch = runtime.generate_patch(
+                issue=issue,
+                plan=plan,
+                plan_text=plan_text,
+                subgraph_linearized=subgraph_linearized,
+                snippets=snippets,
+                constraints=constraints,
+            )
+            return patch
+        except Exception as exc:  # pragma: no cover
+            last_exc = exc
+            telemetry.log_event(
+                {
+                    "kind": "cgm-local",
+                    "ok": False,
+                    "error": str(exc),
+                    "model": getattr(
+                        getattr(runtime, "generator", None),
+                        "model_name",
+                        "",
+                    ),
+                }
+            )
+
+    # 3) 没有 client/runtime，或者都失败：不再本地规则 patch，直接抛错
+    if last_exc is not None:
         raise RuntimeError(
-            "Ray is not available; CGM remote generation cannot be used. "
-            "Rule-based fallback has been disabled by design."
-        )
+            f"CGM generation failed (no rule-based fallback): {last_exc}"
+        ) from last_exc
 
-    # 2) 解析 Ray actor
-    actor = _resolve_actor(actor_name)
-    if actor is None:
-        raise RuntimeError(
-            f"No CGM Ray actor named '{actor_name}' is available. "
-            "Rule-based CGM fallback is disabled; please ensure the actor is started."
-        )
-
-    # 3) 构造请求 payload
-    req = CGMRequest(
-        collated=collated,
-        plan=plan,
-        constraints=constraints,
-        run_id=run_id,
-        issue=issue,
+    raise RuntimeError(
+        "No CGM client or local runtime available; "
+        "rule-based local patch generation has been disabled."
     )
-
-    # 4) 调用远程 CGM
-    try:
-        # 约定远程 actor 暴露 generate_patch.remote(payload: dict) -> patch: dict
-        future = actor.generate_patch.remote(req.to_dict())
-        patch = ray.get(future)
-    except Exception as exc:  # pragma: no cover - 远程错误按统一形式抛给上层
-        raise RuntimeError(f"CGM remote failed: {exc}") from exc
-
-    if not isinstance(patch, dict):
-        raise RuntimeError(
-            f"CGM remote returned non-dict patch: {type(patch)!r}. "
-            "Rule-based local patch generation has been removed."
-        )
-
-    return patch
