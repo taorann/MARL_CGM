@@ -15,69 +15,126 @@ def _dbg(msg: str) -> None:
     if DEBUG:
         print(f"[planner_env] {msg}")
 
-from difflib import unified_diff
 
-try:  # pragma: no cover - optional runtime dependency
-    import ray
-except Exception:  # pragma: no cover - ray optional outside training
-    ray = None  # type: ignore[assignment]
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
 
-from copy import deepcopy
 
-from ..agents.common import text_protocol
-from ..agents.common.chat import action_to_payload
+def _safe_bool(x: Any, default: bool = False) -> bool:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        return x.strip().lower() in {"1", "true", "yes", "y"}
+    try:
+        return bool(x)
+    except Exception:
+        return default
+
+
+def _safe_str(x: Any, default: str = "") -> str:
+    if isinstance(x, str):
+        return x
+    try:
+        return str(x)
+    except Exception:
+        return default
+
+
+def _first_seq(seq: Iterable[Any]) -> Any:
+    for x in seq:
+        return x
+    return None
+
+
+def _norm_path(path: str) -> str:
+    return path.replace("\\", "/") if isinstance(path, str) else ""
+
+
+def _encode_bytes(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _decode_bytes(data: str) -> bytes:
+    return base64.b64decode(data.encode("ascii"))
+
+
+def _read_file_text(path: str, encoding: str = "utf-8") -> str:
+    try:
+        with open(path, "r", encoding=encoding) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _write_file_text(path: str, text: str, encoding: str = "utf-8") -> None:
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding=encoding) as f:
+            f.write(text)
+    except Exception:
+        pass
+
+
+def _ensure_dir(path: str) -> None:
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Imports that may be heavy / optional
+# ---------------------------------------------------------------------------
+
 try:
-    from ..agents.common.chat import extract_json_payload
+    from copy import deepcopy
 except Exception:
-    # Minimal JSON payload extraction fallback (brace match)
-    def extract_json_payload(text):
-        import json as _json
-        import re as _re
+    def deepcopy(x):
+        return x
 
-        m = _re.search(r"\{.*\}", str(text), _re.S)
-        if not m:
-            return None
-        try:
-            return _json.loads(m.group(0))
-        except Exception:
-            return None
-
-from ..agents.common.contracts import ProtocolError, validate_planner_action
 try:
-    from ..agents.common.contracts import CGM_PATCH_INSTRUCTION, CGM_SYSTEM_PROMPT
-except Exception:
-    CGM_PATCH_INSTRUCTION = ""
-    CGM_SYSTEM_PROMPT = ""
-from ..core.actions import (
-    ActionUnion,
-    ExploreAction,
-    MemoryAction,
-    NoopAction,
-    RepairAction,
-    SubmitAction,
-)
-from ..infra.config import Config, load as load_config
-try:
-    from ..integrations.codefuse_cgm.formatting import GraphLinearizer, SnippetFormatter
-except Exception:
-    # Lightweight dummies
+    from ..core.actions import (
+        ActionUnion,
+        ExploreAction,
+        MemoryAction,
+        NoopAction,
+        RepairAction,
+        SubmitAction,
+    )
+    from ..infra.config import Config, load as load_config
+    try:
+        from ..integrations.codefuse_cgm.formatting import GraphLinearizer, SnippetFormatter
+    except Exception:
+        # Lightweight dummies
 
-    class GraphLinearizer:
-        def linearize(self, payload):
-            return "" if payload is None else str(payload)
+        class GraphLinearizer:
+            def linearize(self, payload):
+                return "" if payload is None else str(payload)
 
-
-    class SnippetFormatter:
-        def format(self, snippets):
-            return "" if not snippets else str(snippets)
-from ..memory import graph_adapter, mem_candidates, subgraph_store, text_memory
-from ..memory.subgraph_store import WorkingSubgraph
-from ..runtime.sandbox import SandboxConfig, SandboxRuntime
-from aci.schema import Plan, PlanTarget
-from aci.guard import GuardError, enforce_patch_guard
-from actor.collater import collate
-from actor import cgm_adapter
-from ..agents.rule_based.test_prioritizer import prioritize_tests
+        class SnippetFormatter:
+            def format(self, snippets):
+                return "" if not snippets else str(snippets)
+    from ..memory import graph_adapter, mem_candidates, subgraph_store, text_memory
+    from ..memory.subgraph_store import WorkingSubgraph
+    from ..runtime.sandbox import SandboxConfig, SandboxRuntime
+    from aci.schema import Plan, PlanTarget
+    from aci.guard import GuardError, enforce_patch_guard
+    from actor.collater import collate
+    from actor import cgm_adapter
+    from ..agents.rule_based.test_prioritizer import prioritize_tests
+except Exception as _IMPORT_ERROR:  # pragma: no cover
+    # The environment may not have all dependencies; this file is imported
+    # in tooling contexts where only type information is needed.
+    ActionUnion = object  # type: ignore[assignment]
+    ExploreAction = MemoryAction = RepairAction = SubmitAction = NoopAction = object  # type: ignore[assignment]
+    Config = object  # type: ignore[assignment]
+    SandboxConfig = object  # type: ignore[assignment]
+    SandboxRuntime = object  # type: ignore[assignment]
+    Plan = PlanTarget = object  # type: ignore[assignment]
+    subgraph_store = text_memory = graph_adapter = mem_candidates = object()  # type: ignore[assignment]
 
 
 DEFAULT_MEMORY_CAPS = {
@@ -89,20 +146,20 @@ DEFAULT_MEMORY_CAPS = {
 }
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
+def _get_io_config(cfg: Config) -> Mapping[str, Any]:
     try:
-        return int(value)
+        cfg_dict = cfg.to_dict()
     except Exception:
-        return default
+        cfg_dict = {}
+    io_cfg = cfg_dict.get("io") if isinstance(cfg_dict, Mapping) else {}
+    if not isinstance(io_cfg, Mapping):
+        io_cfg = {}
+    return io_cfg
 
 
-def _get_shared_actor(name: str):  # pragma: no cover - simple Ray helper
-    if ray is None or not getattr(ray, "is_initialized", lambda: False)():
-        return None
-    try:
-        return ray.get_actor(name)
-    except Exception:
-        return None
+# ---------------------------------------------------------------------------
+# PlannerEnv
+# ---------------------------------------------------------------------------
 
 
 class PlannerEnv:
@@ -148,31 +205,41 @@ class PlannerEnv:
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
 
-        # === 图状态：三张图 ===
-        # 完整仓库图：只读，一次构好，用于所有 anchor / 节点查询
-        self.repo_graph: Optional[WorkingSubgraph] = None
+        # 三图结构
+        self.repo_graph: Optional[WorkingSubgraph] = None   # 完整仓库图（只读）
+        self.memory_subgraph: WorkingSubgraph = subgraph_store.new()   # 长期记忆图
+        self.working_subgraph: WorkingSubgraph = subgraph_store.new()  # 当前工作图
+
+        # Repo 图索引
         self._repo_nodes_by_id: Dict[str, Dict[str, Any]] = {}
         self._repo_edges: List[Dict[str, Any]] = []
 
-        # 长期记忆子图：只在 Memory 动作时更新 & reset/load 时初始化
-        self.memory_subgraph: WorkingSubgraph = subgraph_store.new()
-
-        # 工作 / 观测子图：每次 explore 合并查询结果；Memory 后重置为 memory_subgraph 的拷贝
-        self.working_subgraph: WorkingSubgraph = subgraph_store.new()
-        self.last_candidates: List[Dict[str, Any]] = []
-        self.last_reads: List[Dict[str, Any]] = []
-        raw_caps = dict(getattr(self.config, "memory_caps", {}) or {})
-        self.memory_caps: Dict[str, int] = {**DEFAULT_MEMORY_CAPS, **raw_caps}
+        # Text memory 相关
         self.memory_graph_store: Optional[text_memory.WorkingGraphStore] = None
         self.memory_text_store: Optional[text_memory.NoteTextStore] = None
         self.memory_state: Optional[text_memory.TurnState] = None
 
-        # === 轨迹日志根目录：默认 outputs/trajectories，也允许在 config 里覆盖 ===
-        traj_root = (self.config_dict or {}).get("trajectory_root", "outputs/trajectories")
-        self.trajectory_root: Path = Path(traj_root)
+        # 最近一步 explore/read 的结果
+        self.last_candidates: List[Dict[str, Any]] = []
+        self.last_reads: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------
+    # 兼容接口：env.subgraph → working_subgraph
+    # ------------------------------------------------------------
+
+    @property
+    def subgraph(self) -> WorkingSubgraph:
+        """Backward-compat alias for the current working_subgraph.
+
+        Historically ``PlannerEnv.subgraph`` referred to the active code subgraph.
+        After introducing the three-graph design (repo / working / memory),
+        this alias keeps older integrations working by exposing the
+        ``working_subgraph`` as the current observation graph.
+        """
+        return self.working_subgraph
 
     # ------------------------------------------------------------------
-    # 环境基础
+    # Gym-like API
     # ------------------------------------------------------------------
     def reset(self) -> Dict[str, Any]:
         self.steps = 0
@@ -181,25 +248,26 @@ class PlannerEnv:
 
         # === 1) 构建完整仓库图 repo_graph ===
         if backend_mode == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
-            # 约定：remote_swe 下 build_issue_subgraph 返回的是“完整仓库代码图”
+            # remote_swe 模式：build_issue_subgraph 被视为完整仓库图
             try:
-                _dbg(f"reset(): building remote repo_graph for issue_id={self.issue_id!r}")
                 repo_json = self.box.build_issue_subgraph(self.issue_id)
                 self.repo_graph = subgraph_store.wrap(repo_json)
-            except Exception as exc:
-                _dbg(f"remote build_issue_subgraph failed: {exc!r}; using empty repo_graph")
+            except Exception:
                 self.repo_graph = subgraph_store.new()
         else:
-            # 本地 backend：先把 host 侧 repo_root 注入到 graph_adapter，再连上 ACI
-            if hasattr(graph_adapter, "set_repo_root"):
+            # 本地 backend：从 ACI 子图缓存加载（如有需要可触发扫描构图）
+            if hasattr(graph_adapter, "set_repo_root") and self.repo_root_host:
                 graph_adapter.set_repo_root(self.repo_root_host)
-            graph_adapter.connect()
+            try:
+                graph_adapter.connect()
+            except Exception:
+                pass
             try:
                 self.repo_graph = subgraph_store.load(self.issue_id)
             except Exception:
                 self.repo_graph = subgraph_store.new()
 
-        # 为 repo_graph 建索引
+        # Repo 索引
         self._repo_nodes_by_id = {}
         self._repo_edges = []
         if self.repo_graph is not None:
@@ -232,89 +300,32 @@ class PlannerEnv:
             planner_tokens_est=0,
             cgm_tokens_est=0,
         )
+        caps = self.config_dict.get("memory_caps") or DEFAULT_MEMORY_CAPS
+        self.memory_state.caps = text_memory.Size(
+            nodes=int(caps.get("nodes", DEFAULT_MEMORY_CAPS["nodes"])),
+            edges=int(caps.get("edges", DEFAULT_MEMORY_CAPS["edges"])),
+            frontier=int(caps.get("frontier", DEFAULT_MEMORY_CAPS["frontier"])),
+            planner_tokens_est=int(caps.get("planner_tokens", DEFAULT_MEMORY_CAPS["planner_tokens"])),
+            cgm_tokens_est=int(caps.get("cgm_tokens", DEFAULT_MEMORY_CAPS["cgm_tokens"])),
+        )
 
-        # 记录容器内工作目录（pwd 优先，其次配置）
-        try:
-            out, _ = self.box.run("pwd", timeout=10)
-            pwd = (out or "").strip().splitlines()[-1]
-            if pwd:
-                self.repo_root_in_container = pwd
-        except Exception:
-            pass
-
-        self.last_candidates = []
-        self.last_reads = []
-        self._cgm_linearizer = GraphLinearizer()
-        self._cgm_snippet_formatter = SnippetFormatter()
-        try:
-            self.last_info["sandbox_ports"] = self.box.exposed_ports
-        except Exception:
-            self.last_info.pop("sandbox_ports", None)
-
-        # 记录 reset 后的“第 0 步”图状态
-        try:
-            self._log_step_graphs()
-        except Exception:
-            pass
         return self._obs()
 
-    def close(self) -> None:
-        try:
-            # 关 env 时再 snapshot 一次记忆子图
-            subgraph_store.save(self.issue_id, self.memory_subgraph)
-        except Exception:
-            pass
-        try:
-            self.box.close()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 主 step
-    # ------------------------------------------------------------------
-    def step(
-        self, action: ActionUnion | Mapping[str, Any]
-    ) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+        """单步：接受一个 action 字典，返回 (obs, reward, done, info)。"""
+        self.steps += 1
+        info: Dict[str, Any] = {}
         validation_meta: Dict[str, Any] = {}
         action_obj: ActionUnion
 
-        # 先做基础的 action 校验 / 反序列化
-        if isinstance(action, Mapping):
-            try:
-                action_obj = validate_planner_action(action)
-                validation_meta = getattr(action_obj, "_meta", {}) or {}
-            except ProtocolError as exc:
-                if self._strict_io:
-                    info = {"error": exc.code, "detail": exc.detail}
-                    return self._obs(), -0.05, False, info
-                raise
-        else:
-            action_obj = action
-
-        # 这里已经有规范化后的 action_obj 了，打印一份 debug
+        # 解析 / 校验 action
         try:
-            a_type = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
-            a_dict = getattr(action_obj, "__dict__", {}) or {}
-        except Exception:
-            a_type = None
-            a_dict = {}
-        _dbg(f"step: action_type={a_type}, action={a_dict}")
+            action_obj = self._parse_action(action)
+        except ProtocolError as exc:
+            info = {"error": exc.code, "detail": exc.detail}
+            return self._obs(), -0.05, False, info
 
-        # 如果 strict_io，走一遍“序列化再校验”的路径
-        if self._strict_io:
-            try:
-                payload = self._serialise_action_for_validation(action_obj)
-            except Exception as exc:
-                info = {"error": "invalid-action", "detail": str(exc)}
-                return self._obs(), -0.05, False, info
-            try:
-                action_obj = validate_planner_action(payload)
-                validation_meta = getattr(action_obj, "_meta", {}) or {}
-            except ProtocolError as exc:
-                info = {"error": exc.code, "detail": exc.detail}
-                return self._obs(), -0.05, False, info
-
-        # 按类型分发到各个 handler
+        # 按类型分发
         if isinstance(action_obj, ExploreAction):
             info = self._handle_explore(action_obj)
         elif isinstance(action_obj, MemoryAction):
@@ -328,74 +339,60 @@ class PlannerEnv:
         else:
             info = {"kind": "noop"}
 
-        # 把校验信息合并进 info（如果有）
-        if validation_meta:
-            meta = info.get("_meta", {})
-            meta.update(validation_meta)
-            info["_meta"] = meta
-
         kind = info.get("kind")
         if kind == "explore":
             self.memory_state.latest_explore = info
         elif kind and kind != "memory":
-            self.memory_state.latest_observation = info
+            self.memory_state.latest_non_explore = info
 
-        reward = 1.0 if info.get("submit") and info.get("tests", {}).get("passed") else 0.0
-        done = bool(info.get("submit"))
-        self.steps += 1
         self.last_info = info
-        try:
-            self._log_step_graphs()
-        except Exception:
-            pass
+        reward = self._compute_reward(info)
+        done = bool(info.get("done"))
+
         return self._obs(), reward, done, info
 
-
-    @staticmethod
-    def _serialise_action_for_validation(action: ActionUnion) -> Dict[str, Any]:
-        payload = action.dict(exclude={"schema_version"}, exclude_none=True)
-        name = payload.pop("type", None)
-        if not name:
-            name = action_to_payload(action).get("type")
-        if not name:
-            raise ValueError("action missing type field")
-        return {"name": name, "params": payload}
-
     # ------------------------------------------------------------------
-    # Explore / Memory handlers
+    # Action 解析与 reward
+    # ------------------------------------------------------------------
+    def _parse_action(self, payload: Dict[str, Any]) -> ActionUnion:
+        if not isinstance(payload, Mapping):
+            raise ProtocolError("invalid-payload", "action payload must be a mapping")
+        action_type = payload.get("type")
+        if action_type == "explore":
+            return ExploreAction(**payload)
+        if action_type == "memory":
+            return MemoryAction(**payload)
+        if action_type == "repair":
+            return RepairAction(**payload)
+        if action_type == "submit":
+            return SubmitAction(**payload)
+        if action_type == "noop":
+            return NoopAction(**payload)
+        raise ProtocolError("unknown-action", f"unknown action type: {action_type}")
+
+    def _compute_reward(self, info: Dict[str, Any]) -> float:
+        # 简单 reward：成功提交 +1，失败提交 -1，其他略惩罚
+        if info.get("kind") == "submit":
+            if info.get("success"):
+                return 1.0
+            return -1.0
+        if info.get("error"):
+            return -0.1
+        return -0.01
+
+
+# ------------------------------------------------------------------
+    # Explore / Memory
     # ------------------------------------------------------------------
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "explore", "op": act.op}
-        node = None
-        try:
-            node = self._resolve_node(act)  # type: ignore[arg-type]
-        except Exception:
-            node = None
-        if node is None and getattr(act, "nodes", None):
-            try:
-                node = self._resolve_node(act.nodes[0])
-            except Exception:
-                node = None
-        if node is not None:
-            _dbg(
-                f"_handle_explore: node_id={getattr(node, 'id', None) or node.get('id')} path={node.get('path')}"
-            )
-
-        if act.op == "find":
-            nodes: List[Dict[str, Any]] = []
-            for anchor in act.anchors:
-                try:
-                    nodes.extend(graph_adapter.find_nodes_by_anchor(anchor))
-                except Exception:
-                    continue
-            info["nodes"] = nodes
-            return info
+        base_graph = self.repo_graph or self.working_subgraph
 
         if act.op == "expand":
-            max_per_anchor = max(1, int(act.limit or self.config.max_nodes_per_anchor))
-            total_limit = int(self.config.candidate_total_limit)
-            dir_k = int(self.config.dir_diversity_k)
-            base_graph = self.repo_graph or self.working_subgraph
+            max_per_anchor = _safe_int(act.max_per_anchor or 8, 8)
+            total_limit = _safe_int(act.total_limit or 32, 32)
+            dir_k = _safe_int(act.dir_diversity_k or 4, 4)
+
             candidates = mem_candidates.build_mem_candidates(
                 subgraph=base_graph,
                 anchors=act.anchors,
@@ -405,7 +402,6 @@ class PlannerEnv:
             )
             self.last_candidates = candidates
             info["candidates"] = candidates
-            # 把候选节点合并进 working_subgraph（探索状态）
             candidate_ids = [
                 c.get("id") for c in candidates
                 if isinstance(c.get("id"), str)
@@ -427,70 +423,58 @@ class PlannerEnv:
                     snippets.append(snippet)
             self.last_reads = snippets
             info["snippets"] = snippets
-            # 把被读取的节点也合并进 working_subgraph
-            resolved_ids = [
+            # 把读取到的节点也 merge 进 working_subgraph
+            node_ids = [
                 n.get("id") for n in resolved
                 if isinstance(n.get("id"), str)
             ]
-            self._merge_repo_nodes_into_working(resolved_ids, status="explored")
+            self._merge_repo_nodes_into_working(node_ids, status="explored")
+            info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
-        info["warning"] = f"unknown explore op: {act.op}"
+        info["error"] = f"unknown-explore-op:{act.op}"
         return info
 
     def _handle_memory(self, act: MemoryAction) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "memory"}
+
         if not self.memory_state:
-            info.update({"ok": False, "error": "memory-uninitialized"})
+            info["error"] = "memory-not-initialised"
             return info
 
-        caps = self.memory_caps or {}
-        try:
-            if act.intent == "delete":
-                result = text_memory.memory_delete(
-                    self.memory_state, act.target, act.scope, act.selector
-                )
-            else:
-                result = text_memory.memory_commit(
-                    self.memory_state, act.target, act.scope, act.selector, caps
-                )
-        except Exception as exc:
-            info.update({"ok": False, "error": f"memory-exception:{exc}"})
-            return info
+        selector = act.selector or {}
+        caps = self.memory_state.caps or text_memory.Size(**DEFAULT_MEMORY_CAPS)
+        result = text_memory.memory_commit(
+            self.memory_state,
+            act.target,
+            act.scope,
+            selector,
+            caps,
+        )
+        info.update(result or {})
 
-        info.update(result)
-        # === 解析 selector，找到要“记住”的节点 id 列表 ===
-        selected_ids: List[str] = []
-        try:
-            sel = act.selector or {}
-            if isinstance(sel, Mapping):
-                nodes_field = sel.get("nodes")
-            else:
-                nodes_field = getattr(sel, "nodes", None)
-            if isinstance(nodes_field, Sequence):
-                for nid in nodes_field:
-                    if isinstance(nid, str):
-                        selected_ids.append(nid)
-        except Exception:
-            selected_ids = []
+        # 从 selector 中解析 node_ids，并写回 memory_subgraph
+        node_ids: List[str] = []
+        sel_nodes = selector.get("nodes") if isinstance(selector, Mapping) else None
+        if isinstance(sel_nodes, str):
+            node_ids = [sel_nodes]
+        elif isinstance(sel_nodes, Sequence):
+            node_ids = [nid for nid in sel_nodes if isinstance(nid, str)]
 
-        # === 把这些节点从 working_subgraph 写入 memory_subgraph ===
-        if selected_ids:
-            self._merge_working_nodes_into_memory(selected_ids, status="remembered")
+        if node_ids:
+            self._merge_working_nodes_into_memory(node_ids, status="remembered")
 
         info["subgraph_stats"] = subgraph_store.stats(self.memory_subgraph)
-        if info.get("ok"):
-            try:
-                subgraph_store.save(self.issue_id, self.memory_subgraph)
-            except Exception:
-                pass
+        subgraph_store.save(self.issue_id, self.memory_subgraph)
 
-        # === Memory 动作之后：工作图重置为记忆图（丢弃未记忆的探索节点） ===
-        try:
-            self._reset_working_from_memory()
-        except Exception:
-            pass
+        # 记忆动作之后，工作图重置为记忆图
+        self._reset_working_to_memory()
+
         return info
+
+    def _reset_working_to_memory(self) -> None:
+        """Memory 动作之后，把工作图重置为记忆图。"""
+        self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
 
     # ------------------------------------------------------------------
     # Repair / Submit
@@ -504,7 +488,7 @@ class PlannerEnv:
             patch: Dict[str, Any] = dict(act.patch)
             if "summary" not in patch:
                 patch["summary"] = act.plan or ""
-            plan = self._build_plan(act.plan_targets)
+            plan = self._build_plan(act.plan_targets or [])
             try:
                 enforce_patch_guard(patch, plan, self.config)
             except GuardError as ge:
@@ -532,7 +516,7 @@ class PlannerEnv:
     def _repair_with_cgm(self, act: RepairAction, info: Dict[str, Any]) -> Dict[str, Any]:
         plan_struct: Plan
         try:
-            plan_struct = self._build_plan(act.plan_targets)
+            plan_struct = self._build_plan(act.plan_targets or [])
         except Exception as exc:
             info["applied"] = False
             info["no_repair"] = True
@@ -568,7 +552,8 @@ class PlannerEnv:
         )
 
         try:
-            chunks, meta = collate(self.memory_subgraph, plan_struct, collate_cfg)
+            # ✅ 使用 working_subgraph 作为 collate 的基础图
+            chunks, meta = collate(self.working_subgraph, plan_struct, collate_cfg)
         except Exception as exc:
             info["applied"] = False
             info["no_repair"] = True
@@ -586,19 +571,9 @@ class PlannerEnv:
                 plan=act.plan or "",
                 constraints=constraints,
                 run_id=run_id,
-                timeout_s=60.0,
-                retry=1,
-                plan_struct=plan_struct,
-                plan_text=act.plan,
                 issue=self.issue,
             )
         except Exception as exc:
-            if ray is not None and isinstance(exc, getattr(ray.exceptions, "GetTimeoutError", tuple())):  # type: ignore[arg-type]
-                info["applied"] = False
-                info["no_repair"] = True
-                info["error"] = f"cgm-timeout:{exc}"
-                info["fallback_reason"] = "cgm-timeout"
-                return info
             info["applied"] = False
             info["no_repair"] = True
             info["error"] = f"cgm-error:{exc}"
@@ -631,7 +606,6 @@ class PlannerEnv:
         lint_ok = bool(self.box.lint())
         tests_report = self.box.test()
         info["lint_ok"] = lint_ok
-        info["lint"] = lint_ok
         info["tests"] = tests_report
         info["priority_tests"] = prioritize_tests(
             self._observation_pack(),
@@ -641,140 +615,42 @@ class PlannerEnv:
         return info
 
     def _handle_submit(self) -> Dict[str, Any]:
-        tests = self.box.test()
-        patch_text = self.box.get_patch()
-        return {"submit": True, "tests": tests, "patch": patch_text}
+        info: Dict[str, Any] = {"kind": "submit"}
+        try:
+            tests_report = self.box.test()
+        except Exception as exc:
+            info["success"] = False
+            info["error"] = f"test-error:{exc}"
+            return info
 
-    # ------------------------------------------------------------------
-    # 图合并辅助：repo -> working；working -> memory；重置 working
-    # ------------------------------------------------------------------
-    def _merge_repo_nodes_into_working(
-        self,
-        node_ids: Sequence[str],
-        *,
-        status: str = "explored",
-    ) -> None:
-        """从 repo_graph 中取若干节点及其相关边，合并进 working_subgraph。"""
-        if not node_ids or not self.repo_graph:
-            return
+        info["tests"] = tests_report
+        info["success"] = bool(tests_report)
+        info["done"] = True
+        return info
 
-        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
-        for n in getattr(self.working_subgraph, "nodes", []):
-            nid = n.get("id")
-            if isinstance(nid, str):
-                working_nodes_by_id[nid] = n
+    def _apply_patch_edits(self, edits: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        try:
+            result = self.box.apply_patch_edits(list(edits))
+        except Exception as exc:
+            return {"success": False, "error": f"apply-error:{exc}"}
+        return dict(result or {})
 
-        working_edges_set = set()
-        for e in getattr(self.working_subgraph, "edges", []) or []:
-            key = (e.get("src"), e.get("dst"), e.get("kind"))
-            working_edges_set.add(key)
+    #
 
-        # 1) 合并节点
-        for nid in node_ids:
-            repo_node = self._repo_nodes_by_id.get(nid)
-            if repo_node is None:
-                continue
-
-            if nid not in working_nodes_by_id:
-                new_node = dict(repo_node)
-                tags = set(new_node.get("tags") or [])
-                tags.add(status)
-                new_node["tags"] = sorted(tags)
-                prev_status = str(new_node.get("status") or "").strip().lower()
-                if prev_status != "remembered":
-                    new_node["status"] = status
-                self.working_subgraph.nodes.append(new_node)
-                working_nodes_by_id[nid] = new_node
-            else:
-                existing = working_nodes_by_id[nid]
-                prev_status = str(existing.get("status") or "").strip().lower()
-                # 记忆优先级：remembered > explored
-                if prev_status != "remembered":
-                    existing["status"] = status
-                tags = set(existing.get("tags") or [])
-                tags.add(status)
-                existing["tags"] = sorted(tags)
-
-        # 2) 合并边：只要 src/dst 都已经在 working 中就拉进来
-        working_ids = set(working_nodes_by_id.keys())
-        for e in self._repo_edges:
-            src_id = e.get("src")
-            dst_id = e.get("dst")
-            key = (src_id, dst_id, e.get("kind"))
-            if src_id in working_ids and dst_id in working_ids and key not in working_edges_set:
-                self.working_subgraph.edges.append(dict(e))
-                working_edges_set.add(key)
-
-    def _merge_working_nodes_into_memory(
-        self,
-        node_ids: Sequence[str],
-        *,
-        status: str = "remembered",
-    ) -> None:
-        """把 working_subgraph 中的若干节点及其边合并进 memory_subgraph。"""
-        if not node_ids:
-            return
-
-        mem_nodes_by_id: Dict[str, Dict[str, Any]] = {}
-        for n in getattr(self.memory_subgraph, "nodes", []):
-            nid = n.get("id")
-            if isinstance(nid, str):
-                mem_nodes_by_id[nid] = n
-
-        mem_edges_set = set()
-        for e in getattr(self.memory_subgraph, "edges", []) or []:
-            key = (e.get("src"), e.get("dst"), e.get("kind"))
-            mem_edges_set.add(key)
-
-        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
-        for n in getattr(self.working_subgraph, "nodes", []):
-            nid = n.get("id")
-            if isinstance(nid, str):
-                working_nodes_by_id[nid] = n
-
-        # 1) 合并节点
-        for nid in node_ids:
-            wnode = working_nodes_by_id.get(nid)
-            if wnode is None:
-                continue
-
-            if nid not in mem_nodes_by_id:
-                new_node = dict(wnode)
-                tags = set(new_node.get("tags") or [])
-                tags.add(status)
-                new_node["tags"] = sorted(tags)
-                new_node["status"] = status
-                self.memory_subgraph.nodes.append(new_node)
-                mem_nodes_by_id[nid] = new_node
-            else:
-                existing = mem_nodes_by_id[nid]
-                existing["status"] = status
-                tags = set(existing.get("tags") or [])
-                tags.add(status)
-                existing["tags"] = sorted(tags)
-
-        # 2) 合并相关边：只要 src/dst 都在 memory_subgraph，就从 working 中拎过去
-        mem_ids = set(mem_nodes_by_id.keys())
-        for e in getattr(self.working_subgraph, "edges", []) or []:
-            src_id = e.get("src")
-            dst_id = e.get("dst")
-            key = (src_id, dst_id, e.get("kind"))
-            if src_id in mem_ids and dst_id in mem_ids and key not in mem_edges_set:
-                self.memory_subgraph.edges.append(dict(e))
-                mem_edges_set.add(key)
-
-    def _reset_working_from_memory(self) -> None:
-        """Memory 动作之后，把工作图重置为记忆图。"""
-        self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
-
-    # ------------------------------------------------------------------
+------------------------------------------------------------------
     # 辅助函数
     # ------------------------------------------------------------------
     def _obs(self) -> Dict[str, Any]:
-        """构造给 LLM 的 observation：仅暴露 working_subgraph。"""
+        """构造给 LLM 的 observation：仅暴露 working_subgraph。
+
+        - ``subgraph`` / ``subgraph_stats`` 指向当前工作图（working_subgraph）；
+        - ``memory_stats`` 提供长期记忆图的规模信息；
+        - ``observation_pack`` 为锚点规划 / 规则组件准备的摘要包，基于 memory_subgraph。
+        """
         working_stats = subgraph_store.stats(self.working_subgraph)
         working_json = self.working_subgraph.to_json_obj()
         memory_stats = subgraph_store.stats(self.memory_subgraph)
+        obs_pack = self._observation_pack(mem_stats=memory_stats, query_stats=None)
 
         return {
             "issue": self.issue,
@@ -787,6 +663,7 @@ class PlannerEnv:
             "memory_stats": memory_stats,
             "text_memory": text_memory.snapshot(self.memory_state) if self.memory_state else {},
             "reset": bool(self.last_info.get("reset")),
+            "observation_pack": obs_pack,
         }
 
     def _log_step_graphs(self) -> None:
@@ -795,30 +672,20 @@ class PlannerEnv:
             issue_id = (
                 self.issue_id
                 or self.issue.get("issue_id")
-                or self.issue.get("instance_id")
-                or "unknown-issue"
+                or self.issue.get("id")
+                or "__default__"
             )
+            out_dir = os.environ.get("GRAPH_PLANNER_TRACE_DIR")
+            if not out_dir:
+                return
+            _ensure_dir(out_dir)
+            step_prefix = f"{issue_id}.step_{self.steps:04d}"
+            working_path = os.path.join(out_dir, f"{step_prefix}.working.json")
+            memory_path = os.path.join(out_dir, f"{step_prefix}.memory.json")
+            _write_file_text(working_path, json.dumps(self.working_subgraph.to_json_obj(), indent=2))
+            _write_file_text(memory_path, json.dumps(self.memory_subgraph.to_json_obj(), indent=2))
         except Exception:
-            issue_id = "unknown-issue"
-
-        traj_dir = self.trajectory_root / str(issue_id)
-        try:
-            traj_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            return
-
-        step_idx = int(self.steps)
-        step_prefix = f"step_{step_idx:04d}"
-
-        try:
-            mem_path = traj_dir / f"{step_prefix}.memory.json"
-            with mem_path.open("w", encoding="utf-8") as f:
-                json.dump(self.memory_subgraph.to_json_obj(), f, ensure_ascii=False, indent=2)
-            work_path = traj_dir / f"{step_prefix}.working.json"
-            with work_path.open("w", encoding="utf-8") as f:
-                json.dump(self.working_subgraph.to_json_obj(), f, ensure_ascii=False, indent=2)
-        except Exception:
-            return
+            pass
 
     def _observation_pack(
         self,
@@ -836,20 +703,19 @@ class PlannerEnv:
                 self.issue.get("description"),
             )
             if x
-        ).strip()
+        )
         pack = {
             "issue": issue_text,
             "top_assert": self.issue.get("top_assert"),
             "error_kind": self.issue.get("error_kind"),
             "failure_frame": failure,
-
-            # === 历史字段：subgraph_stats 仍然存在，语义＝memory_subgraph_stats ===
+            # 历史字段：subgraph_stats = memory_subgraph_stats
             "subgraph_stats": mem_stats,
-            # === 新字段：明确区分 memory vs query ===
             "memory_subgraph_stats": mem_stats,
             "query_subgraph_stats": query_stats,
-
-            "cost": {"tokens": int(self.last_info.get("collate_meta", {}).get("est_tokens", 0))},
+            "cost": {
+                "tokens": int(self.last_info.get("collate_meta", {}).get("est_tokens", 0)),
+            },
             "cfg": self.config_dict,
         }
         return pack
@@ -864,495 +730,126 @@ class PlannerEnv:
             repo_node = self._repo_nodes_by_id.get(node_id)
             if repo_node:
                 return dict(repo_node)
-        for cand in self.last_candidates:
-            if cand.get("id") == node_id:
-                return dict(cand)
         return None
 
-    def _read_node_snippet(self, node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        path = node.get("path")
+    def _read_node_snippet(self, node: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        path = _norm_path(node.get("path") or "")
         if not path:
             return None
-        span = node.get("span") or {}
-        start = _safe_int(span.get("start"), 1)
-        end = max(start, _safe_int(span.get("end"), start))
-        pad = 3
-        start0 = max(1, start - pad)
-        end0 = end + pad
-        _dbg(
-            f"_read_node_snippet: path={path}, span={span}, "
-            f"start0={start0}, end0={end0}"
-        )
-
-        payload = json.dumps(
-            {
-                "path": path,
-                "base": self.repo_root_in_container,
-                "start": start0,
-                "end": end0,
-            }
-        )
-        script = (
-            "python - <<'PY'\n"
-            "import json\nfrom pathlib import Path\n"
-            "req=json.loads('''" + payload.replace("'", "\\'") + "''')\n"
-            "path=Path(req['path'])\n"
-            "if not path.is_absolute():\n"
-            "    path = Path(req['base']).joinpath(path)\n"
-            "try:\n"
-            "    text = path.read_text(encoding='utf-8', errors='ignore').splitlines()\n"
-            "except Exception:\n"
-            "    text = []\n"
-            "start=max(1,int(req['start']))\n"
-            "end=max(start,int(req['end']))\n"
-            "snippet=[]\n"
-            "for idx in range(start-1, min(len(text), end)):\n"
-            "    snippet.append(f'{idx+1:04d}: {text[idx]}')\n"
-            "print(json.dumps({'path': str(path), 'start': start, 'end': min(end, len(text)), 'snippet': snippet}))\n"
-            "PY"
-        )
-        _dbg("[_read_node_snippet] invoking sandbox.run(...)")
-        out, rc = self.box.run(script, timeout=30)
-        _dbg(f"[_read_node_snippet] sandbox.run rc={rc}, out_head={repr(out[:200])}")
-        if rc != 0:
+        abs_path = os.path.join(self.repo_root_in_container, path)
+        text = _read_file_text(abs_path)
+        if not text:
             return None
-        try:
-            data = json.loads(out.strip().splitlines()[-1])
-        except Exception:
-            return None
-        abs_path = data.get("path")
-        data.update({"node_id": node.get("id"), "path": path, "span": span})
-        if abs_path:
-            data["abs_path"] = abs_path
-        return data
-
-    def _build_repair_state(self, subplan: str, focus_ids: List[str]) -> text_protocol.RepairRuntimeState:
-        if not subplan:
-            raise ValueError("repair subplan is required for CGM execution")
-        text_memory = self._build_text_memory_snapshot()
-        related_files = self._collect_related_files(focus_ids)
-        if not related_files:
-            related_files = self._collect_related_files(self._default_focus_ids())
-        default_focus = focus_ids or self._default_focus_ids()
-        token_budget = int(getattr(self.config.cgm, "max_input_tokens", 8192))
-        state = text_protocol.RepairRuntimeState(
-            issue=dict(self.issue),
-            subgraph=subgraph_store.wrap(self.memory_subgraph),
-            sandbox=self.box,
-            repo_root=self.repo_root_in_container,
-            text_memory=text_memory,
-            related_files=related_files,
-            default_focus_ids=default_focus,
-            snippets=self.last_reads or [],
-            token_budget=token_budget,
-            max_graph_nodes=min(128, int(self.config.candidate_total_limit or 200)),
-            max_files=4,
-            max_file_bytes=40000,
-            cgm_top_k=1,
-            cgm_generate=self._generate_cgm_candidates,
-        )
-        return state
-
-    def _build_text_memory_snapshot(self) -> Dict[str, str]:
-        stats = subgraph_store.stats(self.memory_subgraph)
-        summary_parts = [
-            f"steps={self.steps}",
-            f"nodes={stats.get('nodes', 0)}",
-            f"edges={stats.get('edges', 0)}",
-        ]
-        session_summary = " | ".join(summary_parts)
-        turn_notes = json.dumps(self.last_info, ensure_ascii=False) if self.last_info else ""
-        memory = {"session_summary": session_summary, "turn_notes": turn_notes}
-        return memory
-
-    def _collect_related_files(self, focus_ids: Iterable[str]) -> Dict[str, str]:
-        paths: List[str] = []
-        for node_id in focus_ids:
-            node = self._resolve_node(node_id)
-            if node and node.get("path"):
-                paths.append(str(node.get("path")))
-        if not paths:
-            paths.extend([snip.get("path") for snip in self.last_reads or [] if snip.get("path")])
-        unique_paths = []
-        seen = set()
-        for path in paths:
-            if path and path not in seen:
-                seen.add(path)
-                unique_paths.append(path)
-        files: Dict[str, str] = {}
-        for path in unique_paths:
-            text = self._read_full_file_text(path)
-            if text:
-                files[path] = text
-        return files
-
-    def _read_full_file_text(self, path: str) -> str:
-        payload = json.dumps({"path": path, "base": self.repo_root_in_container})
-        script = (
-            "python - <<'PY'\n"
-            "import json\nfrom pathlib import Path\n"
-            "req=json.loads('''" + payload.replace("'", "\\'") + "''')\n"
-            "path=Path(req['path'])\n"
-            "if not path.is_absolute():\n"
-            "    path = Path(req['base']).joinpath(path)\n"
-            "try:\n"
-            "    text = path.read_text(encoding='utf-8', errors='ignore')\n"
-            "except Exception:\n"
-            "    text = ''\n"
-            "print(json.dumps({'text': text}))\n"
-            "PY"
-        )
-        out, rc = self.box.run(script, timeout=30)
-        if rc != 0:
-            return ""
-        lines = [line for line in out.strip().splitlines() if line.strip()]
-        if not lines:
-            return ""
-        try:
-            data = json.loads(lines[-1])
-        except Exception:
-            return ""
-        return str(data.get("text") or "")
-
-    def _default_focus_ids(self) -> List[str]:
-        ids = [snip.get("node_id") for snip in self.last_reads or [] if snip.get("node_id")]
-        if ids:
-            return [str(i) for i in ids if i]
-        return [str(nid) for nid in getattr(self.memory_subgraph, "node_ids", [])]
-
-    def _plan_targets_from_focus(self, focus_ids: Iterable[str]) -> List[Dict[str, Any]]:
-        targets: List[Dict[str, Any]] = []
-        for node_id in focus_ids:
-            node = self._resolve_node(node_id)
-            if not node:
-                continue
-            path = node.get("path")
-            span = node.get("span") or {}
-            if not path:
-                continue
-            start = _safe_int(span.get("start"), 1)
-            end = max(start, _safe_int(span.get("end"), start))
-            targets.append(
-                {
-                    "path": str(path),
-                    "start": start,
-                    "end": end,
-                    "id": node.get("id") or node_id,
-                    "why": "graph_planner-focus",
-                }
-            )
-        return targets
-
-    def _build_cgm_chat_prompt(
-        self,
-        *,
-        plan_text: str,
-        plan_targets: List[Dict[str, Any]],
-        payload: Dict[str, Any],
-        snippets: List[Dict[str, Any]],
-    ) -> str:
-        sections: List[str] = [CGM_PATCH_INSTRUCTION]
-
-        issue = dict(self.issue)
-        payload_issue = payload.get("issue") or {}
-        if isinstance(payload_issue, Mapping):
-            issue.update({k: v for k, v in payload_issue.items() if v})
-        issue_lines: List[str] = []
-        title = issue.get("title") or issue.get("summary")
-        body = issue.get("body") or issue.get("description")
-        if title:
-            issue_lines.append(str(title))
-        if body:
-            issue_lines.append(str(body))
-        if issue_lines:
-            sections.append("[Issue]\n" + "\n".join(issue_lines))
-
-        if not plan_text:
-            plan_lines: List[str] = []
-            for target in plan_targets:
-                path = target.get("path", "?")
-                start = target.get("start", "?")
-                end = target.get("end", start)
-                plan_lines.append(f"- {path} L{start}-{end}")
-            if plan_lines:
-                plan_text = "Plan to modify:\n" + "\n".join(plan_lines)
-        if plan_text:
-            sections.append("[Subplan]\n" + str(plan_text))
-
-        graph_payload = payload.get("graph")
-        graph_text = self._cgm_linearizer.linearize(graph_payload)
-        if graph_text:
-            sections.append("[Subgraph]\n" + graph_text)
-
-        snippets_text = self._cgm_snippet_formatter.format(snippets)
-        if snippets_text:
-            sections.append("[Snippets]\n" + snippets_text)
-
-        text_memory = payload.get("text_memory") or {}
-        if isinstance(text_memory, Mapping):
-            memory_lines: List[str] = []
-            summary = text_memory.get("session_summary")
-            notes = text_memory.get("turn_notes")
-            if summary:
-                memory_lines.append(str(summary))
-            if notes:
-                memory_lines.append(str(notes))
-            if memory_lines:
-                sections.append("[Memory]\n" + "\n".join(memory_lines))
-
-        files = payload.get("files")
-        if isinstance(files, Mapping) and files:
-            file_lines: List[str] = []
-            for path, content in files.items():
-                preview = str(content)[:400]
-                file_lines.append(f"--- {path} ---\n{preview}")
-            if file_lines:
-                sections.append("[Files]\n" + "\n\n".join(file_lines))
-
-        return "\n\n".join(section for section in sections if section)
-
-    def _parse_cgm_chat_response(
-        self,
-        response: str,
-        *,
-        fallback_summary: str,
-    ) -> Optional[Dict[str, Any]]:
-        if not response:
-            return None
-        payload = extract_json_payload(response)
-        if payload is None:
-            try:
-                payload = json.loads(response)
-            except Exception:
-                return None
-        if not isinstance(payload, Mapping):
-            return None
-
-        patch_obj: Optional[Mapping[str, Any]] = None
-        candidate = payload.get("patch")
-        if isinstance(candidate, Mapping):
-            patch_obj = candidate
-        elif isinstance(payload.get("edits"), Sequence):
-            patch_obj = payload
-        if patch_obj is None:
-            return None
-
-        edits_raw = patch_obj.get("edits")
-        if not isinstance(edits_raw, Sequence):
-            return None
-
-        edits: List[Dict[str, Any]] = []
-        for entry in edits_raw:
-            if not isinstance(entry, Mapping):
-                continue
-            path = entry.get("path")
-            if not path:
-                continue
-            start = _safe_int(entry.get("start", entry.get("line", 1)), 1)
-            end = max(start, _safe_int(entry.get("end", start), start))
-            new_text = entry.get("new_text") or entry.get("text") or entry.get("diff")
-            if new_text is None:
-                continue
-            text_val = str(new_text)
-            if not text_val.endswith("\n"):
-                text_val += "\n"
-            edits.append(
-                {
-                    "path": str(path),
-                    "start": start,
-                    "end": end,
-                    "new_text": text_val,
-                }
-            )
-        if not edits:
-            return None
-
-        summary = (
-            patch_obj.get("summary")
-            or payload.get("summary")
-            or fallback_summary
-            or "cgm-remote"
-        )
-        confidence = float(payload.get("confidence", 0.5))
-        tests = payload.get("tests") if isinstance(payload.get("tests"), Sequence) else []
-        return {"edits": edits, "summary": str(summary), "confidence": confidence, "tests": tests}
-
-    def _generate_cgm_candidates(self, payload: Dict[str, Any], k: int) -> List[Dict[str, Any]]:
-        focus_ids = payload.get("graph", {}).get("focus_ids") or []
-        plan_targets = self._plan_targets_from_focus(focus_ids)
-        if not plan_targets:
-            plan_targets = self._plan_targets_from_snippets(self.last_reads or [])
-        if not plan_targets:
-            return []
-        plan = self._build_plan(plan_targets)
-        plan_text = payload.get("plan_text") or "\n".join(payload.get("plan") or [])
-        linearized_list = list(
-            subgraph_store.linearize(
-                self.memory_subgraph, mode=getattr(self.config.collate, "mode", "wsd")
-            )
-        )
-        snippets = list(self.last_reads or [])
-        patch: Optional[Dict[str, Any]] = None
-        actor = _get_shared_actor("cgm_tool")
-        if actor is not None:
-            try:
-                prompt_text = self._build_cgm_chat_prompt(
-                    plan_text=plan_text,
-                    plan_targets=plan_targets,
-                    payload=payload,
-                    snippets=snippets,
-                )
-                response_text = ray.get(actor.chat.remote([
-                    {"role": "system", "content": CGM_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt_text},
-                ]))
-                patch = self._parse_cgm_chat_response(
-                    response_text,
-                    fallback_summary=plan_text,
-                )
-            except Exception:
-                patch = None
-        if patch is None:
-            linearized_text = "\n".join(str(x) for x in linearized_list)
-            patch = cgm_adapter.generate(
-                subgraph_linearized=linearized_text,
-                plan=plan,
-                constraints={"max_edits": max(1, len(plan_targets))},
-                snippets=snippets,
-                plan_text=plan_text,
-                issue=self.issue,
-            )
-
-        edits = list(patch.get("edits") or [])
-        if not edits:
-            return []
-        max_edits = max(1, len(plan_targets))
-        if len(edits) > max_edits:
-            edits = edits[:max_edits]
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
-        for edit in edits:
-            path = str(edit.get("path") or "")
-            if not path:
-                continue
-            start = _safe_int(edit.get("start"), 1)
-            end = max(start, _safe_int(edit.get("end"), start))
-            new_text = str(edit.get("new_text") or "")
-            if new_text and not new_text.endswith("\n"):
-                new_text = new_text + "\n"
-            grouped.setdefault(path, []).append(
-                {
-                    "path": path,
-                    "start": start,
-                    "end": end,
-                    "new_text": new_text,
-                }
-            )
-
-        summary = patch.get("summary", "")
-        confidence = float(patch.get("confidence", 0.5))
-        tests = patch.get("tests", [])
-        candidates: List[Dict[str, Any]] = []
-        for path, group in grouped.items():
-            candidates.append(
-                {
-                    "patch": {"edits": group},
-                    "summary": summary,
-                    "confidence": confidence,
-                    "tests": tests,
-                    "path": path,
-                }
-            )
-        return candidates[:k]
-
-    def _build_plan(self, targets: List[Dict[str, Any]]) -> Plan:
-        plan_targets: List[PlanTarget] = []
-        for idx, target in enumerate(targets or []):
-            try:
-                path = str(target.get("path"))
-                start = _safe_int(target.get("start"), 1)
-                end = max(start, _safe_int(target.get("end"), start))
-                plan_targets.append(
-                    PlanTarget(
-                        path=path,
-                        start=start,
-                        end=end,
-                        id=str(target.get("id") or f"{path}::{start}-{end}::#{idx}"),
-                        confidence=float(target.get("confidence", 1.0)),
-                        why=str(target.get("why", "agent-plan")),
-                    )
-                )
-            except Exception:
-                continue
-        return Plan(targets=plan_targets, budget={"mode": self.config.mode}, priority_tests=[])
-
-    def _apply_patch_edits(self, edits: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if not edits:
-            return {"success": False, "message": "no_edits", "changed_files": []}
-
-        changed_files: List[str] = []
-        logs: List[str] = []
-        success = True
-
-        for edit in edits:
-            path = edit.get("path")
-            start = _safe_int(edit.get("start"), 1)
-            end = max(start, _safe_int(edit.get("end"), start))
-            new_text = edit.get("new_text", "")
-            if not path:
-                success = False
-                logs.append("missing_path")
-                continue
-            encoded = base64.b64encode(str(new_text).encode("utf-8")).decode("ascii")
-            payload = json.dumps(
-                {
-                    "path": path,
-                    "base": self.repo_root_in_container,
-                    "start": start,
-                    "end": end,
-                    "content": encoded,
-                }
-            )
-            script = (
-                "python - <<'PY'\n"
-                "import base64, json\nfrom pathlib import Path\n"
-                "req=json.loads('''" + payload.replace("'", "\\'") + "''')\n"
-                "path=Path(req['path'])\n"
-                "if not path.is_absolute():\n"
-                "    path = Path(req['base']).joinpath(path)\n"
-                "lines = []\n"
-                "try:\n"
-                "    lines = path.read_text(encoding='utf-8', errors='ignore').splitlines(True)\n"
-                "except Exception:\n"
-                "    pass\n"
-                "start=max(1,int(req['start']))\n"
-                "end=max(start,int(req['end']))\n"
-                "content = base64.b64decode(req['content']).decode('utf-8')\n"
-                "replacement = content.splitlines(True)\n"
-                "if lines and lines[end-1:end] and lines[end-1].endswith('\n') and (not replacement or not replacement[-1].endswith('\n')):\n"
-                "    if replacement:\n"
-                "        replacement[-1] = replacement[-1] + '\n'\n"
-                "    else:\n"
-                "        replacement = ['\n']\n"
-                "if end > len(lines):\n"
-                "    raise SystemExit(1)\n"
-                "lines[start-1:end] = replacement\n"
-                "path.write_text(''.join(lines), encoding='utf-8')\n"
-                "print(json.dumps({'path': str(path), 'changed_lines': len(replacement)}))\n"
-                "PY"
-            )
-            out, rc = self.box.run(script, timeout=60)
-            if rc != 0:
-                success = False
-                logs.append(f"edit_failed:{path}:{start}-{end}")
-                continue
-            changed_files.append(path)
-            logs.append(out.strip())
-
-        diff_text = self.box.get_patch()
+        start_line = int(node.get("start_line") or 1)
+        end_line = int(node.get("end_line") or start_line)
+        lines = text.splitlines()
+        snippet_lines = lines[start_line - 1 : end_line]
         return {
-            "success": success,
-            "changed_files": sorted({p for p in changed_files}),
-            "git_diff": diff_text,
-            "logs": logs,
+            "id": node.get("id"),
+            "path": path,
+            "start": start_line,
+            "end": end_line,
+            "snippet": snippet_lines,
         }
 
+    def _merge_repo_nodes_into_working(
+        self,
+        node_ids: Sequence[str],
+        *,
+        status: str = "explored",
+    ) -> None:
+        """把 repo_graph 中的若干节点及其边合并进 working_subgraph。"""
+        if not node_ids:
+            return
+
+        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.working_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                working_nodes_by_id[nid] = n
+
+        working_edges = list(getattr(self.working_subgraph, "edges", []) or [])
+        working_ids = set(working_nodes_by_id.keys())
+
+        for nid in node_ids:
+            if not isinstance(nid, str):
+                continue
+            repo_node = self._repo_nodes_by_id.get(nid)
+            if not repo_node:
+                continue
+            node_copy = dict(repo_node)
+            node_copy["status"] = status
+            tags = set(node_copy.get("tags") or [])
+            tags.add(status)
+            node_copy["tags"] = sorted(tags)
+            working_nodes_by_id[nid] = node_copy
+            working_ids.add(nid)
+
+        for e in self._repo_edges:
+            src_id = e.get("src")
+            dst_id = e.get("dst")
+            if not isinstance(src_id, str) or not isinstance(dst_id, str):
+                continue
+            if src_id in working_ids and dst_id in working_ids:
+                working_edges.append(dict(e))
+
+        self.working_subgraph = subgraph_store.wrap(
+            {
+                "nodes": list(working_nodes_by_id.values()),
+                "edges": working_edges,
+            }
+        )
+
+    def _merge_working_nodes_into_memory(
+        self,
+        node_ids: Sequence[str],
+        *,
+        status: str = "remembered",
+    ) -> None:
+        """把 working_subgraph 中的若干节点及其边合并进 memory_subgraph。"""
+        if not node_ids:
+            return
+
+        mem_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.memory_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                mem_nodes_by_id[nid] = n
+
+        mem_edges: List[Dict[str, Any]] = list(getattr(self.memory_subgraph, "edges", []) or [])
+        mem_ids = set(mem_nodes_by_id.keys())
+
+        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.working_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                working_nodes_by_id[nid] = n
+
+        for nid in node_ids:
+            if not isinstance(nid, str):
+                continue
+            w_node = working_nodes_by_id.get(nid)
+            if not w_node:
+                continue
+            node_copy = dict(w_node)
+            node_copy["status"] = status
+            tags = set(node_copy.get("tags") or [])
+            tags.add(status)
+            node_copy["tags"] = sorted(tags)
+            mem_nodes_by_id[nid] = node_copy
+            mem_ids.add(nid)
+
+        for e in getattr(self.working_subgraph, "edges", []) or []:
+            src_id = e.get("src")
+            dst_id = e.get("dst")
+            if not isinstance(src_id, str) or not isinstance(dst_id, str):
+                continue
+            if src_id in mem_ids and dst_id in mem_ids:
+                mem_edges.append(dict(e))
+
+        self.memory_subgraph = subgraph_store.wrap(
+            {
+                "nodes": list(mem_nodes_by_id.values()),
+                "edges": mem_edges,
+            }
+        )
