@@ -1,60 +1,117 @@
 """
-actor/cgm_adapter.py
+graph_planner/agents/rule_based/cgm_adapter.py
 
-统一对接 CodeFuse-CGM 的补丁生成入口。
+统一对接 CodeFuse-CGM 的补丁生成入口（本进程内）。
 
-语义（更新版）：
-    - 仅调用远程 CGM Ray actor；
-    - 不再 fallback 到本地 rule-based cgm_adapter.generate；
-    - 如果没有可用 actor 或调用失败，直接 raise，让上层环境决定如何处理。
+语义（对齐 4.1）：
+    - 优先调用远程 CodeFuse CGM HTTP 服务（CodeFuseCGMClient）；
+    - 如果 HTTP 客户端不可用或失败，并且有本地 _LocalCGMRuntime，则尝试本地模型；
+    - 不再 fallback 到任何 rule-based 补丁；
+    - 不在这里处理 Ray / actor 逻辑（Ray 统一放在 actor/cgm_adapter.py）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import os
 
+from aci.schema import Patch, Plan
+from graph_planner.integrations.codefuse_cgm.client import CodeFuseCGMClient
+from graph_planner.infra import telemetry
 
-try:
-    import ray  # type: ignore[import]
-except Exception:  # pragma: no cover
-    ray = None  # type: ignore[assignment]
 
-# 默认的 CGM actor 名称，可以通过环境变量覆盖
-_DEFAULT_ACTOR_NAME = os.environ.get("CODEFUSE_CGM_ACTOR", "codefuse_cgm_actor")
-
+# ============================================================
+# 本地 CGM Runtime（占位实现）
+# ============================================================
 
 @dataclass
-class CGMRequest:
-    """传给远程 CGM 的统一请求结构。"""
+class _LocalCGMRuntime:
+    """
+    本地 CGM 推理 Runtime。
 
-    collated: Dict[str, Any]
-    plan: str
-    constraints: Dict[str, Any]
-    run_id: str
-    issue: Dict[str, Any]
+    目前只存一个 generator 占位，真正的生成逻辑可以之后再补。
+    service.py 会通过 _LocalCGMRuntime(generator=...) 来构造。
+    """
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "collated": self.collated,
-            "plan": self.plan,
-            "constraints": self.constraints,
-            "run_id": self.run_id,
-            "issue": self.issue,
-        }
+    generator: Any
+
+    def generate_patch(
+        self,
+        *,
+        issue: Optional[Dict[str, Any]],
+        plan: Plan,
+        plan_text: Optional[str],
+        subgraph_linearized: Optional[List[Dict[str, Any]]],
+        snippets: Optional[List[Dict[str, Any]]],
+        constraints: Optional[Dict[str, Any]] = None,
+    ) -> Patch:
+        """
+        这里暂时不实现本地推理逻辑，直接提醒需要补完。
+
+        如果你之后真的要用本地 CGM（不通过 HTTP service），
+        可以在这里把 generator + collated payload 接上。
+        """
+        raise NotImplementedError(
+            "Local CGM runtime is not wired yet; "
+            "please implement _LocalCGMRuntime.generate_patch if needed."
+        )
 
 
-def _resolve_actor(name: str) -> Any:
-    """根据名称解析 Ray actor；解析失败返回 None。"""
-    if ray is None:
+# ============================================================
+# HTTP 客户端 & 本地 Runtime getter
+# ============================================================
+
+_CLIENT: Optional[CodeFuseCGMClient] = None
+_LOCAL_RUNTIME: Optional[_LocalCGMRuntime] = None  # 如需本地 runtime，可在其他模块赋值
+
+
+def _get_client() -> Optional[CodeFuseCGMClient]:
+    """
+    返回全局复用的 CodeFuse CGM HTTP 客户端。
+
+    使用环境变量配置：
+        CODEFUSE_CGM_ENDPOINT: 必选，HTTP 服务的 base url（例如 http://127.0.0.1:8000/generate）
+        CODEFUSE_CGM_API_KEY: 可选，若服务需要鉴权
+        CODEFUSE_CGM_MODEL_NAME: 可选，转发给远程服务的模型名
+    """
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+
+    endpoint = os.getenv("CODEFUSE_CGM_ENDPOINT")
+    if not endpoint:
         return None
-    try:
-        return ray.get_actor(name)
-    except Exception:
-        return None
 
+    api_key = os.getenv("CODEFUSE_CGM_API_KEY") or None
+    model_name = os.getenv("CODEFUSE_CGM_MODEL_NAME") or None
+
+    _CLIENT = CodeFuseCGMClient(
+        endpoint=endpoint,
+        api_key=api_key,
+        model=model_name,
+    )
+    return _CLIENT
+
+
+def _get_local_runtime() -> Optional[_LocalCGMRuntime]:
+    """
+    返回全局本地 runtime。
+
+    默认 None；如果你想启用本地 CGM，可以在别处：
+
+        from graph_planner.agents.rule_based import cgm_adapter
+        cgm_adapter._LOCAL_RUNTIME = _LocalCGMRuntime(generator=...)
+
+    然后这里就能拿到。
+    """
+    return _LOCAL_RUNTIME
+
+
+# ============================================================
+# 主入口：generate()
+# ============================================================
 
 def generate(
     subgraph_linearized: Optional[List[Dict[str, Any]]],
@@ -64,12 +121,13 @@ def generate(
     plan_text: Optional[str] = None,
     issue: Optional[Dict[str, Any]] = None,
 ) -> Patch:
-    """生成补丁：优先调用 CodeFuse CGM 客户端或本地 CGM Runtime。
+    """
+    生成补丁：优先调用 CodeFuse CGM HTTP 客户端，然后尝试本地 Runtime。
 
-    更新语义：
-        - 不再回退到本地“规则打标记”补丁（_generate_local_patch）。
+    语义（4.1 对齐版）：
+        - 不再回退到本地“规则打标记”补丁；
         - 如果 HTTP 客户端和本地 Runtime 都不可用或均失败，则直接抛出 RuntimeError，
-          由调用方（PlannerEnv / service 等）自己决定怎么处理。
+          由调用方（PlannerEnv / actor / service 等）决定如何处理。
     """
     client = _get_client()
     runtime = _get_local_runtime()
