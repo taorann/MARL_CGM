@@ -434,7 +434,7 @@ class SandboxRuntime:
         _dbg(f"pytest cmd: {cmd}")
         start = time.time()
         out, rc = self._exec(cmd, timeout=timeout)
-            duration = time.time() - start
+        duration = time.time() - start
         result = {"mode": "pytest", "passed": rc == 0, "rc": rc, "stdout": out}
         return self._finalize_test_result(
             result,
