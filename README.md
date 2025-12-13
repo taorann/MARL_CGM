@@ -7,7 +7,7 @@ Graph Planner 是一个面向代码修复任务的双智能体系统，通过**�
 - 借助 [R2E-Gym](R2E-Gym/README.md) 的 RepoEnv / DockerRuntime 运行环境完成端到端强化学习训练。
 - 保留本地部署接口，使 Planner 模型与 CGM 可以在离线环境下无缝接入。
 
-更多现状、缺失信息与后续计划详见 [`docs/project_status.md`](docs/project_status.md)。
+
 
 ## 目录结构概览
 
@@ -27,20 +27,18 @@ Graph Planner 是一个面向代码修复任务的双智能体系统，通过**�
 | `scripts/` | 数据准备、数据注册、评测与自动化工具脚本。 |
 | `tests/` | rLLM 生态相关的单元/集成测试，例如奖励管理器与数据注册流程。 |
 
-各目录的职责与详细说明可参考：
-
-- [`docs/graph_planner_architecture_pipeline.md`](docs/graph_planner_architecture_pipeline.md)：架构分层、容器运行流以及 CGM / rLLM 训练流水线的统一参考。
-- [`docs/scripts_and_tests_guide.md`](docs/scripts_and_tests_guide.md)：脚本与测试入口、ACI/Git/Lint/Test 的实现来源。
-- [`docs/pain-points.md`](docs/pain-points.md)：记录 Contract-as-Code、补丁落盘与训练集成的痛点与解决方案。
 
 ## 快速上手
 
 1. **安装依赖**
    ```bash
-   pip install -e .             # 安装 Graph Planner 自身
-   pip install -e ./R2E-Gym     # 安装 RepoEnv / DockerRuntime 依赖
+   cd rllm/
+   pip install -e ./verl  #rllm需要安装verl           
+   pip install -e .       #安装rllm
+   cd ..
+   pip install -e .
    ```
-   R2E-Gym 使用 `pyproject.toml` 管理依赖，`pip install -e ./R2E-Gym` 会自动拉取所需包；如需与官方流程保持一致，可按照 `R2E-Gym/README.md` 中的 `uv sync` 步骤进行高级安装。若需要运行本地 LLM / CGM，请在 `.aci/config.json` 中填写对应的 endpoint、model、API Key 等字段。
+
 
 2. **准备训练/评测数据集**
    ```bash
@@ -61,28 +59,14 @@ Graph Planner 是一个面向代码修复任务的双智能体系统，通过**�
 
 4. **运行 Graph Planner 评测**
     ```bash
-    bash scripts/run_eval_graph_planner.sh \
-      --config configs/eval/graph_planner_eval_defaults.yaml \
-      --planner-api-key sk-xxxx
+
     ```
-    Shell 包装脚本会自动导出 `PYTHONPATH`、合并 CLI 与 YAML 配置，随后调用 `scripts/eval_graph_planner_engine.py`：
-    - 在需要时拉起本地 planner / CGM vLLM 服务，并根据显存余量调整 `--gpu-memory-utilization`；
-    - 构造 rLLM 执行引擎，批量运行 RepoEnv 任务并写出日志与结果汇总。
-    若已经手动启动推理服务，可使用 `--skip-auto-launch-planner` 或 `--skip-auto-launch-cgm` 避免重复拉起。
 
-5. **强化学习训练入口重构中**
-    统一的训练 CLI 正在重构中，未来会复用 `scripts/eval_graph_planner_engine.py` 的容器编排逻辑并直接对接 rLLM/VERL GRPO 训练。最新进展与待办可在 [`docs/project_status.md`](docs/project_status.md) 中追踪。
 
-6. **合同冒烟检查**
-    ```bash
-    PYTHONPATH=. python scripts/validate_contracts.py
-    ```
-    该脚本会调用解析器与补丁校验器，以确保 Planner/CGM 的协议未发生漂移。
+5. **强化学习训练**
 
-## 文档索引
 
-- [`docs/graph_planner_architecture_pipeline.md`](docs/graph_planner_architecture_pipeline.md)：端到端架构、RepoEnv 冒烟指引与训练命令速查。
-- [`docs/runbook.md`](docs/runbook.md)：rLLM 训练/评估配置、YAML-only 模式、并行预检与 W&B 监控指南。
 
-若需进一步了解 ACI 工具链与 Git 封装的使用方式，请参见 `docs/scripts_and_tests_guide.md` 中的“ACI / Git / Lint / Test 的实现来源”章节。
+
+
 
