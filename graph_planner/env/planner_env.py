@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
@@ -105,6 +106,7 @@ try:
         SubmitAction,
     )
     from ..infra.config import Config, load as load_config
+    from ..infra import telemetry as telemetry_mod
     try:
         from ..integrations.codefuse_cgm.formatting import GraphLinearizer, SnippetFormatter
     except Exception:
@@ -189,6 +191,12 @@ class PlannerEnv:
         self.box = SandboxRuntime(sandbox_cfg, run_id=effective_run_id)
         self.config: Config = load_config()
         self.config_dict: Dict[str, Any] = self.config.to_dict()
+        # Unified telemetry (trajectory / events / metrics)
+        self.telemetry = telemetry_mod.get_telemetry(run_id=effective_run_id)
+        try:
+            self.telemetry.start_run(meta={"component": "planner_env"})
+        except Exception:
+            pass
         io_cfg = self.config_dict.get("io") if isinstance(self.config_dict, Mapping) else {}
         if not isinstance(io_cfg, Mapping):
             io_cfg = {}
@@ -309,11 +317,31 @@ class PlannerEnv:
             cgm_tokens_est=int(caps.get("cgm_tokens", DEFAULT_MEMORY_CAPS["cgm_tokens"])),
         )
 
+        # Telemetry: start a fresh episode for this issue/task
+        try:
+            self.telemetry.start_episode(
+                task_id=self.issue_id,
+                meta={
+                    "issue_id": self.issue_id,
+                    "repo_root_host": self.repo_root_host,
+                    "backend_mode": backend_mode,
+                },
+                tags=(f"issue:{self.issue_id}",),
+            )
+            self.telemetry.set_step(0)
+        except Exception:
+            pass
+
         return self._obs()
 
     def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """单步：接受一个 action 字典，返回 (obs, reward, done, info)。"""
         self.steps += 1
+        _t0 = time.perf_counter()
+        try:
+            self.telemetry.set_step(self.steps)
+        except Exception:
+            pass
         info: Dict[str, Any] = {}
         validation_meta: Dict[str, Any] = {}
         action_obj: ActionUnion
@@ -326,6 +354,19 @@ class PlannerEnv:
             obs = self._obs()
             try:
                 self._log_step_graphs()
+            except Exception:
+                pass
+            # Telemetry: record invalid action as a step
+            try:
+                self.telemetry.set_step(self.steps)
+                self.telemetry.log_step({
+                    "action": action,
+                    "error": {"code": exc.code, "detail": exc.detail},
+                    "reward": -0.05,
+                    "done": False,
+                    "obs_summary": self._telemetry_obs_summary(),
+                })
+                self.telemetry.metric("env.invalid_action", 1.0, step_id=self.steps)
             except Exception:
                 pass
             return obs, -0.05, False, info
@@ -358,6 +399,10 @@ class PlannerEnv:
         done = bool(info.get("done"))
 
         obs = self._obs()
+        try:
+            self._telemetry_log_step_end(action=action, info=info, reward=reward, done=done, t0=_t0)
+        except Exception:
+            pass
         self._log_step_graphs()
         return obs, reward, done, info
 
