@@ -83,7 +83,7 @@ else:
         """面向 rLLM 的 Graph Planner 代理封装。"""
 
         system_prompt: str = SYSTEM_PROMPT
-        # 默认关闭规则 fallback：解析失败直接抛错，让上层决定是否重试。
+        # 默认关闭规则 fallback，保持“纯模型”行为
         use_rule_fallback: bool = False
 
         def __post_init__(self) -> None:
@@ -225,49 +225,38 @@ else:
             *,
             error: str | None = None,
         ) -> tuple[str, ActionUnion, str, Dict[str, Any]]:
-            """
-            解析/校验失败时的处理逻辑。
+            """在模型输出无法解析时的 fallback 行为。
 
-            默认（use_rule_fallback = False）：
-                - 不再调用规则代理；
-                - 直接把错误信息抛给上游，让 driver 决定是否重试 LLM。
-
-            如果显式配置 use_rule_fallback=True 且存在 _rule_agent：
-                - 保留原来的行为：调用 rule-based agent 给出一个保底动作。
+            - 若启用规则 fallback（use_rule_fallback=True），则调用规则 agent 给出一个保底动作；
+            - 若未启用规则 fallback，则直接抛出异常，让上层 driver 决定是否重试生成。
             """
 
-            # 情况 1：默认路径 / 无规则 agent → 直接抛出错误
+            # 1) 未启用规则 fallback：直接把错误抛给上层
             if not self._rule_agent:
-                detail = {
+                details: Dict[str, Any] = {
                     "reason": reason,
-                    "raw_response": response,
-                    "raw_action": raw_action,
-                    "error": error,
+                    "response": response,
                 }
+                if error:
+                    details["error"] = error
+                if raw_action is not None:
+                    details["raw_action"] = raw_action
                 raise ValueError(
-                    f"Model response invalid and rule-based fallback is disabled: {detail}"
+                    f"Model response could not be parsed and rule-based fallback is disabled: {details}"
                 )
 
-            # 情况 2：显式启用了 rule_fallback → 使用规则 agent 造一个保底动作
+            # 2) 启用了规则 fallback：沿用原来的“保底动作”逻辑
             observation = self._last_env_observation or {}
             fallback = self._rule_agent.step(observation)
             action = fallback.get("action_obj") or SubmitAction()
             thought = fallback.get("plan", fallback.get("prompt", ""))
-
             payload = action_to_payload(action)
-            params = {
-                "thought": thought,
-                **{k: v for k, v in payload.items() if k != "type"},
-            }
+            params = {"thought": thought, **{k: v for k, v in payload.items() if k != "type"}}
             params[FALLBACK_REASON_KEY] = reason
             if error:
                 params["error"] = error
-
-            assistant_msg = text_protocol.format_action_block(
-                payload.get("type", "noop"),
-                params,
-            )
-            meta: Dict[str, Any] = {
+            assistant_msg = text_protocol.format_action_block(payload.get("type", "noop"), params)
+            meta = {
                 "used_fallback": True,
                 FALLBACK_REASON_KEY: reason,
                 "raw_action": raw_action,

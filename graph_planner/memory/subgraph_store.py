@@ -131,8 +131,22 @@ def wrap(obj) -> WorkingSubgraph:
 # ======================= I/O =======================
 
 def _store_dir() -> str:
+    """
+    返回当前仓库下的子图缓存目录。
+
+    优先使用环境变量 GRAPH_PLANNER_SUBGRAPHS_DIR；
+    否则默认: <git-root>/graph_planner/subgraphs
+    """
+    # 1) 环境变量覆盖
+    override = os.environ.get("GRAPH_PLANNER_SUBGRAPHS_DIR")
+    if override:
+        d = os.path.abspath(override)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    # 2) 默认放在仓库根目录下的 graph_planner/subgraphs
     root = repo_root() if callable(repo_root) else repo_root
-    d = os.path.join(root, ".aci", "subgraphs")
+    d = os.path.join(root, "graph_planner", "subgraphs")
     os.makedirs(d, exist_ok=True)
     return d
 
