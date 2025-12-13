@@ -9,8 +9,8 @@ __pycache__/
 outputs/
 wandb/
 logs/
-.aci/backups/
-.aci/subgraphs/
+graph_planner/backups/
+graph_planner/subgraphs/
 
 # ===== big local models =====
 models/

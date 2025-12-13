@@ -24,11 +24,12 @@ GraphAdapter:
 - span: 1-based, 闭区间
 """
 
-from typing import List, Dict, Any, Optional, Tuple, Iterable
+from typing import List, Dict, Any, Optional, Tuple, Iterable, Callable
 import os
 import json
 import ast
 import re
+import logging
 from collections import defaultdict
 
 from aci._utils import repo_root, list_text_files, safe_read_text
@@ -36,6 +37,7 @@ from .types import Node, Edge, Anchor, DocChunk
 
 
 _REPO_ROOT_OVERRIDE: Optional[str] = None
+logger = logging.getLogger(__name__)
 
 
 def set_repo_root(root: Optional[str]) -> None:
@@ -338,6 +340,58 @@ def _load_jsonl_graph(path: str, gh: GraphHandle) -> None:
 
 def _build_light_graph(gh: GraphHandle) -> None:
     """
+    Lightweight graph builder with dump-back strategy.
+
+    Steps:
+    1) Try an external/high-quality builder hook (e.g., tree-sitter / CodeFuse).
+    2) Fallback to the built-in AST-based lightweight graph.
+    3) Persist the result to ``repo_graph.jsonl`` so future runs can load directly.
+    """
+
+    built_by_external = _build_with_external_builder(gh)
+
+    if not built_by_external:
+        _build_light_graph_ast(gh)
+
+    try:
+        graph_path = os.path.join(gh.root, "repo_graph.jsonl")
+        _dump_jsonl_graph(graph_path, gh)
+    except Exception:
+        logger.warning("failed to dump repo_graph.jsonl", exc_info=True)
+
+
+def _build_with_external_builder(gh: GraphHandle) -> bool:
+    """
+    Hook for higher-quality graph construction.
+
+    If ``GRAPH_PLANNER_EXTERNAL_GRAPH_BUILDER`` is set to ``module:func``, this
+    attempts to import and invoke it with ``(gh,)``. The function should mutate
+    the provided ``GraphHandle`` in place. Any failure falls back to the AST
+    builder.
+    """
+
+    builder_path = os.environ.get("GRAPH_PLANNER_EXTERNAL_GRAPH_BUILDER")
+    if not builder_path:
+        return False
+
+    try:
+        module_name, func_name = builder_path.rsplit(":", 1)
+        module = __import__(module_name, fromlist=[func_name])
+        builder: Callable[[GraphHandle], None] = getattr(module, func_name)
+    except Exception:
+        logger.warning("failed to import external graph builder %s", builder_path, exc_info=True)
+        return False
+
+    try:
+        builder(gh)
+        return True
+    except Exception:
+        logger.warning("external graph builder %s failed, falling back to AST", builder_path, exc_info=True)
+        return False
+
+
+def _build_light_graph_ast(gh: GraphHandle) -> None:
+    """
     Lightweight graph:
       - file nodes for text files (<=5MB)
       - python files: ast parse to add function/class (contains edges)
@@ -355,6 +409,28 @@ def _build_light_graph(gh: GraphHandle) -> None:
         rel = _norm_posix(os.path.relpath(f, root))
         _add_python_contains(gh, rel)
         _add_python_imports(gh, rel)
+
+
+def _dump_jsonl_graph(path: str, gh: GraphHandle) -> None:
+    """Persist ``GraphHandle`` as JSONL for future fast loading."""
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        for node in gh.nodes.values():
+            rec = {"type": "node", "data": dict(node)}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        for src, lst in gh.adj.items():
+            for dst, etype in lst:
+                rec = {
+                    "type": "edge",
+                    "data": {"src": src, "dst": dst, "etype": etype},
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    os.replace(tmp, path)
 
 
 def _file_node_id(rel_path: str) -> str:

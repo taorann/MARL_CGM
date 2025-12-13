@@ -5,7 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
 
 DEBUG = bool(os.environ.get("DEBUG"))
@@ -242,6 +242,7 @@ class PlannerEnv:
     # Gym-like API
     # ------------------------------------------------------------------
     def reset(self) -> Dict[str, Any]:
+        """重置环境：重建 repo_graph，并清空 memory_subgraph / working_subgraph。"""
         self.steps = 0
         self.last_info = {"reset": True}
         backend_mode = getattr(self.box, "_mode", None)
@@ -277,13 +278,11 @@ class PlannerEnv:
                     self._repo_nodes_by_id[nid] = n
             self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
 
-        # === 2) 初始化 memory_subgraph（长期记忆） ===
-        try:
-            self.memory_subgraph = subgraph_store.load(self.issue_id)
-        except Exception:
-            self.memory_subgraph = subgraph_store.new()
+        # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
+        # 直接 new 一张空的长期记忆图，不再从磁盘加载历史记忆。
+        self.memory_subgraph = subgraph_store.new()
 
-        # === 3) 工作图 = 记忆图的拷贝（起点一致） ===
+        # === 3) 工作图 = 记忆图的拷贝（此时也是空图） ===
         self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
 
         # === 4) 初始化 text_memory（基于 memory_subgraph） ===
@@ -293,6 +292,7 @@ class PlannerEnv:
             graph_store=self.memory_graph_store,
             text_store=self.memory_text_store,
         )
+        # 此时 memory_subgraph 为空，size 从 0 开始计
         self.memory_state.size = text_memory.Size(
             nodes=len(self.memory_subgraph.nodes),
             edges=len(self.memory_subgraph.edges),
@@ -309,14 +309,7 @@ class PlannerEnv:
             cgm_tokens_est=int(caps.get("cgm_tokens", DEFAULT_MEMORY_CAPS["cgm_tokens"])),
         )
 
-        # 在 reset 时记录一次三图状态（如果配置了 GRAPH_PLANNER_TRACE_DIR）
-        obs = self._obs()
-        try:
-            self._log_step_graphs()
-        except Exception:
-            pass
-
-        return obs
+        return self._obs()
 
     def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """单步：接受一个 action 字典，返回 (obs, reward, done, info)。"""
@@ -362,12 +355,7 @@ class PlannerEnv:
         done = bool(info.get("done"))
 
         obs = self._obs()
-        # 每一步动作之后记录一次三图状态
-        try:
-            self._log_step_graphs()
-        except Exception:
-            pass
-
+        self._log_step_graphs()
         return obs, reward, done, info
 
     # ------------------------------------------------------------------
@@ -403,50 +391,84 @@ class PlannerEnv:
     # Explore / Memory
     # ------------------------------------------------------------------
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
+        """
+        实现 ExploreAction 的三个子操作：
+        - find:  根据 anchors 在 repo 图中做候选检索，不修改 working_subgraph；
+        - expand: 围绕 anchors/nodes 在图上扩展，并 merge 进 working_subgraph；
+        - read:  对指定 nodes 读取代码片段（snippets），并将这些节点标记为 explored。
+        """
+
         info: Dict[str, Any] = {"kind": "explore", "op": act.op}
-        base_graph = self.repo_graph or self.working_subgraph
 
-        if act.op == "expand":
-            max_per_anchor = _safe_int(act.max_per_anchor or 8, 8)
-            total_limit = _safe_int(act.total_limit or 32, 32)
-            dir_k = _safe_int(act.dir_diversity_k or 4, 4)
+        if not self.repo_graph:
+            info["error"] = "missing-repo-graph"
+            return info
 
+        total_limit = _safe_int(act.limit or 32, 32)
+
+        # -------- op = find --------
+        if act.op == "find":
             candidates = mem_candidates.build_mem_candidates(
-                subgraph=base_graph,
+                subgraph=self.repo_graph,
                 anchors=act.anchors,
-                max_nodes_per_anchor=max_per_anchor,
+                max_nodes_per_anchor=total_limit,
                 total_limit=total_limit,
-                dir_diversity_k=dir_k,
+                dir_diversity_k=4,
             )
             self.last_candidates = candidates
             info["candidates"] = candidates
-            candidate_ids = [
-                c.get("id") for c in candidates
-                if isinstance(c.get("id"), str)
-            ]
-            self._merge_repo_nodes_into_working(candidate_ids, status="explored")
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
+        # -------- op = expand --------
+        if act.op == "expand":
+            candidates = mem_candidates.build_mem_candidates(
+                subgraph=self.repo_graph,
+                anchors=act.anchors,
+                max_nodes_per_anchor=total_limit,
+                total_limit=total_limit,
+                dir_diversity_k=4,
+            )
+            self.last_candidates = candidates
+            info["candidates"] = candidates
+
+            node_ids: List[str] = []
+            for c in candidates:
+                nid = c.get("id")
+                if isinstance(nid, str):
+                    node_ids.append(nid)
+
+            self._merge_repo_nodes_into_working(node_ids, status="explored")
+            info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
+            return info
+
+        # -------- op = read --------
         if act.op == "read":
-            resolved: List[Dict[str, Any]] = []
-            for node_id in act.nodes:
-                node = self._resolve_node(node_id)
-                if node:
-                    resolved.append(node)
-            snippets: List[Dict[str, Any]] = []
-            for node in resolved[: max(1, int(act.limit or 3))]:
-                snippet = self._read_node_snippet(node)
+            node_ids = list(act.nodes)
+            if not node_ids and getattr(self, "last_candidates", None):
+                for c in self.last_candidates:
+                    nid = c.get("id")
+                    if isinstance(nid, str):
+                        node_ids.append(nid)
+
+            # 去重并做 limit 截断
+            uniq_ids: List[str] = []
+            for nid in node_ids:
+                if isinstance(nid, str) and nid not in uniq_ids:
+                    uniq_ids.append(nid)
+            if total_limit:
+                uniq_ids = uniq_ids[: total_limit]
+
+            snippets = []
+            for nid in uniq_ids:
+                snippet = self._read_node_snippet(nid)
                 if snippet:
                     snippets.append(snippet)
+
             self.last_reads = snippets
             info["snippets"] = snippets
-            # 把读取到的节点也 merge 进 working_subgraph
-            node_ids = [
-                n.get("id") for n in resolved
-                if isinstance(n.get("id"), str)
-            ]
-            self._merge_repo_nodes_into_working(node_ids, status="explored")
+
+            self._merge_repo_nodes_into_working(uniq_ids, status="explored")
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -748,7 +770,9 @@ class PlannerEnv:
                 return dict(repo_node)
         return None
 
-    def _read_node_snippet(self, node: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    def _read_node_snippet(self, node: Union[Mapping[str, Any], str]) -> Optional[Dict[str, Any]]:
+        if isinstance(node, str):
+            node = self._resolve_node(node) or {}
         path = _norm_path(node.get("path") or "")
         if not path:
             return None
@@ -756,8 +780,11 @@ class PlannerEnv:
         text = _read_file_text(abs_path)
         if not text:
             return None
-        start_line = int(node.get("start_line") or 1)
-        end_line = int(node.get("end_line") or start_line)
+        span = node.get("span") if isinstance(node, Mapping) else {}
+        span_start = span.get("start") if isinstance(span, Mapping) else None
+        span_end = span.get("end") if isinstance(span, Mapping) else None
+        start_line = int(node.get("start_line") or span_start or 1)
+        end_line = int(node.get("end_line") or span_end or start_line)
         lines = text.splitlines()
         snippet_lines = lines[start_line - 1 : end_line]
         return {

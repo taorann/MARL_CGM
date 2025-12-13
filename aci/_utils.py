@@ -84,7 +84,15 @@ def ensure_backup(path: str) -> str:
     """
     root = repo_root()
     rel = os.path.relpath(os.path.abspath(path), root)
-    backup_dir = os.path.join(root, ".aci", "backups", os.path.dirname(rel))
+    # 1) 环境变量覆盖备份根目录
+    override = os.environ.get("GRAPH_PLANNER_BACKUPS_DIR")
+    if override:
+        backup_root = os.path.abspath(override)
+    else:
+        # 默认：<git-root>/graph_planner/backups
+        backup_root = os.path.join(root, "graph_planner", "backups")
+
+    backup_dir = os.path.join(backup_root, os.path.dirname(rel))
     os.makedirs(backup_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     suffix = f".{ts}.bak"
