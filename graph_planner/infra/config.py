@@ -90,6 +90,27 @@ class LintCfg:
 
 @dataclass
 class TelemetryCfg:
+    """Telemetry configuration.
+
+    - ``base_dir`` is the root directory for the unified telemetry backend.
+      A run directory is created under ``base_dir/<run_id>/episodes/<episode_id>/``.
+    - ``events_path`` / ``test_runs_path`` are legacy flat JSONL paths kept for
+      backward compatibility.
+    """
+
+    enabled: bool = True
+
+    # Unified backend root.
+    base_dir: str = str(REPO_ROOT / "logs" / "telemetry")
+
+    # Write a compact metrics line to stdout for quick monitoring.
+    console_metrics: bool = True
+
+    # Max characters kept for any free-form text field in telemetry payload.
+    truncate_chars: int = 4000
+
+    # Legacy flat JSONL outputs (optional).
+    write_legacy: bool = False
     events_path: str = str(REPO_ROOT / "logs" / "events.jsonl")
     test_runs_path: str = str(REPO_ROOT / "logs" / "test_runs.jsonl")
 
