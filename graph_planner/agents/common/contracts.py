@@ -136,16 +136,16 @@ PLANNER_CONTRACT = PlannerContract(
     SYSTEM_PROMPT=PLANNER_SYSTEM_PROMPT,
     ACTIONS=("explore", "memory", "repair", "submit", "noop"),
     allowed_params={
-        "explore": {"thought", "op", "anchors", "nodes", "hop", "limit"},
-        "memory": {"thought", "target", "scope", "intent", "selector"},
+        "explore": {"thought", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
+        "memory": {"thought", "target", "intent", "selector"},
         "repair": {"thought", "subplan", "focus_ids", "apply"},
         "submit": {"thought"},
         "noop": {"thought"},
     },
     required_params={
         "repair": {"subplan"},
-        "memory": {"target", "intent"},
-        "explore": {"anchors"},
+        "memory": {"intent"},
+        "explore": set(),
     },
 )
 
@@ -334,46 +334,128 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         )
 
     if action_name == "explore":
-        op = str(params.get("op", "expand")).lower()
+        op = str(params.get("op", "find")).lower()
         anchors = _ensure_dict_list(params.get("anchors"))
-        if not anchors:
-            raise ProtocolError(
-                PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
-                "explore action requires at least one anchor",
-            )
         nodes = _ensure_str_list(params.get("nodes"))
-        try:
-            hop_raw = int(params.get("hop", 1))
-        except Exception:
-            hop_raw = 1
-        try:
-            limit_raw = int(params.get("limit", 50))
-        except Exception:
-            limit_raw = 50
+        query = params.get("query")
+        if isinstance(query, str):
+            query = query.strip()
+        else:
+            query = None
+
+        # 兼容：如果 expand 给的是 nodes 而不是 anchors，把 nodes 转成 anchors
+        if op == "expand" and not anchors and nodes:
+            anchors = [{"id": nid} for nid in nodes if isinstance(nid, str) and nid.strip()]
+
+        # op 分支校验（不要再强制所有 explore 都带 anchors）
+        if op == "read":
+            if not nodes:
+                raise ProtocolError(
+                    PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                    "explore.read requires non-empty nodes",
+                )
+        elif op == "expand":
+            if not anchors:
+                raise ProtocolError(
+                    PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                    "explore.expand requires anchors (or nodes convertible to anchors)",
+                )
+        elif op == "find":
+            if not anchors and not query:
+                raise ProtocolError(
+                    PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                    "explore.find requires anchors or query",
+                )
+        else:
+            raise ProtocolError(PlannerErrorCode.UNKNOWN_ACTION.value, f"unknown explore op: {op}")
+
+        # 数值字段解析 + cap
+        def _to_int(name: str, default: int) -> int:
+            try:
+                return int(params.get(name, default))
+            except Exception:
+                return default
+
+        hop_raw = _to_int("hop", 1)
+        limit_raw = _to_int("limit", 50)
+        max_per_anchor_raw = params.get("max_per_anchor")
+        total_limit_raw = params.get("total_limit")
+        dir_diversity_k_raw = params.get("dir_diversity_k")
 
         hop = max(0, min(2, hop_raw))
         limit = max(1, min(100, limit_raw))
+
+        if max_per_anchor_raw is None:
+            max_per_anchor_raw = None
+        else:
+            try:
+                max_per_anchor_raw = int(max_per_anchor_raw)
+            except Exception:
+                max_per_anchor_raw = None
+
+        if total_limit_raw is None:
+            total_limit_raw = None
+        else:
+            try:
+                total_limit_raw = int(total_limit_raw)
+            except Exception:
+                total_limit_raw = None
+
+        if dir_diversity_k_raw is None:
+            dir_diversity_k_raw = None
+        else:
+            try:
+                dir_diversity_k_raw = int(dir_diversity_k_raw)
+            except Exception:
+                dir_diversity_k_raw = None
+
+        def _cap_optional(v: Optional[int], lo: int, hi: int) -> Optional[int]:
+            if v is None:
+                return None
+            return max(lo, min(hi, v))
+
+        max_per_anchor = _cap_optional(max_per_anchor_raw, 1, 200)
+        total_limit = _cap_optional(total_limit_raw, 1, 300)
+        dir_diversity_k = _cap_optional(dir_diversity_k_raw, 0, 50)
+
         capped_fields: Dict[str, Any] = {}
         if hop != hop_raw:
             capped_fields["hop"] = hop_raw
         if limit != limit_raw:
             capped_fields["limit"] = limit_raw
+        if max_per_anchor_raw is not None and max_per_anchor != max_per_anchor_raw:
+            capped_fields["max_per_anchor"] = max_per_anchor_raw
+        if total_limit_raw is not None and total_limit != total_limit_raw:
+            capped_fields["total_limit"] = total_limit_raw
+        if dir_diversity_k_raw is not None and dir_diversity_k != dir_diversity_k_raw:
+            capped_fields["dir_diversity_k"] = dir_diversity_k_raw
         if capped_fields:
             meta.setdefault("warnings", []).append("value-capped")
             meta["capped"] = True
             meta["capped_fields"] = capped_fields
 
-        return _attach_meta(ExploreAction(op=op, anchors=anchors, nodes=nodes, hop=hop, limit=limit), meta)
-
+        return _attach_meta(
+            ExploreAction(
+                op=op,
+                anchors=anchors,
+                nodes=nodes,
+                query=query,
+                hop=hop,
+                limit=limit,
+                max_per_anchor=max_per_anchor,
+                total_limit=total_limit,
+                dir_diversity_k=dir_diversity_k,
+            ),
+            meta,
+        )
     if action_name == "memory":
         target = str(params.get("target", "explore"))
-        scope = str(params.get("scope", "turn"))
         intent = str(params.get("intent", "commit"))
         selector = params.get("selector")
-        if isinstance(selector, (dict, list)):
-            selector = json.dumps(selector, ensure_ascii=False)
-        return _attach_meta(MemoryAction(target=target, scope=scope, intent=intent, selector=selector), meta)
-
+        # 兼容旧版：scope 字段存在时忽略
+        if isinstance(selector, str):
+            selector = selector.strip() or None
+        return _attach_meta(MemoryAction(target=target, intent=intent, selector=selector), meta)
     if action_name == "repair":
         subplan = params.get("subplan")
         if not isinstance(subplan, str) or not subplan.strip():
