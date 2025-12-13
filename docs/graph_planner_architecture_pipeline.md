@@ -1,4 +1,4 @@
-# Graph Planner 架构与运行全景（对齐 main(9)）
+# Graph Planner 架构与运行全景
 
 > **Summary (English)**  
 > Graph Planner is a two-model workflow for code repair: a **Planner** decides what to explore / remember / repair, and a **CGM** model generates patches. This document summarizes the **current** module boundaries, data flow, container backends (including `remote_swe`), and the eval/training entrypoints that exist **in this repository version**.
@@ -170,15 +170,9 @@ PYTHONPATH=. python scripts/register_graphplanner_dataset.py   --name graph_plan
 
 ---
 
-## 10. `.aci/config.json` 与 `.aci/` 说明
 
-- 代码会尝试读取 `.aci/config.json` 作为本地覆盖配置入口；没有该文件也能跑（使用默认配置）
-- `.aci/subgraphs` 会在运行中自动生成，用于缓存子图与加速重启恢复
-- `.aci` 不建议提交进 git（除非你刻意把它当作实验快照）
 
----
-
-## 11. 曙光—北极星容器控制流（remote_swe）
+## 10. 曙光—北极星容器控制流（remote_swe）
 
 ```
 曙光命令行
