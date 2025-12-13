@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from aci.schema import Plan, PlanTarget
 
-from ...agents.rule_based.cgm_adapter import _LocalCGMRuntime
+from .adapter import _LocalCGMRuntime
 from .inference import CGMGenerationConfig, CodeFuseCGMGenerator
 
 LOGGER = logging.getLogger("graph_planner.cgm.service")

@@ -11,7 +11,7 @@ try:  # pragma: no cover - optional runtime dependency
 except Exception:  # pragma: no cover - ray may be optional when running locally
     ray = None  # type: ignore[assignment]
 
-from graph_planner.agents.rule_based import cgm_adapter as _local_cgm_adapter
+from graph_planner.integrations.codefuse_cgm import adapter as _local_cgm_adapter
 
 
 def _ray_available() -> bool:
