@@ -25,6 +25,7 @@ __all__ = [
     "ApplyStats",
     "Size",
     "TurnState",
+    "snapshot",
     "estimate_costs",
     "is_over_budget",
     "memory_commit",
@@ -131,6 +132,56 @@ def estimate_costs(state: TurnState) -> Size:
     return state.size
 
 
+
+def snapshot(state: TurnState, *, max_notes: int = 20, max_chars: int = 2000) -> Dict[str, Any]:
+    """Return a compact snapshot of the current text/graph memory state.
+
+    This is intentionally *best-effort* because ``TextStore`` is a protocol.
+    We support the in-repo ``NoteTextStore`` and fall back gracefully for
+    other implementations.
+
+    Output schema (stable):
+    {
+      "notes_total": int,
+      "notes_recent": [{"note_id": int, "text": str}, ...],
+      "size": {nodes, edges, frontier, planner_tokens_est, cgm_tokens_est},
+      "version": int
+    }
+    """
+    out: Dict[str, Any] = {}
+    if state is None:
+        return out
+
+    # Size/version are always available.
+    try:
+        out["size"] = estimate_costs(state).to_dict()
+    except Exception:
+        out["size"] = {}
+    out["version"] = getattr(state, "version", 0)
+
+    # Notes: best effort extraction from NoteTextStore.
+    notes_total = 0
+    notes_recent = []
+    try:
+        store = getattr(state, "text_store", None)
+        scope_key = "session"
+        # NoteTextStore keeps `_notes: {scope_key: [ _NoteRecord(...) ]}`
+        raw_notes = getattr(store, "_notes", {}).get(scope_key, [])
+        notes_total = len(raw_notes)
+        for rec in raw_notes[-max_notes:]:
+            note_id = getattr(rec, "note_id", None)
+            text = getattr(rec, "text", "")
+            if not isinstance(text, str):
+                text = str(text)
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"...(truncated,{len(text)} chars)"
+            notes_recent.append({"note_id": note_id, "text": text})
+    except Exception:
+        pass
+
+    out["notes_total"] = notes_total
+    out["notes_recent"] = notes_recent
+    return out
 _CAP_KEY_MAP = {
     "nodes": "nodes",
     "edges": "edges",
