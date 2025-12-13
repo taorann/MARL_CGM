@@ -33,6 +33,8 @@ except ModuleNotFoundError:
 else:
     _AGENT_IMPORT_ERROR = None
 
+RuleFallbackAgent = None
+
 from ...agents.common import text_protocol
 from ...agents.common.contracts import ProtocolError, parse_action_block, validate_planner_action
 from ...agents.common.chat import (
@@ -41,7 +43,6 @@ from ...agents.common.chat import (
     action_to_payload,
     summarise_observation,
 )
-from ...agents.rule_based.planner import PlannerAgent as RuleFallbackAgent
 from ...core.actions import (
     ActionUnion,
     ExploreAction,
@@ -91,11 +92,12 @@ else:
 
             self._trajectory = Trajectory()
             self._messages: List[Dict[str, str]] = []
-            self._rule_agent = RuleFallbackAgent() if self.use_rule_fallback else None
+            self._rule_agent = None
             self._last_env_observation: Dict[str, Any] | None = None
             self._step_index = 0
             self._state = _AgentState()
             self._config: Config = load_config()
+            self._maybe_init_rule_fallback()
             self.reset()
 
         # ------------------------------------------------------------------
@@ -110,6 +112,20 @@ else:
             self._last_env_observation = None
             self._step_index = 0
             self._state = _AgentState()
+
+        def _maybe_init_rule_fallback(self) -> None:
+            """Lazy initialiser for optional rule-based fallback agent."""
+
+            global RuleFallbackAgent
+
+            if not self.use_rule_fallback:
+                self._rule_agent = None
+                return
+
+            if RuleFallbackAgent is None:
+                from ...agents.rule_based.planner import PlannerAgent as RuleFallbackAgent  # type: ignore
+
+            self._rule_agent = RuleFallbackAgent()
 
         def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any] | None, **kwargs):
             """根据环境返回的观察值更新轨迹和内部状态。"""
@@ -232,18 +248,8 @@ else:
             """
 
             # 1) 未启用规则 fallback：直接把错误抛给上层
-            if not self._rule_agent:
-                details: Dict[str, Any] = {
-                    "reason": reason,
-                    "response": response,
-                }
-                if error:
-                    details["error"] = error
-                if raw_action is not None:
-                    details["raw_action"] = raw_action
-                raise ValueError(
-                    f"Model response could not be parsed and rule-based fallback is disabled: {details}"
-                )
+            if not self.use_rule_fallback or self._rule_agent is None:
+                raise ProtocolError("rule-fallback-disabled", "Rule fallback disabled")
 
             # 2) 启用了规则 fallback：沿用原来的“保底动作”逻辑
             observation = self._last_env_observation or {}

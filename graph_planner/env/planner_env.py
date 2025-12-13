@@ -124,7 +124,7 @@ try:
     from aci.guard import GuardError, enforce_patch_guard
     from actor.collater import collate
     from actor import cgm_adapter
-    from ..agents.rule_based.test_prioritizer import prioritize_tests
+    from ..infra.test_prioritizer import prioritize_tests
 except Exception as _IMPORT_ERROR:  # pragma: no cover
     # The environment may not have all dependencies; this file is imported
     # in tooling contexts where only type information is needed.

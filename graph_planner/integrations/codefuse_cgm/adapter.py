@@ -1,5 +1,5 @@
 """
-graph_planner/agents/rule_based/cgm_adapter.py
+graph_planner/integrations/codefuse_cgm/adapter.py
 
 统一对接 CodeFuse-CGM 的补丁生成入口（本进程内）。
 
@@ -101,8 +101,8 @@ def _get_local_runtime() -> Optional[_LocalCGMRuntime]:
 
     默认 None；如果你想启用本地 CGM，可以在别处：
 
-        from graph_planner.agents.rule_based import cgm_adapter
-        cgm_adapter._LOCAL_RUNTIME = _LocalCGMRuntime(generator=...)
+        from graph_planner.integrations.codefuse_cgm import adapter
+        adapter._LOCAL_RUNTIME = _LocalCGMRuntime(generator=...)
 
     然后这里就能拿到。
     """

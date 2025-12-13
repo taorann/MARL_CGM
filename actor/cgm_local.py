@@ -8,7 +8,7 @@ from typing import Any, Mapping, Dict
 _impl = None
 try:
     # If present in this repo
-    from graph_planner.agents.rule_based import cgm_adapter as _impl  # type: ignore
+    from graph_planner.integrations.codefuse_cgm import adapter as _impl  # type: ignore
 except Exception:
     pass
 

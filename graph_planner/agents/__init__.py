@@ -2,10 +2,8 @@
 
 from typing import Any
 
-from .rule_based.planner import PlannerAgent
-
-# 只对外暴露规则 Planner 和 rLLM 版的 GraphPlannerRLLMAgent
-__all__ = ["PlannerAgent", "GraphPlannerRLLMAgent"]
+# 只对外暴露 rLLM 版的 GraphPlannerRLLMAgent
+__all__ = ["GraphPlannerRLLMAgent"]
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover - trivial lazy import
