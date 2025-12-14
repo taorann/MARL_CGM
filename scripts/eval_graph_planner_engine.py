@@ -1285,6 +1285,75 @@ def _ensure_repoenv_manifest(
     return entry
 
 
+
+
+def _merge_sandbox_overrides(
+    entry: Dict[str, Any],
+    sandbox_overrides: Dict[str, Any] | None,
+    *,
+    prefer_testbed_for_remote_swe: bool = True,
+) -> Dict[str, Any]:
+    """Merge CLI/YAML sandbox overrides into a dataset entry and normalise required fields.
+
+    Invariants we enforce:
+      - entry["sandbox"] is a dict
+      - sandbox has docker_image/workdir/mounts/env (with safe defaults)
+      - if backend == "remote_swe", default workdir is /testbed (unless explicitly overridden)
+    """
+    sandbox = entry.get("sandbox")
+    if not isinstance(sandbox, dict):
+        sandbox = {}
+    sandbox = dict(sandbox)
+
+    if sandbox_overrides:
+        merged: Dict[str, Any] = dict(sandbox)
+        for key, value in sandbox_overrides.items():
+            if value is None:
+                continue
+            if key in {"mounts", "env"}:
+                base = merged.get(key)
+                if not isinstance(base, dict):
+                    base = {}
+                if isinstance(value, dict):
+                    base = dict(base)
+                    base.update(value)
+                    merged[key] = base
+                    continue
+            if key == "port_forwards" and not value:
+                continue
+            merged[key] = value
+        sandbox = merged
+
+    # backfill docker_image from legacy top-level fields if needed
+    if not isinstance(sandbox.get("docker_image"), str) or not sandbox.get("docker_image", "").strip():
+        for k in ("docker_image", "image", "container_image"):
+            v = entry.get(k)
+            if isinstance(v, str) and v.strip():
+                sandbox["docker_image"] = v.strip()
+                break
+
+    backend = str(sandbox.get("backend") or "repoenv").strip()
+    sandbox["backend"] = backend
+
+    if not isinstance(sandbox.get("mounts"), dict):
+        sandbox["mounts"] = {}
+    if not isinstance(sandbox.get("env"), dict):
+        sandbox["env"] = {}
+
+    if backend == "remote_swe":
+        if prefer_testbed_for_remote_swe and (not sandbox_overrides or "workdir" not in sandbox_overrides):
+            sandbox["workdir"] = "/testbed"
+        elif not isinstance(sandbox.get("workdir"), str) or not sandbox.get("workdir", "").strip():
+            sandbox["workdir"] = "/testbed"
+    else:
+        if not isinstance(sandbox.get("workdir"), str) or not sandbox.get("workdir", "").strip():
+            sandbox["workdir"] = "/repo"
+
+    entry = dict(entry)
+    entry["sandbox"] = sandbox
+    return entry
+
+
 def _load_tasks(
     dataset_path: Path,
     *,
@@ -1309,18 +1378,9 @@ def _load_tasks(
         if limit is not None and len(tasks) >= limit:
             break
 
-        entry = _ensure_repoenv_manifest(entry, dataset_path=dataset_path)
-        if sandbox_overrides:
-            sandbox_payload = entry.get("sandbox")
-            if isinstance(sandbox_payload, dict):
-                merged = dict(sandbox_payload)
-                for key, value in sandbox_overrides.items():
-                    if key == "port_forwards" and not value:
-                        continue
-                    merged[key] = value
-                entry = dict(entry)
-                entry["sandbox"] = merged
+        entry = _merge_sandbox_overrides(entry, sandbox_overrides)
 
+        entry = _ensure_repoenv_manifest(entry, dataset_path=dataset_path)
         task_id = entry.get("task_id") or entry.get("issue_id") or f"{registered.split}-{index}"
         task_payload = {
             "task_id": task_id,
