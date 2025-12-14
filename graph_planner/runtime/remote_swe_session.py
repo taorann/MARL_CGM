@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+def _dbg(msg: str) -> None:
+    if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+        print(f"[remote_swe_session] {msg}", file=sys.stderr)
+
+
 
 
 @dataclass
@@ -49,6 +57,7 @@ class RemoteSweSession:
 
 
     def _call_proxy(self, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
+        _dbg(f"call op={payload.get('op')!r} run_id={payload.get('run_id')!r} image={payload.get('image')!r} cwd={payload.get('cwd')!r} timeout={timeout}")
         proc = subprocess.run(
             self._build_ssh_cmd(),
             input=json.dumps(payload).encode("utf-8"),
@@ -135,6 +144,52 @@ class RemoteSweSession:
             "timeout": timeout or 600.0,
         }
         return self._call_proxy(payload, timeout=timeout)
+
+    def build_repo_graph(
+        self,
+        repo_id: str = "",
+        timeout: int = 3600,
+        *,
+        cwd: Optional[str] = None,
+        repo: Optional[str] = None,
+    ) -> str:
+        """Build a repo-level graph in the remote SWE container and return base64(gzip(JSONL)).
+
+        This calls swe_proxy with op='build_repo_graph'. The returned base64 string should be
+        decoded client-side (SandboxRuntime) and can be cached on the host.
+
+        Parameters
+        ----------
+        repo_id:
+            Optional repo identifier (for logging/caching keys).
+        timeout:
+            Proxy-side timeout in seconds.
+        cwd, repo:
+            Optional remote-side working directory and repo mount path.
+        """
+        payload: Dict[str, Any] = {
+            "op": "build_repo_graph",
+            "run_id": self.run_id,
+            "image": self.image,
+            "repo_id": repo_id,
+            "timeout": float(timeout),
+        }
+        if cwd is not None:
+            payload["cwd"] = cwd
+        if repo is not None:
+            payload["repo"] = repo
+
+        resp = self._call_proxy(payload, timeout=float(timeout))
+        if not resp.get("ok", False):
+            raise RuntimeError(
+                f"remote build_repo_graph failed (rc={resp.get('returncode')}). "
+                f"stderr={resp.get('stderr', '')}"
+            )
+
+        raw = (resp.get("stdout") or "").strip()
+        if not raw:
+            raise RuntimeError("remote build_repo_graph returned empty stdout")
+        return raw
 
     def build_graph(
         self,
