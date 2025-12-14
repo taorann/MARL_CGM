@@ -1170,8 +1170,10 @@ def _configure_runtime_env(
         os.environ["CGM_TOKENIZER_PATH"] = str(args.cgm_tokenizer_path)
     if args.cgm_endpoint:
         os.environ["CGM_ENDPOINT"] = str(args.cgm_endpoint)
+        os.environ["CODEFUSE_CGM_ENDPOINT"] = str(args.cgm_endpoint)
     if args.cgm_model:
         os.environ["CGM_MODEL"] = str(args.cgm_model)
+        os.environ["CODEFUSE_CGM_MODEL_NAME"] = str(args.cgm_model)
     if cgm_api_key_env:
         if cgm_api_key:
             os.environ[cgm_api_key_env] = cgm_api_key
@@ -1179,6 +1181,7 @@ def _configure_runtime_env(
     elif cgm_api_key:
         os.environ["CGM_API_KEY_ENV"] = "CGM_API_KEY"
         os.environ["CGM_API_KEY"] = cgm_api_key
+        os.environ["CODEFUSE_CGM_API_KEY"] = cgm_api_key
     if args.cgm_timeout is not None:
         os.environ["CGM_TIMEOUT_S"] = str(int(args.cgm_timeout))
     os.environ["CGM_MAX_INPUT_TOKENS"] = str(args.cgm_max_input_tokens)
@@ -1298,7 +1301,7 @@ def _merge_sandbox_overrides(
     Invariants we enforce:
       - entry["sandbox"] is a dict
       - sandbox has docker_image/workdir/mounts/env (with safe defaults)
-      - if backend == "remote_swe", default workdir is /testbed (unless explicitly overridden)
+      - if backend == "remote_swe", default workdir is /repo (unless explicitly overridden)
     """
     sandbox = entry.get("sandbox")
     if not isinstance(sandbox, dict):
@@ -1340,11 +1343,15 @@ def _merge_sandbox_overrides(
     if not isinstance(sandbox.get("env"), dict):
         sandbox["env"] = {}
 
+    # Expose repo id for caching/diagnostics
+    if isinstance(entry.get("repo"), str) and entry.get("repo", "").strip():
+        sandbox["env"].setdefault("GP_REPO_ID", entry["repo"].strip())
+
     if backend == "remote_swe":
         if prefer_testbed_for_remote_swe and (not sandbox_overrides or "workdir" not in sandbox_overrides):
-            sandbox["workdir"] = "/testbed"
+            sandbox["workdir"] = "/repo"
         elif not isinstance(sandbox.get("workdir"), str) or not sandbox.get("workdir", "").strip():
-            sandbox["workdir"] = "/testbed"
+            sandbox["workdir"] = "/repo"
     else:
         if not isinstance(sandbox.get("workdir"), str) or not sandbox.get("workdir", "").strip():
             sandbox["workdir"] = "/repo"
