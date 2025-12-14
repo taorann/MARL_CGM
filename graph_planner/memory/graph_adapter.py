@@ -153,6 +153,85 @@ def connect(handle_or_path: Optional[str] = None) -> GraphHandle:
     return gh
 
 
+def connect_from_nodes_edges(nodes: Any, edges: Any, root: Optional[str] = None) -> "GraphHandle":
+    """Build the global GraphHandle directly from an in-memory repo graph.
+
+    Required for remote_swe: the evaluator host cannot read /repo from its own filesystem,
+    but we do have repo_graph JSON (nodes/edges) returned from the remote container.
+    """
+    if root:
+        try:
+            set_repo_root(root)
+        except Exception:
+            pass
+    gh = GraphHandle(root=(root or (_REPO_ROOT_OVERRIDE or repo_root())))
+
+    # nodes: dict[id->node] or list[node]
+    node_list: List[Node] = []
+    if isinstance(nodes, dict):
+        node_list = [v for v in nodes.values() if isinstance(v, dict)]
+    elif isinstance(nodes, list):
+        node_list = [v for v in nodes if isinstance(v, dict)]
+
+    for n in node_list:
+        nid = n.get("id")
+        if not isinstance(nid, str) or not nid:
+            continue
+        nn = dict(n)
+        if "path" in nn:
+            nn["path"] = _norm_posix(nn.get("path"))
+        if isinstance(nn.get("kind"), str):
+            nn["kind"] = nn["kind"].lower()
+        gh.add_node(nn)  # type: ignore[arg-type]
+
+    # edges: list[edge] or dict
+    edge_list: List[Any] = []
+    if isinstance(edges, list):
+        edge_list = edges
+    elif isinstance(edges, dict):
+        edge_list = list(edges.values())
+
+    for e in edge_list:
+        try:
+            if isinstance(e, dict):
+                src = e.get("src") or e.get("source") or e.get("from")
+                dst = e.get("dst") or e.get("target") or e.get("to")
+                etype = e.get("etype") or e.get("type") or e.get("kind") or "edge"
+            elif isinstance(e, (list, tuple)) and len(e) >= 2:
+                src, dst = e[0], e[1]
+                etype = e[2] if len(e) >= 3 else "edge"
+            else:
+                continue
+            if not (isinstance(src, str) and isinstance(dst, str)):
+                continue
+            gh.add_edge(src, dst, str(etype))
+        except Exception:
+            continue
+
+    # cache degree
+    for nid, n in gh.nodes.items():
+        try:
+            n["degree"] = gh.degree(nid)
+        except Exception:
+            pass
+
+    global _GH
+    _GH = gh
+    return gh
+
+
+def connect_from_subgraph(subgraph: Any, root: Optional[str] = None) -> "GraphHandle":
+    """Connect from a Subgraph-like object (with .nodes/.edges)."""
+    if subgraph is None:
+        return connect(handle_or_path=None)
+    nodes = getattr(subgraph, "nodes", None)
+    edges = getattr(subgraph, "edges", None)
+    if nodes is None and isinstance(subgraph, dict):
+        nodes = subgraph.get("nodes")
+        edges = subgraph.get("edges")
+    return connect_from_nodes_edges(nodes, edges, root=root)
+
+
 def get_node_by_id(node_id: str) -> Optional[Node]:
     gh = _require_handle()
     return gh.get(node_id)
