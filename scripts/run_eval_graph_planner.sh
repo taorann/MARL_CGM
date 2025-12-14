@@ -31,7 +31,7 @@ if [[ $CONFIG_FLAG_PRESENT -eq 0 ]]; then
   set -- --config "${GRAPH_PLANNER_EVAL_CONFIG:-$DEFAULT_CONFIG}" "$@"
 fi
 
-PYTHONPATH="${PYTHONPATH:-${ROOT_DIR}}" \
+PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
 TOKENIZERS_PARALLELISM="false" \
 python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" \
   "$@"
