@@ -140,6 +140,9 @@ class RemoteSweSession:
         self,
         issue_id: str,
         timeout: Optional[float] = None,
+        *,
+        cwd: Optional[str] = None,
+        repo: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Construct an issue-specific code subgraph inside the remote SWE container."""
 
@@ -150,6 +153,11 @@ class RemoteSweSession:
             "issue_id": issue_id,
             "timeout": timeout or 600.0,
         }
+        if cwd is not None:
+            payload["cwd"] = cwd
+        if repo is not None:
+            payload["repo"] = repo
+
         resp = self._call_proxy(payload, timeout=timeout)
         if not resp.get("ok", False):
             raise RuntimeError(
