@@ -471,6 +471,8 @@ class SandboxRuntime:
         return self._remote.build_graph(
             issue_id=issue_id,
             timeout=float(timeout),
+            cwd=self.workdir,
+            repo=self.workdir,
         )
 
     def reset_soft(self) -> None:
