@@ -343,18 +343,23 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         else:
             query = None
 
+
+        # 兼容旧版：explore.read 已弃用；将其规范化为 explore.expand (hop=0)
+        # 语义：读取 nodes 的 snippet，但不扩展邻居。
+        if op == "read":
+            op = "expand"
+            # read 通常给 nodes；若 anchors 为空则从 nodes 构造 anchors
+            if not anchors and nodes:
+                anchors = [{"id": nid} for nid in nodes if isinstance(nid, str) and nid.strip()]
+            # hop=0 表示“只读不扩展”
+            params["hop"] = 0
+
         # 兼容：如果 expand 给的是 nodes 而不是 anchors，把 nodes 转成 anchors
         if op == "expand" and not anchors and nodes:
             anchors = [{"id": nid} for nid in nodes if isinstance(nid, str) and nid.strip()]
 
         # op 分支校验（不要再强制所有 explore 都带 anchors）
-        if op == "read":
-            if not nodes:
-                raise ProtocolError(
-                    PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
-                    "explore.read requires non-empty nodes",
-                )
-        elif op == "expand":
+        if op == "expand":
             if not anchors:
                 raise ProtocolError(
                     PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
