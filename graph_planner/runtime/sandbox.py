@@ -1,10 +1,10 @@
 # graph_planner/runtime/sandbox.py
-import os, json, random, string, time, shutil, tempfile
+import os, json, random, string, time, shutil, tempfile, base64, shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-import docker
+import docker, base64, gzip
 
 from ..agents.common.contracts import CGM_CONTRACT, CGMPatchErrorCode, ProtocolError, normalize_newlines
 
@@ -31,7 +31,7 @@ def _rand_name(prefix="gp"):
     return f"{prefix}-" + "".join(_r.choices(_s.ascii_lowercase + _s.digits, k=8))
 
 def _dbg(msg: str):
-    if os.environ.get("DEBUG"):
+    if os.environ.get("DEBUG") or os.environ.get("EBUG"):
         print(f"[sandbox] {msg}")
 
 @dataclass
@@ -99,6 +99,7 @@ class SandboxRuntime:
         elif self._mode == "apptainer_queue":
             self._init_apptainer_backend()
         elif self._mode == "remote_swe":
+            _dbg(f"init remote_swe: run_id={self.run_id} ssh_target={self.cfg.ssh_target} remote_repo={self.cfg.remote_repo} image={self.cfg.docker_image}")
             self._init_remote_swe_backend()
         else:
             self._init_docker_backend()
@@ -210,7 +211,7 @@ class SandboxRuntime:
             num_runners=num_runners,
             ensure_runners=True,
         )
-        self.workdir = cfg.workdir or "/testbed"
+        self.workdir = "/repo"  # remote_swe 强制统一 repo root
         _dbg(
             f"remote_swe backend initialized: ssh={cfg.ssh_target!r}, "
             f"repo={cfg.remote_repo!r}, workdir={self.workdir!r}, num_runners={num_runners}"
@@ -357,6 +358,122 @@ class SandboxRuntime:
     def run(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         return self._exec(cmd, timeout)
 
+    def apply_patch_edits(self, edits: List[Mapping[str, Any]]) -> Mapping[str, Any]:
+        """Apply structured edits in-place within the sandbox.
+
+        Each edit:
+          { "path": str, "start": int, "end": int, "new_text": str }
+
+        Conventions (best-effort):
+        - If start >= 1: treat as 1-based line index, and end as 1-based inclusive.
+        - If start <= 0: treat as 0-based slice indices, and end as 0-based exclusive.
+        - If end < start: treat as insertion at start.
+
+        Robustness:
+        - Accept missing +x for scripts elsewhere (unrelated), but here handle CRLF, empty files, OOB indices,
+          and missing directories; preserve trailing newline when possible.
+        """
+        try:
+            payload = json.dumps(list(edits or []), ensure_ascii=False)
+        except Exception:
+            return {"success": False, "applied": 0, "paths": [], "error": "invalid_edits"}
+
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+        py = r'''
+import base64, json, os, sys
+edits = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+ok = True
+paths = []
+applied = 0
+
+def norm(s: str) -> str:
+    return (s or '').replace('\r\n', '\n').replace('\r', '\n')
+
+for e in edits:
+    try:
+        p = e.get('path')
+        if not isinstance(p, str) or not p.strip():
+            ok = False
+            continue
+        p = p.strip()
+        start_raw = e.get('start', None)
+        end_raw = e.get('end', None)
+        try:
+            s = int(start_raw) if start_raw is not None else 1
+        except Exception:
+            s = 1
+        try:
+            en = int(end_raw) if end_raw is not None else (s - 1 if s >= 1 else s)
+        except Exception:
+            en = (s - 1 if s >= 1 else s)
+
+        nt = norm(e.get('new_text') or '')
+        new_lines = nt.split('\n') if nt != '' else []
+
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+        content = ''
+        had_trailing_nl = False
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            had_trailing_nl = content.endswith('\n') or content.endswith('\r')
+        content = norm(content)
+        lines = content.splitlines()
+
+        # Index mapping
+        if s >= 1:
+            # 1-based inclusive [s, en]
+            i0 = max(0, s - 1)
+            i1 = max(0, en)  # exclusive end
+            if en < s:
+                i1 = i0
+        else:
+            # 0-based slice [s, en) (treat end<start as insertion)
+            i0 = max(0, s)
+            i1 = max(0, en)
+            if en < s:
+                i1 = i0
+
+        # Clamp to file bounds
+        n = len(lines)
+        if i0 > n:
+            i0 = n
+        if i1 > n:
+            i1 = n
+        if i1 < i0:
+            i1 = i0
+
+        out = lines[:i0] + new_lines + lines[i1:]
+
+        with open(p, 'w', encoding='utf-8') as f:
+            if out:
+                f.write('\n'.join(out))
+                if had_trailing_nl:
+                    f.write('\n')
+            else:
+                f.write('')
+
+        paths.append(p)
+        applied += 1
+    except Exception:
+        ok = False
+
+print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_ascii=False))
+'''
+
+        cmd = "python -c " + shlex.quote(py) + " " + shlex.quote(b64)
+        out, rc = self._exec(cmd, timeout=900)
+        if rc != 0:
+            return {"success": False, "applied": 0, "paths": [], "error": "exec_failed", "rc": rc, "stdout": out}
+        try:
+            return json.loads(out.strip().splitlines()[-1])
+        except Exception:
+            return {"success": True, "applied": 0, "paths": []}
+
     def apply_patch(self, unified_diff: str) -> bool:
         if self._mode in ("r2e", "repoenv"):
             return self._rt.apply_patch(unified_diff)
@@ -384,12 +501,32 @@ class SandboxRuntime:
     def test(self, selector: Optional[List[str]] = None, timeout: int = 1800) -> Dict:
         selector_tuple: Tuple[str, ...] = tuple(selector or ())
         sel = " ".join(selector_tuple)
+
+        # remote_swe: prefer /repo (workdir) run_tests.sh if present, else fallback pytest
+        if self._mode == "remote_swe":
+            wd = (self.workdir or "/repo").rstrip("/")
+            for script in (f"{wd}/run_tests.sh", "/repo/run_tests.sh"):
+                # Some SWE-bench images ship run_tests.sh without +x; accept if file exists.
+                if self._exec(f"test -f {script}")[1] == 0:
+                    # SWE-bench run_tests.sh typically does not accept extra positional args; run full suite.
+                    cmd = f"cd {os.path.dirname(script)} && bash {script}".strip()
+                    start = time.time()
+                    out, rc = self._exec(cmd, timeout=timeout)
+                    duration = time.time() - start
+                    result = {"mode": "run_tests.sh", "passed": rc == 0, "rc": rc, "stdout": out}
+                    return self._finalize_test_result(
+                        result,
+                        command=cmd,
+                        selector=selector_tuple,
+                        duration=duration,
+                    )
+
         # RepoEnv / R2E：尝试官方脚本 → 失败再回退 pytest
         if self._mode in ("repoenv", "r2e"):
             # 探测常见官方入口
             probes = [
-                "test -x /testbed/run_tests.sh",
-                "test -x /work/run_tests.sh",
+                "test -f /testbed/run_tests.sh",
+                "test -f /work/run_tests.sh",
                 "test -d /r2e_tests",
             ]
             if any(self._exec(p)[1] == 0 for p in probes):
@@ -443,19 +580,93 @@ class SandboxRuntime:
             duration=duration,
         )
 
+    def _aci_root(self) -> Path:
+        # Host-side cache root for GraphPlanner artifacts
+        # Default: .aci (relative to current working directory)
+        return Path(os.environ.get("GP_ACI_ROOT", ".aci"))
+
+    def _repo_graph_cache_path(self, repo_id: str) -> Path:
+        rid = (repo_id or "").strip() or "repo"
+        return self._aci_root() / "subgraphs" / rid / "repo" / "repo_graph.jsonl"
+
+    def _load_repo_graph_jsonl(self, path: Path) -> Dict[str, Any]:
+        nodes: List[Dict[str, Any]] = []
+        edges: List[Dict[str, Any]] = []
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                typ = obj.pop("type", None)
+                if typ == "node":
+                    nodes.append(obj)
+                elif typ == "edge":
+                    edges.append(obj)
+                else:
+                    # best-effort fallback
+                    if "src" in obj and "dst" in obj:
+                        edges.append(obj)
+                    else:
+                        nodes.append(obj)
+        return {"nodes": nodes, "edges": edges}
+
+    def build_repo_graph(self, repo_id: str = "", *, timeout: int = 3600, force: bool = False) -> str:
+        """Build repo-level graph in remote_swe and cache JSONL on the host.
+
+        Returns the host-side cache path to repo_graph.jsonl.
+        """
+        if self._mode != "remote_swe":
+            raise RuntimeError(f"build_repo_graph is only supported for backend='remote_swe', got {self._mode!r}")
+        if not self._remote:
+            raise RuntimeError("remote_swe backend is not initialized")
+
+        # Ensure remote instance started (idempotent)
+        start_timeout = max(float(timeout), 300.0)
+        self._remote.start(timeout=start_timeout)
+
+        # Resolve repo id for caching
+        rid = (repo_id or "").strip()
+        if not rid:
+            rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "").strip()
+        if not rid:
+            rid = "repo"
+
+        cache_path = self._repo_graph_cache_path(rid)
+        if cache_path.exists() and not force:
+            return str(cache_path)
+
+        _dbg(f"remote_swe build_repo_graph: repo_id={rid} workdir={self.workdir} image={self.cfg.docker_image}")
+        b64 = self._remote.build_repo_graph(repo_id=rid, timeout=int(timeout), cwd="/repo", repo="/repo")
+        if not b64:
+            raise RuntimeError("build_repo_graph returned empty base64 payload")
+
+        try:
+            blob = base64.b64decode(b64.encode("ascii"), validate=False)
+            raw = gzip.decompress(blob)
+        except Exception as exc:
+            raise RuntimeError("failed to decode base64+gzip repo graph payload") from exc
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(raw)
+        return str(cache_path)
+
+
     def build_issue_subgraph(
         self,
         issue_id: str,
         timeout: int = 900,
     ) -> Dict[str, Any]:
-        """
-        使用当前 sandbox backend 为指定 issue 构建“工作子图”。
+        """Build the working subgraph.
 
-        - backend == "remote_swe":
-            * 先通过 RemoteSweSession.start() 确保容器已启动（幂等）；
-            * 再调用 RemoteSweSession.build_graph()，在容器内 /repo 上构图；
-            * 返回的是容器侧 swe_build_graph 打印的 JSON 对象。
-        - 其它 backend 当前不支持，由上层按原有本地 ACI 流程处理。
+        For backend='remote_swe', we prefer a repo-level graph cached as JSONL on the host
+        (via build_repo_graph). This avoids parsing large JSON over stdout and enables reuse
+        across multiple issues from the same repo.
+
+        For compatibility, if repo-level build fails, we fall back to remote build_graph (JSON).
         """
         if self._mode != "remote_swe":
             raise RuntimeError(
@@ -464,10 +675,17 @@ class SandboxRuntime:
         if not self._remote:
             raise RuntimeError("remote_swe backend is not initialized")
 
-        start_timeout = max(float(timeout), 300.0)
-        # 这里会调用 ensure_runners + start(instance)，是幂等的
-        self._remote.start(timeout=start_timeout)
+        # Try repo-level cached JSONL first
+        try:
+            rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "repo")
+            jsonl_path = Path(self.build_repo_graph(repo_id=rid, timeout=int(timeout), force=False))
+            return self._load_repo_graph_jsonl(jsonl_path)
+        except Exception:
+            pass
 
+        # Fallback: legacy JSON stdout
+        start_timeout = max(float(timeout), 300.0)
+        self._remote.start(timeout=start_timeout)
         return self._remote.build_graph(
             issue_id=issue_id,
             timeout=float(timeout),
