@@ -164,7 +164,7 @@ def main() -> int:
     cmd = req.get("cmd")
     timeout = float(req.get("timeout") or 600.0)
     env = req.get("env") or {}
-    cwd = Path(req.get("cwd") or "/home")
+    cwd = Path(req.get("cwd") or "/testbed")
 
     # 多 runner 数量（与 Slurm 启动的 runner 数量保持一致）
     num_runners = int(os.environ.get("GP_NUM_RUNNERS", "1"))
