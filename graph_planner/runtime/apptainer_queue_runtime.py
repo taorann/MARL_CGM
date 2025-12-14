@@ -24,7 +24,7 @@ class ApptainerQueueRuntime:
         *,
         default_timeout_sec: float = 900.0,
         poll_interval_sec: float = 0.5,
-        max_stdout_bytes: int = 512_000,
+        max_stdout_bytes: int = int(os.environ.get("GP_MAX_STDOUT_BYTES", "20000000")),
     ) -> None:
         self.queue_root = Path(queue_root)
         self.sif_dir = Path(sif_dir)
@@ -266,4 +266,3 @@ class ApptainerQueueRuntime:
             ok=True,
             error=None,
         )
-
