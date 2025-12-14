@@ -9,7 +9,7 @@ class ExploreAction(BaseModel):
     model_config = {"extra": "ignore"}
 
     type: Literal["explore"] = "explore"
-    op: Literal["find", "read", "expand"] = "find"
+    op: Literal["find", "expand"] = "find"
 
     # 两种用法：
     # 1) anchors -> 在 repo 图里做 find/expand
