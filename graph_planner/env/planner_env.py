@@ -191,6 +191,14 @@ class PlannerEnv:
         self.box = SandboxRuntime(sandbox_cfg, run_id=effective_run_id)
         self.config: Config = load_config()
         self.config_dict: Dict[str, Any] = self.config.to_dict()
+        # Episode stop condition: align with dataset/eval_engine max_steps when provided.
+        issue_max_steps = self.issue.get("max_steps")
+        env_max_steps = os.environ.get("GP_MAX_STEPS") or os.environ.get("GRAPH_PLANNER_MAX_STEPS")
+        cfg_max_steps = getattr(self.config, "max_steps", None) or getattr(self.config, "episode_max_steps", None)
+        try:
+            self.max_steps = int(env_max_steps or issue_max_steps or cfg_max_steps or 40)
+        except Exception:
+            self.max_steps = 40
         # Unified telemetry (trajectory / events / metrics)
         self.telemetry = telemetry_mod.get_telemetry(run_id=effective_run_id)
         try:
@@ -209,6 +217,8 @@ class PlannerEnv:
         self.steps: int = 0
         self.last_info: Dict[str, Any] = {}
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
+        if getattr(self.box, "_mode", None) == "remote_swe":
+            self.repo_root_in_container = "/repo"
         # Optional host repo root for per-env graph scanning.
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
@@ -261,6 +271,7 @@ class PlannerEnv:
             try:
                 repo_json = self.box.build_issue_subgraph(self.issue_id)
                 self.repo_graph = subgraph_store.wrap(repo_json)
+
             except Exception:
                 self.repo_graph = subgraph_store.new()
         else:
@@ -275,6 +286,19 @@ class PlannerEnv:
                 self.repo_graph = subgraph_store.load(self.issue_id)
             except Exception:
                 self.repo_graph = subgraph_store.new()
+
+
+        # Keep graph_adapter aligned with repo_graph (mem_candidates / expand).
+        try:
+            root = "/repo" if getattr(self.box, "_mode", None) == "remote_swe" else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
+            if hasattr(graph_adapter, "set_repo_root"):
+                graph_adapter.set_repo_root(root)
+            if hasattr(graph_adapter, "connect_from_subgraph"):
+                graph_adapter.connect_from_subgraph(self.repo_graph, root=root)
+            elif hasattr(graph_adapter, "connect_from_nodes_edges"):
+                graph_adapter.connect_from_nodes_edges(self.repo_graph.nodes, self.repo_graph.edges, root=root)  # type: ignore
+        except Exception:
+            pass
 
         # Repo 索引
         self._repo_nodes_by_id = {}
@@ -369,6 +393,10 @@ class PlannerEnv:
                 self.telemetry.metric("env.invalid_action", 1.0, step_id=self.steps)
             except Exception:
                 pass
+            # Stop the trajectory if we have reached the max step budget.
+            if getattr(self, "max_steps", None) is not None and self.steps >= int(self.max_steps):
+                info["stop_reason"] = "max_steps"
+                return obs, -0.05, True, info
             return obs, -0.05, False, info
 
         # 按类型分发
@@ -397,6 +425,12 @@ class PlannerEnv:
         self.last_info = info
         reward = self._compute_reward(info)
         done = bool(info.get("done"))
+        # Global stop: enforce max_steps budget (used by eval_engine/datasets).
+        if getattr(self, "max_steps", None) is not None and self.steps >= int(self.max_steps):
+            if not done:
+                info["stop_reason"] = "max_steps"
+            done = True
+        info["done"] = bool(done)
 
         obs = self._obs()
         try:
@@ -414,6 +448,17 @@ class PlannerEnv:
             raise ProtocolError("invalid-payload", "action payload must be a mapping")
         action_type = payload.get("type")
         if action_type == "explore":
+            # Backward compatibility: normalize legacy explore.read to explore.expand hop=0
+            try:
+                if payload.get("op") == "read":
+                    payload = dict(payload)
+                    payload["op"] = "expand"
+                    payload["hop"] = 0
+                    nodes = payload.get("nodes") or []
+                    if nodes and not payload.get("anchors"):
+                        payload["anchors"] = [{"id": nid} for nid in nodes if isinstance(nid, str)]
+            except Exception:
+                pass
             return ExploreAction(**payload)
         if action_type == "memory":
             return MemoryAction(**payload)
@@ -487,6 +532,24 @@ class PlannerEnv:
 
             self.last_candidates = candidates
             info["candidates"] = candidates
+            # auto-attach snippets for candidates (explore has no separate read op)
+            cand_snippets = []
+            for c in candidates:
+                try:
+                    nid = c.get("id")
+                    if isinstance(nid, str):
+                        n = self._resolve_node(nid) or {}
+                        sn = self._read_node_snippet(n) if n else None
+                        if sn:
+                            c["snippet_lines"] = sn.get("snippet_lines", [])
+                            cand_snippets.append(sn)
+                            try:
+                                self.working_subgraph.update_node(nid, {"snippet_lines": sn.get("snippet_lines", [])})
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+            info["candidate_snippets"] = cand_snippets
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -712,7 +775,9 @@ class PlannerEnv:
                 pass
 
         info["subgraph_stats"] = subgraph_store.stats(self.memory_subgraph)
-        subgraph_store.save(self.issue_id, self.memory_subgraph)
+        # Trajectory-only memory/working subgraphs: default is NOT to persist to disk.
+        if os.environ.get("GP_PERSIST_SUBGRAPHS") in ("1", "true", "True"):
+            subgraph_store.save(self.issue_id, self.memory_subgraph)
 
         # 记忆动作之后，工作图重置为记忆图
         self._reset_working_to_memory()
@@ -870,8 +935,10 @@ class PlannerEnv:
             return info
 
         info["tests"] = tests_report
-        info["success"] = bool(tests_report)
-        info["done"] = True
+        passed = bool(tests_report.get("passed", False)) if isinstance(tests_report, dict) else bool(tests_report)
+        info["success"] = passed
+        # Only finish when tests passed. Otherwise allow more repair steps.
+        info["done"] = bool(passed)
         return info
 
     def _apply_patch_edits(self, edits: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -977,34 +1044,76 @@ class PlannerEnv:
         return None
 
     def _read_node_snippet(self, node: Union[Mapping[str, Any], str]) -> Optional[Dict[str, Any]]:
-        if isinstance(node, str):
-            node = self._resolve_node(node) or {}
-        path = _norm_path(node.get("path") or "")
-        if not path:
-            return None
-        abs_path = os.path.join(self.repo_root_in_container, path)
-        text = _read_file_text(abs_path)
-        if not text:
-            return None
-        span = node.get("span") if isinstance(node, Mapping) else {}
-        span_start = span.get("start") if isinstance(span, Mapping) else None
-        span_end = span.get("end") if isinstance(span, Mapping) else None
-        start_line = int(node.get("start_line") or span_start or 1)
-        end_line = int(node.get("end_line") or span_end or start_line)
-        lines = text.splitlines()
-        snippet_lines = lines[start_line - 1 : end_line]
-        return {
-            "id": node.get("id"),
-            "path": path,
-            "start": start_line,
-            "end": end_line,
-            "snippet": snippet_lines,
-        }
+        """Read snippet lines for a node.
 
+        - local backends: read from evaluator filesystem
+        - remote_swe: read inside remote container (repo root fixed at /repo)
+        """
+        try:
+            if isinstance(node, str):
+                node = self._resolve_node(node) or {}
+            if not isinstance(node, Mapping):
+                return None
 
-    # ------------------------------------------------------------------
-    # Memory recall helpers (query -> top-k notes/nodes)
-    # ------------------------------------------------------------------
+            path = (node.get("path") or "").lstrip("/")
+            if not path:
+                return None
+
+            span = node.get("span") if isinstance(node, Mapping) else {}
+            span_start = span.get("start") if isinstance(span, Mapping) else None
+            span_end = span.get("end") if isinstance(span, Mapping) else None
+            start_line = int(node.get("start_line") or span_start or 1)
+            end_line = int(node.get("end_line") or span_end or start_line)
+
+            # remote_swe: run inside container
+            if getattr(self.box, "_mode", None) == "remote_swe":
+                abs_path = os.path.join("/repo", path)
+                req = {"path": abs_path, "start": start_line, "end": end_line}
+                b64 = base64.b64encode(json.dumps(req).encode("utf-8")).decode("ascii")
+                py = r"""
+import base64, json, sys
+req = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+p = req['path']; s = int(req.get('start',1)); e = int(req.get('end',s))
+with open(p,'r',encoding='utf-8',errors='replace') as f:
+    lines = f.read().splitlines()
+snippet = lines[max(0,s-1):max(0,e)]
+print(json.dumps({'snippet_lines': snippet}))
+"""
+                cmd = "python -c " + shlex.quote(py) + " " + shlex.quote(b64)
+                out, rc = self.box.run(cmd, timeout=60)
+                if rc != 0:
+                    return None
+                try:
+                    resp = json.loads(out.strip().splitlines()[-1])
+                    snippet_lines = resp.get("snippet_lines") or []
+                except Exception:
+                    snippet_lines = []
+                return {
+                    "id": node.get("id"),
+                    "path": path,
+                    "start": start_line,
+                    "end": end_line,
+                    "snippet_lines": snippet_lines,
+                    "snippet": snippet_lines,  # backward compat
+                }
+
+            # local
+            abs_path = os.path.join(self.repo_root_in_container, path)
+            text = _read_file_text(abs_path)
+            if not text:
+                return None
+            lines2 = text.splitlines()
+            snippet_lines = lines2[start_line - 1 : end_line]
+            return {
+                "id": node.get("id"),
+                "path": path,
+                "start": start_line,
+                "end": end_line,
+                "snippet_lines": snippet_lines,
+                "snippet": snippet_lines,
+            }
+        except Exception:
+            return None
     def _recall_memory(self, *, query: str, k: int = 8) -> Dict[str, Any]:
         q = (query or "").strip().lower()
         if not q:
