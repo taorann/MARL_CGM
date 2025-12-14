@@ -16,7 +16,7 @@ swe_proxy.py
      {
        "run_id": "local-test",
        "image": "<docker image>",
-       "cmd": "cd /testbed && python -V",
+       "cmd": "cd /repo && python -V",
        "timeout": 600,
        "env": {...},     # 可选
        "cwd": "/home"    # 可选，默认 "/home"
@@ -33,7 +33,7 @@ swe_proxy.py
        {
          "op": "exec", "run_id": "ep-1",
          "image": "<docker image>",
-         "cmd": "cd /testbed && python -V",
+         "cmd": "cd /repo && python -V",
          "timeout": 600,
          "env": {...}, "cwd": "/home"
        }
@@ -52,6 +52,11 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, List
+
+
+def _dbg(msg: str) -> None:
+    if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+        print(f"[swe_proxy] {msg}", file=sys.stderr)
 
 from graph_planner.runtime.apptainer_queue_runtime import ApptainerQueueRuntime
 from graph_planner.runtime.queue_protocol import QueueRequest, QueueResponse
@@ -154,6 +159,7 @@ def main() -> int:
 
     try:
         req = json.loads(raw)
+        _dbg(f"recv op={req.get('op')!r} run_id={req.get('run_id')!r} image={req.get('image')!r} cwd={req.get('cwd')!r} repo={req.get('repo')!r}")
     except Exception as e:
         print(json.dumps({"ok": False, "error": f"invalid json: {e}"}))
         return 1
@@ -164,7 +170,7 @@ def main() -> int:
     cmd = req.get("cmd")
     timeout = float(req.get("timeout") or 600.0)
     env = req.get("env") or {}
-    cwd = Path(req.get("cwd") or "/testbed")
+    cwd = Path(req.get("cwd") or "/repo")
 
     # 多 runner 数量（与 Slurm 启动的 runner 数量保持一致）
     num_runners = int(os.environ.get("GP_NUM_RUNNERS", "1"))
@@ -191,9 +197,9 @@ def main() -> int:
     # ---------------------------------------------------------------
     # 1) 长期 instance 模式：显式带 op = start / exec / stop
     # ---------------------------------------------------------------
-    if op in {"start", "exec", "stop", "build_graph"}:
-        if op in {"start", "exec", "build_graph"} and not image:
-            print(json.dumps({"ok": False, "error": "image is required for op=start/exec/build_graph"}))
+    if op in {"start", "exec", "stop", "build_graph", "build_repo_graph"}:
+        if op in {"start", "exec", "build_graph", "build_repo_graph"} and not image:
+            print(json.dumps({"ok": False, "error": "image is required for op=start/exec/build_graph/build_repo_graph"}))
             return 1
 
         if op == "start":
@@ -244,6 +250,30 @@ def main() -> int:
                 env=env,
                 cwd=cwd,
             )
+        elif op == "build_repo_graph":
+            # Repo-level graph build: emits base64(gzip(JSONL)) to stdout for transport
+            repo_arg = payload.get('repo') or '/repo'
+            cwd_arg = payload.get('cwd') or '/repo'
+            _dbg(f"build_repo_graph: cwd={cwd_arg} repo={repo_arg} run_id={run_id} image={image}")
+            cmd = (
+                "PYTHONPATH=$PYTHONPATH:/gp "
+                "python -m graph_planner.tools.swe_build_graph "
+                f"--repo {repo_arg} "
+                "--emit-base64-gzip"
+            )
+
+
+            resp = _instance_roundtrip(
+                aq,
+                op_type="instance_exec",
+                run_id=run_id,
+                image=str(image),
+                cmd=cmd,
+                timeout=timeout,
+                env=env,
+                cwd=Path(cwd_arg),
+            )
+
         else:  # op == "stop"
             resp = _instance_roundtrip(
                 aq,
