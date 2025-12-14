@@ -247,7 +247,8 @@ else:
             task_id = str(self.entry.get("task_id") or "").strip()
             if task_id:
                 # 一条 SWE 任务 ↔ 一个 run_id
-                issue.setdefault("run_id", f"gp-{task_id}")
+                # One SWE task may be evaluated multiple times / concurrently; include issue_uid for isolation.
+                issue["run_id"] = f"gp-{task_id}__{self._issue_uid}"
 
             parts = [
                 original_id or None,
@@ -256,6 +257,9 @@ else:
                 self._issue_uid,
             ]
             issue["id"] = "__".join([p for p in parts if p]) or self._issue_uid
+            # Ensure remote_swe instance isolation: prefer explicit run_id when available.
+            # Fallback: ensure run_id exists and is unique per trajectory.
+            issue.setdefault("run_id", issue["id"])
             return issue
 
         @property
