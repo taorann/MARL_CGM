@@ -1090,11 +1090,18 @@ def _parse_args() -> argparse.Namespace:
     args.sandbox_port_forwardings = port_forwardings
     args.sandbox_port_forward = port_forwardings
 
-    missing = [field for field in ("dataset", "planner_model", "cgm_model_path") if getattr(args, field) is None]
+    missing = [field for field in ("dataset", "planner_model") if getattr(args, field) is None]
+    # CGM can be provided either as a local model path (auto-launch) or as an HTTP endpoint.
+    if getattr(args, "cgm_model_path", None) is None and getattr(args, "cgm_endpoint", None) is None:
+        missing.append("cgm")
+
     if missing:
         parser.error(
-            "The following arguments are required (supply via CLI or config): "
-            + ", ".join(f"--{field.replace('_', '-')}" for field in missing)
+            "Missing required arguments (supply via CLI or config): "
+            + ", ".join(
+                ("--cgm-model-path/--cgm-endpoint" if field == "cgm" else f"--{field.replace('_', '-')}")
+                for field in missing
+            )
         )
 
     return args
@@ -1599,4 +1606,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
