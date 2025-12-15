@@ -91,15 +91,27 @@ else:
         def _trace_id(self) -> str:
             obs = self._last_env_observation or {}
             if isinstance(obs, dict):
-                issue = obs.get('issue') or {}
+                # Prefer runner index for concise logs (00/01/02...)
+                runner_id = obs.get("runner_id")
+                if runner_id is None:
+                    issue = obs.get("issue") or {}
+                    if isinstance(issue, dict):
+                        runner_id = issue.get("runner_id")
+                try:
+                    if runner_id is not None:
+                        return f"{int(runner_id):02d}"
+                except Exception:
+                    pass
+
+                issue = obs.get("issue") or {}
                 if isinstance(issue, dict):
-                    rid = str(issue.get('run_id') or '')
+                    rid = str(issue.get("run_id") or "")
                     if rid:
                         return rid
-                    iid = str(issue.get('id') or '')
+                    iid = str(issue.get("id") or "")
                     if iid:
                         return iid
-            return 'unknown'
+            return "unknown"
 
         def __post_init__(self) -> None:
             """初始化轨迹、消息列表以及可选的规则后备代理。"""
@@ -145,6 +157,8 @@ else:
         def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any] | None, **kwargs):
             """根据环境返回的观察值更新轨迹和内部状态。"""
 
+            # Ensure trace_id can read current observation
+            self._last_env_observation = observation
             info = info or {}
             if DEBUG:
                 trace = self._trace_id()
@@ -177,7 +191,13 @@ else:
                 trace = self._trace_id()
                 tp = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
                 try:
-                    action_json = json.dumps(action_obj.__dict__, ensure_ascii=False, default=str)
+                    if hasattr(action_obj, "model_dump"):
+                        payload = action_obj.model_dump(exclude_none=True)  # pydantic v2
+                    elif hasattr(action_obj, "dict"):
+                        payload = action_obj.dict(exclude_none=True)  # pydantic v1
+                    else:
+                        payload = getattr(action_obj, "__dict__", {})
+                    action_json = json.dumps(payload, ensure_ascii=False, default=str)
                 except Exception:
                     action_json = repr(action_obj)
                 if len(action_json) > 600:
