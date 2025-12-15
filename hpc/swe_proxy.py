@@ -1,70 +1,56 @@
 #!/usr/bin/env python
-"""
-swe_proxy.py
+"""swe_proxy.py
 
-一个很薄的本地代理：
+A thin JSON stdin/stdout proxy for GraphPlanner's remote_swe sandbox backend.
 
-- 从 stdin 读取一条 JSON 请求；
-- 通过 ApptainerQueueRuntime 把请求发到指定的 runner；
-- runner 在计算节点上使用 singularity/apptainer 执行命令；
-- 最后把结果封装成 JSON 打印到 stdout。
+It forwards requests to ApptainerQueueRuntime (file-queue IPC) which dispatches
+work to long-running runners on compute nodes. The runner executes commands
+inside a .sif image via apptainer/singularity.
 
-支持两种模式：
+Supported request formats:
 
-1) 一次性执行（旧用法，兼容）：
-   输入 JSON 不带 "op" 字段时：
-     {
-       "run_id": "local-test",
-       "image": "<docker image>",
-       "cmd": "cd /repo && python -V",
-       "timeout": 600,
-       "env": {...},     # 可选
-       "cwd": "/home"    # 可选，默认 "/home"
-     }
-   会在对应 SIF 上执行一次性的 `apptainer exec`。
+1) Legacy one-shot exec (no "op"):
+   {
+     "run_id": "...",
+     "image": "<docker image string>",
+     "cmd": "<shell command>",
+     "cwd": "/repo",           # optional
+     "timeout": 600,            # optional
+     "env": {"K": "V"}         # optional
+   }
 
-2) 长期 instance（轨迹模式）：
-   需要显式带上 "op" 字段：
+2) Trajectory / instance mode (explicit "op"):
+   - start: {"op":"start", "run_id":"...", "image":"...", "cwd":"/repo", "timeout":600, "env":{...}}
+   - exec : {"op":"exec",  "run_id":"...", "image":"...", "cmd":"...", "cwd":"/repo", "timeout":600, "env":{...}}
+   - stop : {"op":"stop",  "run_id":"...", "timeout":600}
 
-   (a) 启动轨迹容器：
-       {"op": "start", "run_id": "ep-1", "image": "<docker image>", "timeout": 600}
+3) Helpers used by SandboxRuntime (remote_swe):
+   - build_graph:
+     {"op":"build_graph", "run_id":"...", "image":"...", "issue_id":"...", "repo":"/repo", "cwd":"/repo"}
+   - build_repo_graph:
+     {"op":"build_repo_graph", "run_id":"...", "image":"...", "repo":"/repo", "cwd":"/repo"}
 
-   (b) 在该轨迹对应的容器里执行命令：
-       {
-         "op": "exec", "run_id": "ep-1",
-         "image": "<docker image>",
-         "cmd": "cd /repo && python -V",
-         "timeout": 600,
-         "env": {...}, "cwd": "/home"
-       }
-
-   (c) 结束轨迹、停止容器：
-       {"op": "stop", "run_id": "ep-1", "timeout": 600}
-
-其中 run_id 用来标识一条轨迹；ApptainerQueueRuntime 会把同一个 run_id
-稳定映射到某一个 runner（例如 gp-00 / gp-01 / ...）。
+Env:
+  - GP_NUM_RUNNERS (default 1)
+  - QUEUE_ROOT (default ~/gp_queue)
+  - GP_SIF_DIR or SIF_DIR (default ~/sif/sweb)
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
+from graph_planner.runtime.apptainer_queue_runtime import ApptainerQueueRuntime
+from graph_planner.runtime.queue_protocol import QueueResponse
+
 
 def _dbg(msg: str) -> None:
     if os.environ.get("DEBUG") or os.environ.get("EBUG"):
         print(f"[swe_proxy] {msg}", file=sys.stderr)
-
-from graph_planner.runtime.apptainer_queue_runtime import ApptainerQueueRuntime
-from graph_planner.runtime.queue_protocol import QueueRequest, QueueResponse
-
-
-# ---------------------------------------------------------------------
-# 小工具：把 QueueResponse / ExecResult 转成统一的 dict
-# ---------------------------------------------------------------------
 
 
 def _resp_to_dict(resp: QueueResponse) -> Dict[str, Any]:
@@ -78,28 +64,10 @@ def _resp_to_dict(resp: QueueResponse) -> Dict[str, Any]:
     }
 
 
-def _exec_result_to_dict(res: Any) -> Dict[str, Any]:
-    # ExecResult 定义在 queue_protocol 里，这里不强依赖类型
-    return {
-        "ok": bool(res.returncode == 0),
-        "returncode": int(res.returncode),
-        "stdout": getattr(res, "stdout", "") or "",
-        "stderr": getattr(res, "stderr", "") or "",
-        "runtime_sec": float(getattr(res, "runtime_sec", 0.0) or 0.0),
-        "error": getattr(res, "error", None),
-    }
-
-
-# ---------------------------------------------------------------------
-# 通过 ApptainerQueueRuntime 发送 instance_* 请求（start/exec/stop）
-# 注意：这里会调用 ApptainerQueueRuntime 的“内部方法”，但在我们自己的项目中是 OK 的。
-# ---------------------------------------------------------------------
-
-
 def _instance_roundtrip(
     aq: ApptainerQueueRuntime,
     *,
-    op_type: str,          # "instance_start" | "instance_exec" | "instance_stop"
+    op_type: str,  # instance_start | instance_exec | instance_stop
     run_id: str,
     image: Optional[str],
     cmd: Optional[str],
@@ -107,48 +75,41 @@ def _instance_roundtrip(
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[Path] = None,
 ) -> QueueResponse:
-    """构造一个 QueueRequest 发给 runner，走长期 instance 逻辑。"""
-    # 选一个 runner（内部是稳定 hash 到 [0, num_runners)）
-    runner_id = aq._choose_runner(run_id)  # type: ignore[attr-defined]
+    """Construct a QueueRequest and send it to the mapped runner."""
 
-    # 映射 docker image → SIF 路径（start / exec 需要，stop 可以忽略）
+    runner_id = aq._choose_runner(run_id)  # type: ignore[attr-defined]
     sif_path: Optional[Path] = None
     if image:
         sif_path = aq._image_to_sif(image)  # type: ignore[attr-defined]
 
-    # cmd: 对 exec 场景封装成 ["bash", "-lc", "<shell cmd>"]，其他 op 则为空
+    cmd_list: List[str]
     if cmd is None:
-        cmd_list: List[str] = []
+        cmd_list = []
     else:
         cmd_list = ["bash", "-lc", cmd]
 
-    workdir = cwd or Path("/home")
+    workdir = cwd or Path("/repo")
 
-    # 构造请求
-    req = QueueRequest(
-        req_id=aq._new_req_id(),  # type: ignore[attr-defined]
-        runner_id=runner_id,
-        run_id=run_id,
-        type=op_type,
-        image=image,
-        sif_path=str(sif_path) if sif_path is not None else None,
-        cmd=cmd_list,
-        cwd=str(workdir),
-        env=dict(env or {}),
-        timeout_sec=float(timeout or aq.default_timeout_sec),
-        src=None,
-        dst=None,
-        meta={},
-    )
+    # Build raw QueueRequest without importing it here (avoid duplicate protocol deps)
+    req = {
+        "req_id": aq._new_req_id(),  # type: ignore[attr-defined]
+        "runner_id": runner_id,
+        "run_id": run_id,
+        "type": op_type,
+        "image": image,
+        "sif_path": str(sif_path) if sif_path is not None else None,
+        "cmd": cmd_list,
+        "cwd": str(workdir),
+        "env": dict(env or {}),
+        "timeout_sec": float(timeout or aq.default_timeout_sec),
+        "src": None,
+        "dst": None,
+        "meta": {},
+    }
 
-    # 发给对应 runner，并等待响应
-    resp = aq._roundtrip(req)  # type: ignore[attr-defined]
+    # Use internal roundtrip for instance ops
+    resp = aq._roundtrip(type("_Q", (), req)())  # type: ignore[attr-defined]
     return resp
-
-
-# ---------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------
 
 
 def main() -> int:
@@ -158,32 +119,22 @@ def main() -> int:
         return 1
 
     try:
-        req = json.loads(raw)
-        _dbg(f"recv op={req.get('op')!r} run_id={req.get('run_id')!r} image={req.get('image')!r} cwd={req.get('cwd')!r} repo={req.get('repo')!r}")
+        payload = json.loads(raw)
     except Exception as e:
         print(json.dumps({"ok": False, "error": f"invalid json: {e}"}))
         return 1
 
-    # 公共字段
-    run_id = str(req.get("run_id") or "__default__")
-    image = req.get("image")
-    cmd = req.get("cmd")
-    timeout = float(req.get("timeout") or 600.0)
-    env = req.get("env") or {}
-    cwd = Path(req.get("cwd") or "/repo")
+    run_id = str(payload.get("run_id") or "__default__")
+    op = str(payload.get("op") or "").strip().lower()
+    image = payload.get("image")
+    cmd = payload.get("cmd")
+    timeout = float(payload.get("timeout") or 600.0)
+    env = payload.get("env") or {}
+    cwd = Path(payload.get("cwd") or "/repo")
 
-    # 多 runner 数量（与 Slurm 启动的 runner 数量保持一致）
-    num_runners = int(os.environ.get("GP_NUM_RUNNERS", "1"))
-
-    # 3. 构造 ApptainerQueueRuntime
-    queue_root = Path.home() / "gp_queue"
-    sif_dir = Path.home() / "sif" / "sweb"
-
-    num_runners_env = os.environ.get("GP_NUM_RUNNERS", "1") or "1"
-    try:
-        num_runners = int(num_runners_env)
-    except ValueError:
-        num_runners = 1
+    num_runners = int(os.environ.get("GP_NUM_RUNNERS", "1") or "1")
+    queue_root = Path(os.environ.get("QUEUE_ROOT", str(Path.home() / "gp_queue"))).expanduser().resolve()
+    sif_dir = Path(os.environ.get("GP_SIF_DIR") or os.environ.get("SIF_DIR") or str(Path.home() / "sif" / "sweb")).expanduser().resolve()
 
     aq = ApptainerQueueRuntime(
         queue_root=queue_root,
@@ -192,134 +143,119 @@ def main() -> int:
         default_timeout_sec=timeout,
     )
 
-    op = str(req.get("op") or "").strip().lower()
-
-    # ---------------------------------------------------------------
-    # 1) 长期 instance 模式：显式带 op = start / exec / stop
-    # ---------------------------------------------------------------
-    if op in {"start", "exec", "stop", "build_graph", "build_repo_graph"}:
-        if op in {"start", "exec", "build_graph", "build_repo_graph"} and not image:
-            print(json.dumps({"ok": False, "error": "image is required for op=start/exec/build_graph/build_repo_graph"}))
-            return 1
-
-        if op == "start":
-            resp = _instance_roundtrip(
-                aq,
-                op_type="instance_start",
-                run_id=run_id,
-                image=str(image),
-                cmd=None,
-                timeout=timeout,
-                env=env,
-                cwd=cwd,
-            )
-        elif op == "exec":
-            if not isinstance(cmd, str) or not cmd:
-                print(json.dumps({"ok": False, "error": "cmd is required for op=exec"}))
-                return 1
-            resp = _instance_roundtrip(
-                aq,
-                op_type="instance_exec",
-                run_id=run_id,
-                image=str(image),
-                cmd=str(cmd),
-                timeout=timeout,
-                env=env,
-                cwd=cwd,
-            )
-        elif op == "build_graph":
-            issue_id = str(req.get("issue_id") or "")
-            if not issue_id:
-                print(json.dumps({"ok": False, "error": "issue_id is required for op=build_graph"}))
-                return 1
-
-            cmd = (
-                "PYTHONPATH=$PYTHONPATH:/gp "
-                "python -m graph_planner.tools.swe_build_graph "
-                "--repo /repo "
-                f"--issue-id {issue_id}"
-            )
-
-            resp = _instance_roundtrip(
-                aq,
-                op_type="instance_exec",
-                run_id=run_id,
-                image=str(image),
-                cmd=cmd,
-                timeout=timeout,
-                env=env,
-                cwd=cwd,
-            )
-        elif op == "build_repo_graph":
-            # Repo-level graph build: emits base64(gzip(JSONL)) to stdout for transport
-            repo_arg = payload.get('repo') or '/repo'
-            cwd_arg = payload.get('cwd') or '/repo'
-            _dbg(f"build_repo_graph: cwd={cwd_arg} repo={repo_arg} run_id={run_id} image={image}")
-            cmd = (
-                "PYTHONPATH=$PYTHONPATH:/gp "
-                "python -m graph_planner.tools.swe_build_graph "
-                f"--repo {repo_arg} "
-                "--emit-base64-gzip"
-            )
-
-
-            resp = _instance_roundtrip(
-                aq,
-                op_type="instance_exec",
-                run_id=run_id,
-                image=str(image),
-                cmd=cmd,
-                timeout=timeout,
-                env=env,
-                cwd=Path(cwd_arg),
-            )
-
-        else:  # op == "stop"
-            resp = _instance_roundtrip(
-                aq,
-                op_type="instance_stop",
-                run_id=run_id,
-                image=None,
-                cmd=None,
-                timeout=timeout,
-                env=None,
-                cwd=cwd,
-            )
-
-        out = _resp_to_dict(resp)
-        print(json.dumps(out, ensure_ascii=False))
-        return 0
-
-    # ---------------------------------------------------------------
-    # 2) 兼容旧用法：不带 op → 一次性 exec（非长期 instance）
-    # ---------------------------------------------------------------
-    if not image:
-        print(json.dumps({"ok": False, "error": "image is required when op is omitted"}))
-        return 1
-
-    if not isinstance(cmd, str) or not cmd:
-        print(json.dumps({"ok": False, "error": "cmd is required when op is omitted"}))
-        return 1
-
-    exec_cmd = ["bash", "-lc", cmd]
+    _dbg(f"recv op={op!r} run_id={run_id!r} image={image!r} cwd={str(cwd)!r} queue_root={str(queue_root)!r} sif_dir={str(sif_dir)!r} num_runners={num_runners}")
 
     try:
+        # ---------- instance mode ----------
+        if op in {"start", "exec", "stop", "build_graph", "build_repo_graph"}:
+            if op in {"start", "exec", "build_graph", "build_repo_graph"} and not image:
+                print(json.dumps({"ok": False, "error": f"image is required for op={op}"}))
+                return 1
+
+            if op == "start":
+                resp = _instance_roundtrip(
+                    aq,
+                    op_type="instance_start",
+                    run_id=run_id,
+                    image=str(image),
+                    cmd=None,
+                    timeout=timeout,
+                    env=env,
+                    cwd=cwd,
+                )
+            elif op == "exec":
+                if not isinstance(cmd, str) or not cmd:
+                    print(json.dumps({"ok": False, "error": "cmd is required for op=exec"}))
+                    return 1
+                resp = _instance_roundtrip(
+                    aq,
+                    op_type="instance_exec",
+                    run_id=run_id,
+                    image=str(image),
+                    cmd=str(cmd),
+                    timeout=timeout,
+                    env=env,
+                    cwd=cwd,
+                )
+            elif op == "build_graph":
+                issue_id = str(payload.get("issue_id") or "").strip()
+                if not issue_id:
+                    print(json.dumps({"ok": False, "error": "issue_id is required for op=build_graph"}))
+                    return 1
+                repo = str(payload.get("repo") or "/repo")
+                py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/gp"
+                build_cmd = (
+                    f"{py} python -m graph_planner.tools.swe_build_graph "
+                    f"--repo {repo} --issue-id {issue_id}"
+                )
+                resp = _instance_roundtrip(
+                    aq,
+                    op_type="instance_exec",
+                    run_id=run_id,
+                    image=str(image),
+                    cmd=build_cmd,
+                    timeout=timeout,
+                    env=env,
+                    cwd=cwd,
+                )
+            elif op == "build_repo_graph":
+                repo = str(payload.get("repo") or "/repo")
+                py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/gp"
+                build_cmd = (
+                    f"{py} python -m graph_planner.tools.swe_build_graph "
+                    f"--repo {repo} --emit-base64-gzip"
+                )
+                resp = _instance_roundtrip(
+                    aq,
+                    op_type="instance_exec",
+                    run_id=run_id,
+                    image=str(image),
+                    cmd=build_cmd,
+                    timeout=timeout,
+                    env=env,
+                    cwd=cwd,
+                )
+            else:  # stop
+                resp = _instance_roundtrip(
+                    aq,
+                    op_type="instance_stop",
+                    run_id=run_id,
+                    image=None,
+                    cmd=None,
+                    timeout=timeout,
+                    env=env,
+                    cwd=cwd,
+                )
+
+            print(json.dumps(_resp_to_dict(resp), ensure_ascii=False))
+            return 0
+
+        # ---------- legacy one-shot exec ----------
+        if not image or not cmd:
+            print(json.dumps({"ok": False, "error": "missing image/cmd"}, ensure_ascii=False))
+            return 1
+
         res = aq.exec(
             run_id=run_id,
             docker_image=str(image),
-            cmd=exec_cmd,
+            cmd=["bash", "-lc", str(cmd)],
             cwd=cwd,
             env=env,
             timeout_sec=timeout,
-            meta={"src": "swe_proxy", "op": "exec_oneoff"},
         )
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": f"aq.exec failed: {e}"}))
-        return 1
+        print(json.dumps({
+            "ok": bool(res.returncode == 0),
+            "returncode": int(res.returncode),
+            "stdout": res.stdout or "",
+            "stderr": res.stderr or "",
+            "runtime_sec": float(getattr(res, "runtime_sec", 0.0) or 0.0),
+            "error": getattr(res, "error", None),
+        }, ensure_ascii=False))
+        return 0
 
-    out = _exec_result_to_dict(res)
-    print(json.dumps(out, ensure_ascii=False))
-    return 0
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": repr(e)}, ensure_ascii=False))
+        return 1
 
 
 if __name__ == "__main__":
