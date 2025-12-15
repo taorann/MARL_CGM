@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import subprocess
 import time
 from pathlib import Path
@@ -37,6 +38,14 @@ def _ensure_dir(p: Path) -> None:
 
 def _now() -> float:
     return time.time()
+
+
+
+def _dbg(msg: str) -> None:
+    if os.environ.get('DEBUG') or os.environ.get('EBUG'):
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        print(f'[runner {RUNNER_ID:02d} {ts}] {msg}', file=sys.stderr, flush=True)
+
 
 
 
@@ -78,35 +87,81 @@ def main() -> None:
             time.sleep(POLL_INTERVAL_SEC)
 
 
+
 def handle_one_request(req_path: Path, outbox: Path) -> None:
+    """Handle a single queue request and always write a response.
+
+    IMPORTANT: Never let exceptions crash the runner loop; otherwise the proxy
+    will wait forever for a response file and clients will see timeouts / retries.
+    """
+    t0 = _now()
     data: Dict[str, Any] = json.loads(req_path.read_text(encoding="utf-8"))
     req = QueueRequest(**data)
 
-    if req.type == "exec":
-        resp = handle_exec(req)
-    elif req.type == "instance_start":
-        resp = handle_instance_start(req)
-    elif req.type == "instance_exec":
-        resp = handle_instance_exec(req)
-    elif req.type == "instance_stop":
-        resp = handle_instance_stop(req)
-    elif req.type == "put":
-        resp = handle_put(req)
-    elif req.type == "get":
-        resp = handle_get(req)
-    elif req.type == "cleanup":
-        resp = handle_cleanup(req)
-    else:
+    _dbg(
+        f"recv type={req.type!r} req_id={req.req_id!r} run_id={req.run_id!r} "
+        f"cwd={req.cwd!r} timeout_sec={req.timeout_sec!r} "
+        f"sif={req.sif_path!r} cmd={(req.cmd[:3] if req.cmd else None)!r}"
+    )
+
+    try:
+        if req.type == "exec":
+            resp = handle_exec(req)
+        elif req.type == "instance_start":
+            resp = handle_instance_start(req)
+        elif req.type == "instance_exec":
+            resp = handle_instance_exec(req)
+        elif req.type == "instance_stop":
+            resp = handle_instance_stop(req)
+        elif req.type == "put":
+            resp = handle_put(req)
+        elif req.type == "get":
+            resp = handle_get(req)
+        elif req.type == "cleanup":
+            resp = handle_cleanup(req)
+        else:
+            resp = QueueResponse(
+                req_id=req.req_id,
+                runner_id=req.runner_id,
+                run_id=req.run_id,
+                type=req.type,
+                ok=True,
+            )
+    except subprocess.TimeoutExpired as e:
+        _dbg(f"timeout type={req.type!r} run_id={req.run_id!r}: {e}")
         resp = QueueResponse(
             req_id=req.req_id,
             runner_id=req.runner_id,
             run_id=req.run_id,
             type=req.type,
-            ok=True,
+            ok=False,
+            returncode=124,
+            stdout="",
+            stderr=str(e),
+            runtime_sec=_now() - t0,
+            error="timeout",
+        )
+    except Exception as e:
+        _dbg(f"error type={req.type!r} run_id={req.run_id!r}: {e!r}")
+        resp = QueueResponse(
+            req_id=req.req_id,
+            runner_id=req.runner_id,
+            run_id=req.run_id,
+            type=req.type,
+            ok=False,
+            returncode=1,
+            stdout="",
+            stderr=repr(e),
+            runtime_sec=_now() - t0,
+            error=repr(e),
         )
 
     resp_path = outbox / f"{resp.req_id}.json"
     resp_path.write_text(json.dumps(resp.__dict__, ensure_ascii=False), encoding="utf-8")
+    _dbg(
+        f"sent type={req.type!r} req_id={req.req_id!r} ok={resp.ok!r} "
+        f"rc={getattr(resp, 'returncode', None)!r} dt={_now()-t0:.2f}s"
+    )
 
 
 # ----------------- 一次性 exec（直接对 SIF 调用） -----------------
