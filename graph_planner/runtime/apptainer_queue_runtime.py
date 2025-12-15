@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import time
 import uuid
@@ -266,3 +267,4 @@ class ApptainerQueueRuntime:
             ok=True,
             error=None,
         )
+
