@@ -157,6 +157,11 @@ def main() -> int:
         max_stdout_bytes=(max_stdout_bytes if max_stdout_bytes is not None else int(os.environ.get("GP_MAX_STDOUT_BYTES", "20000000"))),
     )
 
+    # Ensure repo_graph payload isn't truncated by an overly small stdout cap
+    if op == "build_repo_graph":
+        aq.max_stdout_bytes = max(int(getattr(aq, "max_stdout_bytes", 0) or 0), 200_000_000)
+
+
     _dbg(f"recv op={op!r} run_id={run_id!r} image={image!r} cwd={str(cwd)!r} queue_root={str(queue_root)!r} sif_dir={str(sif_dir)!r} num_runners={num_runners}")
 
     try:
@@ -197,7 +202,7 @@ def main() -> int:
                     print(json.dumps({"ok": False, "error": "issue_id is required for op=build_graph"}))
                     return 1
                 repo = str(payload.get("repo") or "/repo")
-                py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/gp"
+                py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/mnt/share/MARL_CGM-main:/gp"
                 build_cmd = (
                     f"{py} python -m graph_planner.tools.swe_build_graph "
                     f"--repo {repo} --issue-id {issue_id}"
@@ -214,7 +219,7 @@ def main() -> int:
                 )
             elif op == "build_repo_graph":
                 repo = str(payload.get("repo") or "/repo")
-                py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/gp"
+                py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/mnt/share/MARL_CGM-main:/gp"
                 build_cmd = (
                     f"{py} python -m graph_planner.tools.swe_build_graph "
                     f"--repo {repo} --emit-base64-gzip"
