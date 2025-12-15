@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 import os
 import json
+import sys
 
 from ...infra.vendor import ensure_rllm_importable
 
@@ -249,8 +250,33 @@ else:
             """
 
             # 1) 未启用规则 fallback：直接把错误抛给上层
+            # If rule fallback is disabled, do not hard-fail the whole eval.
+            # Instead return a safe NoopAction and make the error visible in logs.
             if not self.use_rule_fallback or self._rule_agent is None:
-                raise ProtocolError("rule-fallback-disabled", "Rule fallback disabled")
+                # Do not crash the whole eval just because the model produced a
+                # slightly malformed block. Return a safe no-op action and emit
+                # a visible debug log so you can spot prompt / parser issues.
+                if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+                    print(
+                        "[gp-agent] rule fallback disabled; returning noop: "
+                        f"reason={reason!r} error={error!r} "
+                        f"response_prefix={response[:200]!r}",
+                        file=sys.stderr,
+                    )
+                action_obj = NoopAction(reason=f"fallback:{reason}")
+                assistant_msg = text_protocol.format_action_block(
+                    "noop",
+                    {"reason": reason, "error": str(error or "")},
+                )
+                meta = {
+                    "used_fallback": True,
+                    "fallback": "noop",
+                    "reason": reason,
+                    "error": error,
+                    "raw_action": raw_action,
+                    "model_response": response,
+                }
+                return "", action_obj, assistant_msg, meta
 
             # 2) 启用了规则 fallback：沿用原来的“保底动作”逻辑
             observation = self._last_env_observation or {}
