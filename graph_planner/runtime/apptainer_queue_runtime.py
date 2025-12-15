@@ -35,6 +35,9 @@ class ApptainerQueueRuntime:
         self.max_stdout_bytes = int(max_stdout_bytes)
         self._run_to_runner: Dict[str, int] = {}
 
+        # Runner liveness / startup waiting (for remote_swe).
+        self.heartbeat_ttl_sec = float(os.environ.get("GP_RUNNER_HEARTBEAT_TTL_SEC", "180"))
+        self.wait_for_runners_sec = float(os.environ.get("GP_WAIT_FOR_RUNNERS_SEC", "60"))
     # ----------------------
     # 一次性容器（原有接口）
     # ----------------------
@@ -207,12 +210,72 @@ class ApptainerQueueRuntime:
     # ----------------------
     # 内部工具函数
     # ----------------------
+
+    def _heartbeat_path(self, rid: int) -> Path:
+        return self.queue_root / f"runner-{rid}" / "heartbeat.json"
+
+    def _alive_runner_ids(self) -> List[int]:
+        """Return runner ids considered 'alive' based on heartbeat.json timestamps."""
+        now = time.time()
+        alive: List[int] = []
+        # only consider [0, num_runners) to avoid routing to ids we never created
+        for rid in range(max(int(self.num_runners), 1)):
+            hp = self._heartbeat_path(rid)
+            if not hp.exists():
+                continue
+            try:
+                data = json.loads(hp.read_text(encoding="utf-8"))
+                ts = float(data.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = hp.stat().st_mtime
+            if now - ts <= float(self.heartbeat_ttl_sec):
+                alive.append(rid)
+        return alive
+
+    def _maybe_reroute_to_alive(self, req: QueueRequest) -> None:
+        """If there are alive runners and req.runner_id is not one of them, reroute."""
+        alive = self._alive_runner_ids()
+        if not alive:
+            # optionally wait a bit for runners to come up, to avoid 15min 'start' hangs
+            if float(self.wait_for_runners_sec) <= 0:
+                return
+            deadline = time.time() + float(self.wait_for_runners_sec)
+            while time.time() < deadline:
+                time.sleep(min(float(self.poll_interval_sec), 1.0))
+                alive = self._alive_runner_ids()
+                if alive:
+                    break
+            if not alive:
+                return
+
+        if int(req.runner_id) in alive:
+            return
+
+        # deterministic mapping to currently alive runners
+        new_rid = alive[hash(req.run_id) % len(alive)]
+        if req.meta is None:
+            req.meta = {}
+        req.meta["reroute_from"] = str(req.runner_id)
+        req.meta["reroute_to"] = str(new_rid)
+        req.runner_id = int(new_rid)
+
     def _choose_runner(self, run_id: str) -> int:
+        # Prefer alive runners to avoid routing to PENDING / dead runners (common on Slurm).
+        alive = self._alive_runner_ids()
         rid = self._run_to_runner.get(run_id)
+
+        if alive:
+            if rid is not None and int(rid) in alive:
+                return int(rid)
+            new_rid = alive[hash(run_id) % len(alive)]
+            self._run_to_runner[run_id] = int(new_rid)
+            return int(new_rid)
+
+        # Fallback: deterministic modulo (may hang if Slurm hasn't started runners yet).
         if rid is None:
-            rid = hash(run_id) % max(self.num_runners, 1)
-            self._run_to_runner[run_id] = rid
-        return rid
+            rid = hash(run_id) % max(int(self.num_runners), 1)
+            self._run_to_runner[run_id] = int(rid)
+        return int(rid)
 
     def _new_req_id(self) -> str:
         return uuid.uuid4().hex
@@ -226,6 +289,8 @@ class ApptainerQueueRuntime:
         return self.sif_dir / f"{normalized}.sif"
 
     def _roundtrip(self, req: QueueRequest) -> QueueResponse:
+        # Reroute to an alive runner if possible (prevents long timeouts when some runners are pending).
+        self._maybe_reroute_to_alive(req)
         root = self.queue_root
         inbox = runner_inbox(root, req.runner_id)
         outbox = runner_outbox(root, req.runner_id)
