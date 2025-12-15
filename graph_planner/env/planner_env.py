@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -237,9 +238,6 @@ class PlannerEnv:
         self.memory_subgraph: WorkingSubgraph = subgraph_store.new()   # 长期记忆图
         self.working_subgraph: WorkingSubgraph = subgraph_store.new()  # 当前工作图
 
-        # 最近一次 explore.expand/read 合并进 working 的新增节点（供 memory.selector='latest' 使用）
-        self._last_working_additions: List[str] = []
-
         # Repo 图索引
         self._repo_nodes_by_id: Dict[str, Dict[str, Any]] = {}
         self._repo_edges: List[Dict[str, Any]] = []
@@ -329,8 +327,6 @@ class PlannerEnv:
         # === 3) 工作图 = 记忆图的拷贝（此时也是空图） ===
         self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
 
-
-        self._last_working_additions = []
         # === 4) 初始化 text_memory（基于 memory_subgraph） ===
         self.memory_graph_store = text_memory.WorkingGraphStore(self.memory_subgraph)
         self.memory_text_store = text_memory.NoteTextStore()
@@ -608,7 +604,12 @@ class PlannerEnv:
                     dir_diversity_k=dir_diversity_k,
                 )
             else:
-                candidates = []
+                if query:
+                    candidates = self._search_repo_candidates_by_query(
+                        query=query, total_limit=total_limit, dir_diversity_k=dir_diversity_k
+                    )
+                else:
+                    candidates = []
 
             self.last_candidates = candidates
             info["candidates"] = candidates
@@ -688,6 +689,144 @@ class PlannerEnv:
         info["error"] = f"unknown-explore-op:{act.op}"
         return info
 
+
+    def _search_repo_candidates_by_query(
+        self,
+        *,
+        query: str,
+        total_limit: int,
+        dir_diversity_k: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Search repo_graph nodes when explore.find is called without anchors.
+
+        The repo_graph is a coarse code graph (files/symbols/spans). When the model provides
+        a free-form query, we do a lightweight lexical match against node id/name/path.
+
+        Query conventions (best-effort, optional):
+        - "path:<substr>"   : prioritize path matches
+        - "symbol:<name>"  : prioritize symbol/id/name matches
+        """
+        q = (query or "").strip()
+        if not q or not self.repo_graph:
+            return []
+
+        q_lower = q.lower()
+
+        mode = "free"
+        payload = q
+        if q_lower.startswith("path:"):
+            mode, payload = "path", q[5:].strip()
+        elif q_lower.startswith("symbol:"):
+            mode, payload = "symbol", q[7:].strip()
+
+        # Tokenize payload: keep identifiers and path-ish tokens
+        toks = re.findall(r"[A-Za-z0-9_./:-]+", payload)
+        toks = [t.lower() for t in toks if t and len(t) >= 2]
+
+        def norm_dir(p: str) -> str:
+            try:
+                pp = Path(p)
+                return str(pp.parent.as_posix())
+            except Exception:
+                return ""
+
+        scored: List[Dict[str, Any]] = []
+        nodes = getattr(self.repo_graph, "nodes", {}) or {}
+        for nid, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            nid_s = str(nid or node.get("id") or "")
+            name = str(node.get("name") or node.get("symbol") or "")
+            path = str(node.get("path") or "")
+            kind = str(node.get("kind") or "").lower()
+
+            hay = (nid_s + " " + name + " " + path).lower()
+            if not hay:
+                continue
+
+            score = 0.0
+            reasons: List[str] = []
+
+            # Strong exact/substring match on whole payload
+            p_lower = payload.lower()
+            if p_lower and p_lower in hay:
+                score += 3.0
+                reasons.append("payload")
+
+            # Token matches
+            for t in toks:
+                if t in hay:
+                    score += 1.0
+                    reasons.append(t)
+
+            # Mode-specific boosts
+            if mode == "path" and payload and payload.lower() in path.lower():
+                score += 3.0
+                reasons.append("path")
+            if mode == "symbol" and payload:
+                pl = payload.lower()
+                if pl == nid_s.lower() or pl == name.lower():
+                    score += 4.0
+                    reasons.append("symbol_exact")
+                elif pl in nid_s.lower() or pl in name.lower():
+                    score += 2.0
+                    reasons.append("symbol")
+
+            if score <= 0:
+                continue
+
+            scored.append(
+                {
+                    "id": nid_s,
+                    "kind": kind,
+                    "path": node.get("path"),
+                    "span": node.get("span"),
+                    "degree": int(node.get("degree") or 0),
+                    "from_anchor": False,
+                    "score": float(score),
+                    "reasons": list(dict.fromkeys(reasons))[:8],
+                    "name": name or None,
+                }
+            )
+
+        scored.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+        # Directory diversity: round-robin by parent dir to avoid over-concentration.
+        if dir_diversity_k and dir_diversity_k > 0:
+            buckets: Dict[str, List[Dict[str, Any]]] = {}
+            order: List[str] = []
+            for c in scored:
+                d = norm_dir(str(c.get("path") or ""))
+                if d not in buckets:
+                    buckets[d] = []
+                    order.append(d)
+                buckets[d].append(c)
+
+            mixed: List[Dict[str, Any]] = []
+            rounds = 0
+            while len(mixed) < total_limit:
+                progressed = False
+                for d in list(order):
+                    if not buckets.get(d):
+                        continue
+                    # Take up to k per dir overall via round-robin rounds
+                    if rounds < dir_diversity_k:
+                        mixed.append(buckets[d].pop(0))
+                        progressed = True
+                        if len(mixed) >= total_limit:
+                            break
+                    else:
+                        # After k rounds, just fill greedily
+                        while buckets[d] and len(mixed) < total_limit:
+                            mixed.append(buckets[d].pop(0))
+                        progressed = True
+                if not progressed:
+                    break
+                rounds += 1
+            scored = mixed
+
+        return scored[:total_limit]
+
     def _handle_memory(self, act: MemoryAction) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "memory", "target": act.target, "intent": act.intent}
 
@@ -699,21 +838,8 @@ class PlannerEnv:
         scope = "session"
 
         selector = act.selector
-
-        # selector 允许:
-        # - str: "latest" / tag / note_id
-        # - dict: {"nodes":[...], "note":"...", "tag":"..."}
         sel_map: Dict[str, Any] = selector if isinstance(selector, Mapping) else {}
-
-        # "latest" 是特殊 selector：不当作 tag
-        selector_is_latest = isinstance(selector, str) and selector.strip().lower() == "latest"
-
-        tag = None
-        if isinstance(sel_map.get("tag"), str):
-            tag = sel_map.get("tag")
-        elif isinstance(selector, str) and (not selector_is_latest):
-            tag = selector
-
+        tag = sel_map.get("tag") if isinstance(sel_map.get("tag"), str) else (selector if isinstance(selector, str) else None)
         note_text = sel_map.get("note") if isinstance(sel_map.get("note"), str) else None
 
         # node_ids（可选）
@@ -729,23 +855,6 @@ class PlannerEnv:
         result: Dict[str, Any] = {}
         if act.intent == "commit":
             if act.target == "explore":
-                # 选出要写入 memory_subgraph 的节点：
-                # - selector="latest" 或未指定 nodes：默认使用最近一次 explore 合并的新增节点
-                # - selector.nodes 指定：使用指定 nodes
-                # - 若都为空：回退为当前 working_subgraph 的全部节点
-                if selector_is_latest or (not node_ids):
-                    if self._last_working_additions:
-                        node_ids = list(self._last_working_additions)
-                    elif hasattr(self.working_subgraph, "node_ids"):
-                        node_ids = sorted(list(getattr(self.working_subgraph, "node_ids", set()) or set()))
-                    else:
-                        try:
-                            node_ids = sorted(list(self.working_subgraph.nodes.keys()))
-                        except Exception:
-                            node_ids = []
-
-                merge_report = self._merge_working_nodes_into_memory(node_ids)
-                info["graph_commit"] = merge_report
                 # 选择性 commit：如果给了 nodes，就只把这些节点（及相关边）写入记忆
                 if node_ids:
                     candidates: List[Dict[str, Any]] = []
@@ -896,64 +1005,8 @@ class PlannerEnv:
     def _reset_working_to_memory(self) -> None:
         """Memory 动作之后，把工作图重置为记忆图。"""
         self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
-        self._last_working_additions = []
 
-    def _merge_working_nodes_into_memory(self, node_ids: Sequence[str]) -> Dict[str, Any]:
-        """从 working_subgraph 里选择性抽取 nodes/edges，合并进 memory_subgraph。"""
-        committed: List[str] = []
-        skipped: List[str] = []
-        if not node_ids:
-            return {"committed": committed, "skipped": skipped}
-
-        mem_nodes: Dict[str, Dict[str, Any]] = dict(getattr(self.memory_subgraph, "nodes", {}) or {})
-        work_nodes: Dict[str, Dict[str, Any]] = dict(getattr(self.working_subgraph, "nodes", {}) or {})
-
-        for nid in node_ids:
-            if not isinstance(nid, str) or not nid.strip():
-                continue
-            w = work_nodes.get(nid)
-            if not isinstance(w, dict) or not w:
-                skipped.append(nid)
-                continue
-            node_copy = dict(w)
-            node_copy["id"] = nid
-            node_copy["status"] = "remembered"
-            tags = set(node_copy.get("tags") or [])
-            tags.add("remembered")
-            node_copy["tags"] = sorted(tags)
-            mem_nodes[nid] = node_copy
-            committed.append(nid)
-
-        mem_ids = set(mem_nodes.keys())
-
-        # edges: keep existing, plus any working edges whose endpoints both in mem_ids
-        mem_edges: List[Dict[str, Any]] = []
-        for e in (getattr(self.memory_subgraph, "edges", []) or []):
-            if isinstance(e, dict):
-                src, dst = e.get("src"), e.get("dst")
-                if isinstance(src, str) and isinstance(dst, str) and src in mem_ids and dst in mem_ids:
-                    mem_edges.append(dict(e))
-
-        existing = {(e.get("src"), e.get("dst"), e.get("etype") or e.get("type")) for e in mem_edges if isinstance(e, dict)}
-        for e in (getattr(self.working_subgraph, "edges", []) or []):
-            if not isinstance(e, dict):
-                continue
-            src, dst = e.get("src"), e.get("dst")
-            if not isinstance(src, str) or not isinstance(dst, str):
-                continue
-            if src in mem_ids and dst in mem_ids:
-                key = (src, dst, e.get("etype") or e.get("type"))
-                if key in existing:
-                    continue
-                existing.add(key)
-                mem_edges.append(dict(e))
-
-        self.memory_subgraph.nodes = mem_nodes
-        self.memory_subgraph.edges = mem_edges
-        self.memory_subgraph.node_ids = set(mem_nodes.keys())
-        return {"committed": committed, "skipped": skipped}
-
-# ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Repair / Submit
     # ------------------------------------------------------------------
     def _handle_repair(self, act: RepairAction) -> Dict[str, Any]:
@@ -1400,99 +1453,47 @@ print(json.dumps({'snippet_lines': snippet}))
         *,
         status: str = "explored",
     ) -> None:
-        """把 repo_graph 中的若干节点及其边合并进 working_subgraph，并记录新增节点。
-
-        注意：repo_graph 只读；working_subgraph 仅在当前 trajectory 内有效。
-        """
+        """把 repo_graph 中的若干节点及其边合并进 working_subgraph。"""
         if not node_ids:
             return
 
-        existing_ids = set(getattr(self.working_subgraph, "node_ids", set()) or set())
-        to_add_ids: List[str] = []
+        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in getattr(self.working_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                working_nodes_by_id[nid] = n
+
+        working_edges = list(getattr(self.working_subgraph, "edges", []) or [])
+        working_ids = set(working_nodes_by_id.keys())
+
         for nid in node_ids:
-            if isinstance(nid, str) and nid.strip():
-                to_add_ids.append(nid)
-
-        # 1) nodes
-        for nid in to_add_ids:
-            w_node = self.working_subgraph.get_node(nid) if hasattr(self.working_subgraph, "get_node") else (self.working_subgraph.nodes or {}).get(nid)
-            if isinstance(w_node, dict) and w_node:
-                # already exists: just update status/tags
-                try:
-                    self.working_subgraph.update_node(nid, status=status)
-                    n = self.working_subgraph.get_node(nid)
-                    tags = set(n.get("tags") or [])
-                    tags.add(status)
-                    n["tags"] = sorted(tags)
-                except Exception:
-                    pass
+            if not isinstance(nid, str):
                 continue
-
-            r_node = self._repo_nodes_by_id.get(nid)
-            if not isinstance(r_node, dict):
-                # fallback: try repo_graph.get_node
-                try:
-                    r_node = self.repo_graph.get_node(nid) if self.repo_graph is not None else None
-                except Exception:
-                    r_node = None
-            if not isinstance(r_node, dict) or not r_node:
+            repo_node = self._repo_nodes_by_id.get(nid)
+            if not repo_node:
                 continue
-
-            node_copy = dict(r_node)
-            node_copy["id"] = nid
+            node_copy = dict(repo_node)
             node_copy["status"] = status
             tags = set(node_copy.get("tags") or [])
             tags.add(status)
             node_copy["tags"] = sorted(tags)
+            working_nodes_by_id[nid] = node_copy
+            working_ids.add(nid)
 
-            try:
-                self.working_subgraph.add_nodes([node_copy])
-            except Exception:
-                # backward compatible: set dict directly
-                try:
-                    self.working_subgraph.nodes[nid] = node_copy
-                    self.working_subgraph.node_ids.add(nid)
-                except Exception:
-                    pass
-
-        # 2) edges (only keep edges whose endpoints are both in working)
-        working_ids = set(getattr(self.working_subgraph, "node_ids", set()) or set())
-        if not working_ids:
-            return
-
-        existing_edge_keys = {
-            (e.get("src"), e.get("dst"), e.get("etype") or e.get("type"))
-            for e in (getattr(self.working_subgraph, "edges", []) or [])
-            if isinstance(e, dict)
-        }
-        edges = list(getattr(self.working_subgraph, "edges", []) or [])
-
-        added_set = set(to_add_ids) - existing_ids
-        for e in (self._repo_edges or []):
-            if not isinstance(e, dict):
+        for e in self._repo_edges:
+            src_id = e.get("src")
+            dst_id = e.get("dst")
+            if not isinstance(src_id, str) or not isinstance(dst_id, str):
                 continue
-            src = e.get("src")
-            dst = e.get("dst")
-            if not isinstance(src, str) or not isinstance(dst, str):
-                continue
-            if src not in working_ids or dst not in working_ids:
-                continue
-            # only add edges touching newly added nodes to reduce churn
-            if added_set and (src not in added_set and dst not in added_set):
-                continue
-            key = (src, dst, e.get("etype") or e.get("type"))
-            if key in existing_edge_keys:
-                continue
-            existing_edge_keys.add(key)
-            edges.append(dict(e))
+            if src_id in working_ids and dst_id in working_ids:
+                working_edges.append(dict(e))
 
-        self.working_subgraph.edges = edges
-
-        # 3) record last additions (for memory.selector='latest')
-        if added_set:
-            self._last_working_additions = sorted(added_set)
-        else:
-            self._last_working_additions = []
+        self.working_subgraph = subgraph_store.wrap(
+            {
+                "nodes": list(working_nodes_by_id.values()),
+                "edges": working_edges,
+            }
+        )
 
     def _merge_working_nodes_into_memory(
         self,
