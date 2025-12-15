@@ -39,6 +39,24 @@ def _now() -> float:
     return time.time()
 
 
+
+def _resolve_cwd(req_cwd: str | None, run_id: str) -> tuple[Path, str | None]:
+    """Split cwd into a safe host-side cwd and an optional container-side pwd.
+
+    remote_swe often passes container paths like "/repo". The runner must NOT treat
+    them as host paths (would attempt mkdir /repo and fail). We instead:
+      - use a per-run directory under $SHARE_ROOT/gp_work as host cwd;
+      - pass the container path via apptainer --pwd when it looks like an absolute POSIX path.
+    """
+    container_pwd: str | None = None
+    if isinstance(req_cwd, str) and req_cwd.startswith('/'):
+        container_pwd = req_cwd
+
+    host_base = Path(os.environ.get('RUNNER_WORKDIR_HOST', str(SHARE_ROOT / 'gp_work')))
+    host_cwd = host_base / run_id / INSTANCE_NAME
+    _ensure_dir(host_cwd)
+    return host_cwd, container_pwd
+
 def main() -> None:
     inbox = runner_inbox(QUEUE_ROOT, RUNNER_ID)
     outbox = runner_outbox(QUEUE_ROOT, RUNNER_ID)
@@ -95,9 +113,9 @@ def handle_one_request(req_path: Path, outbox: Path) -> None:
 
 
 def handle_exec(req: QueueRequest) -> QueueResponse:
-    assert req.sif_path and req.cmd and req.cwd
-    workdir_host = Path(req.cwd)
-    _ensure_dir(workdir_host)
+    assert req.sif_path and req.cmd
+
+    workdir_host, container_pwd = _resolve_cwd(req.cwd, req.run_id)
 
     env = os.environ.copy()
     if req.env:
@@ -109,9 +127,14 @@ def handle_exec(req: QueueRequest) -> QueueResponse:
         "--cleanenv",
         "--bind",
         f"{SHARE_ROOT}:/mnt/share",
+    ]
+    if container_pwd:
+        cmd.extend(["--pwd", container_pwd])
+
+    cmd.extend([
         req.sif_path,
         *req.cmd,
-    ]
+    ])
 
     t0 = _now()
     proc = subprocess.run(
@@ -143,24 +166,22 @@ def handle_exec(req: QueueRequest) -> QueueResponse:
 
 
 def handle_instance_start(req: QueueRequest) -> QueueResponse:
-    """
-    启动本 runner 的唯一容器 instance: INSTANCE_NAME = gp-{RUNNER_ID:02d}
-    规则：
-      - CURRENT_RUN_ID 为 None：绑定到 req.run_id，启动 instance；
-      - CURRENT_RUN_ID == req.run_id：视为幂等 start，直接 ok；
-      - CURRENT_RUN_ID 其他：返回 busy 错误。
+    """Start this runner's single apptainer instance.
+
+    Rules:
+      - If CURRENT_RUN_ID is None: bind to req.run_id and start.
+      - If CURRENT_RUN_ID == req.run_id: idempotent start (ok=True).
+      - Otherwise: return busy.
     """
     global CURRENT_RUN_ID
+    assert req.sif_path
 
-    assert req.sif_path and req.cwd
-    workdir_host = Path(req.cwd)
-    _ensure_dir(workdir_host)
+    workdir_host, _ = _resolve_cwd(req.cwd, req.run_id)
 
     env = os.environ.copy()
     if req.env:
         env.update(req.env)
 
-    # runner 空闲：启动 instance + 绑定 run_id
     if CURRENT_RUN_ID is None:
         cmd = [
             APPTAINER_BIN,
@@ -200,7 +221,6 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             error=None if proc.returncode == 0 else "non-zero return code",
         )
 
-    # 已绑定同一个 run_id：幂等
     if CURRENT_RUN_ID == req.run_id:
         return QueueResponse(
             req_id=req.req_id,
@@ -215,7 +235,6 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             error=None,
         )
 
-    # 被其他 run_id 占用
     msg = f"runner busy: current_run_id={CURRENT_RUN_ID}, new_run_id={req.run_id}"
     return QueueResponse(
         req_id=req.req_id,
@@ -230,16 +249,12 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
         error=msg,
     )
 
-
 def handle_instance_exec(req: QueueRequest) -> QueueResponse:
-    """
-    在本 runner 的 instance 中执行命令：
-      apptainer exec ... instance://INSTANCE_NAME CMD...
-    仅允许 CURRENT_RUN_ID == req.run_id。
-    """
-    assert req.cmd and req.cwd
-    workdir_host = Path(req.cwd)
-    _ensure_dir(workdir_host)
+    """Execute a command inside this runner's apptainer instance."""
+    global CURRENT_RUN_ID
+    assert req.cmd
+
+    workdir_host, container_pwd = _resolve_cwd(req.cwd, req.run_id)
 
     env = os.environ.copy()
     if req.env:
@@ -281,9 +296,13 @@ def handle_instance_exec(req: QueueRequest) -> QueueResponse:
         "--cleanenv",
         "--bind",
         f"{SHARE_ROOT}:/mnt/share",
+    ]
+    if container_pwd:
+        cmd.extend(["--pwd", container_pwd])
+    cmd.extend([
         f"instance://{INSTANCE_NAME}",
         *req.cmd,
-    ]
+    ])
 
     t0 = _now()
     proc = subprocess.run(
@@ -310,17 +329,11 @@ def handle_instance_exec(req: QueueRequest) -> QueueResponse:
         error=None if proc.returncode == 0 else "non-zero return code",
     )
 
-
 def handle_instance_stop(req: QueueRequest) -> QueueResponse:
-    """
-    停止本 runner 的 instance：
-      apptainer instance stop INSTANCE_NAME
-    仅允许 CURRENT_RUN_ID == req.run_id；成功后清空 CURRENT_RUN_ID。
-    """
+    """Stop this runner's apptainer instance."""
     global CURRENT_RUN_ID
 
-    workdir_host = Path(req.cwd or ".")
-    _ensure_dir(workdir_host)
+    workdir_host, _ = _resolve_cwd(req.cwd, req.run_id)
 
     env = os.environ.copy()
     if req.env:
@@ -355,12 +368,7 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
             error=msg,
         )
 
-    cmd = [
-        APPTAINER_BIN,
-        "instance",
-        "stop",
-        INSTANCE_NAME,
-    ]
+    cmd = [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME]
 
     t0 = _now()
     proc = subprocess.run(
@@ -389,7 +397,6 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
         runtime_sec=t1 - t0,
         error=None if proc.returncode == 0 else "non-zero return code",
     )
-
 
 def handle_put(req: QueueRequest) -> QueueResponse:
     assert req.src and req.dst
