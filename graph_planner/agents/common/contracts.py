@@ -113,63 +113,32 @@ class CGMPatch:
     summary: Optional[str] = None
 
 
-PLANNER_SYSTEM_PROMPT = (
-    "You are the Graph Planner decision model.\n"
-    "Every reply MUST contain exactly one text-trajectory block in the format:\n\n"
-    "<function=ACTION_NAME>\n"
-    "  <param name=\"thought\"><![CDATA[free-form reasoning]]></param>\n"
-    "  <param name=\"PARAM\">VALUE</param>\n"
-    "</function>\n\n"
-    "Replace ACTION_NAME with one of: explore, memory, repair, submit, noop.\n"
-    "Do not emit any other text outside the block.\n\n"
-    "Parameter formatting rules:\n"
-    "- Each parameter MUST be its own <param> element. DO NOT use packed fields like \"k\", \"payload\", or \"kwargs\".\n"
-    "- For multi-line strings, wrap the value in CDATA: <![CDATA[...]]>.\n"
-    "- For lists/dicts, use valid JSON (e.g., [\"a\", \"b\"], {\"x\": 1}).\n"
-    "- For numbers and booleans, use JSON literals (e.g., 3, true, false).\n\n"
-    "Action schemas (use these exact param names):\n"
-    "- explore:\n"
-    "  - op (required): \"find\" or \"expand\"\n"
-    "  - query (required if op=\"find\"): string\n"
-    "  - anchors (required if op=\"expand\"): JSON array of anchor ids\n"
-    "  - nodes (optional): JSON array of node ids\n"
-    "  - hop (optional): int\n"
-    "  - limit (optional): int\n"
-    "  - max_per_anchor (optional): int\n"
-    "  - total_limit (optional): int\n"
-    "  - dir_diversity_k (optional): int\n"
-    "- memory:\n"
-    "  - intent (required): string\n"
-    "  - target (optional): string\n"
-    "  - selector (optional): string\n"
-    "- repair:\n"
-    "  - subplan (required): CDATA string\n"
-    "  - focus_ids (optional): JSON array\n"
-    "  - apply (optional): boolean\n"
-    "- submit: no parameters besides thought\n"
-    "- noop: no parameters besides thought\n\n"
-    "Examples:\n"
-    "<function=explore>\n"
-    "  <param name=\"thought\"><![CDATA[Need relevant files; search for the failing function.]]></param>\n"
-    "  <param name=\"op\">find</param>\n"
-    "  <param name=\"query\">TimeSeries required columns removed</param>\n"
-    "</function>\n\n"
-    "<function=repair>\n"
-    "  <param name=\"thought\"><![CDATA[Implement fix and add regression test.]]></param>\n"
-    "  <param name=\"subplan\"><![CDATA[1) Edit module X to handle Y.\n2) Add test Z.]]></param>\n"
-    "</function>\n"
-)
+PLANNER_SYSTEM_PROMPT = """You are the Graph Planner decision model.
+Every reply MUST contain exactly one action block in the format:
+
+<function=ACTION_NAME>
+  <param name="thought"><![CDATA[free-form reasoning]]></param>
+  <param name="action">{JSON}</param>
+</function>
+
+Replace ACTION_NAME with one of: explore, memory, repair, submit, noop.
+The "action" param MUST be a single JSON object describing the full action,
+including "type" (matching ACTION_NAME) and required fields (e.g. memory.intent).
+Do not emit any other text outside the block.
+"""
 
 
 PLANNER_CONTRACT = PlannerContract(
     SYSTEM_PROMPT=PLANNER_SYSTEM_PROMPT,
     ACTIONS=("explore", "memory", "repair", "submit", "noop"),
     allowed_params={
-        "explore": {"thought", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
-        "memory": {"thought", "target", "intent", "selector"},
-        "repair": {"thought", "subplan", "focus_ids", "apply"},
-        "submit": {"thought"},
-        "noop": {"thought"},
+        # New: prefer <param name="action">{JSON}</param>
+        # Compat: accept legacy params (op/anchors/...) and older "k" wrapper if emitted by older prompts.
+        "explore": {"thought", "action", "k", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
+        "memory": {"thought", "action", "k", "target", "intent", "selector"},
+        "repair": {"thought", "action", "k", "subplan", "focus_ids", "apply"},
+        "submit": {"thought", "action", "k"},
+        "noop": {"thought", "action", "k"},
     },
     required_params={
         "repair": {"subplan"},
@@ -249,10 +218,44 @@ def _normalise_json_value(raw: str) -> Any:
 
 
 def parse_action_block(text: str) -> Dict[str, Any]:
-    """Parse a planner action block and enforce structural guarantees."""
+    """Parse a planner action response.
+
+    Preferred format:
+        <function=ACTION>
+          <param name="thought"><![CDATA[...]]></param>
+          <param name="action">{JSON}</param>
+        </function>
+
+    Tolerances:
+      - bare JSON (entire response is a single JSON object)
+      - missing </function> terminator (best-effort parse)
+      - legacy <param name="k">{JSON}</param>
+    """
 
     if not isinstance(text, str):
         raise ProtocolError(PlannerErrorCode.MISSING_FUNCTION_TAG.value, "planner response must be a string")
+
+    stripped = text.strip()
+
+    # 0) Bare JSON fallback
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict):
+                action_name = PLANNER_CONTRACT.normalise_action(obj.get("type") or obj.get("name"))
+                if not action_name:
+                    raise ProtocolError(PlannerErrorCode.MISSING_FUNCTION_TAG.value, "json action missing 'type'")
+                params = dict(obj)
+                # ensure 'type' aligns
+                params["type"] = action_name
+                # keep optional thought if present
+                return {"name": action_name, "params": params}
+        except json.JSONDecodeError:
+            pass
+        except ProtocolError:
+            raise
+        except Exception:
+            pass
 
     matches = list(_BLOCK_RE.finditer(text))
     if not matches:
@@ -261,21 +264,12 @@ def parse_action_block(text: str) -> Dict[str, Any]:
         raise ProtocolError(PlannerErrorCode.INVALID_MULTI_BLOCK.value, "response must contain exactly one function block")
 
     match = matches[0]
-    # Be tolerant to chatty models that prepend analysis / role tags / polite
-    # text before the function block. We still require exactly one function
-    # block in the entire response (checked above).
-    _ = text[: match.start()]
-
-    end_match = _END_RE.search(text, match.end())
-    if not end_match:
-        raise ProtocolError(PlannerErrorCode.MISSING_FUNCTION_TAG.value, "missing </function> terminator")
-
-    # Same tolerance for suffix text (e.g. trailing newlines).
-    _ = text[end_match.end() :]
-
     action_name = PLANNER_CONTRACT.normalise_action(match.group(1))
 
-    inner = text[match.end() : end_match.start()]
+    end_match = _END_RE.search(text, match.end())
+    end_pos = end_match.start() if end_match else len(text)  # tolerate truncation
+    inner = text[match.end():end_pos]
+
     params: Dict[str, Any] = {}
     last_end = 0
     for param_match in _PARAM_RE.finditer(inner):
@@ -290,20 +284,29 @@ def parse_action_block(text: str) -> Dict[str, Any]:
             raise ProtocolError(PlannerErrorCode.DUPLICATE_PARAM.value, f"duplicate parameter '{key}'")
         raw_value = param_match.group(2).strip()
         if raw_value.startswith(_CDATA_START) and raw_value.endswith("]]>"):
-            value = raw_value[len(_CDATA_START) : -3]
+            value = raw_value[len(_CDATA_START):-3]
         else:
-            try:
-                value = _normalise_json_value(raw_value)
-            except ProtocolError as exc:
-                if exc.code == PlannerErrorCode.INVALID_JSON_PARAM.value:
-                    raise ProtocolError(exc.code, f"parameter '{key}' {exc.detail}") from exc
-                raise
+            value = _normalise_json_value(raw_value)
         params[key] = value
         last_end = end
-    if inner[last_end:].strip():
-        raise ProtocolError(PlannerErrorCode.EXTRA_TEXT.value, "unexpected trailing text inside function block")
+
+    # Best-effort recover for truncated <param name="action"> or <param name="k">
+    if "action" not in params and "k" not in params:
+        for key in ("action", "k"):
+            m = re.search(rf'<param name="{key}">(.*)', inner, re.DOTALL)
+            if not m:
+                continue
+            raw = m.group(1)
+            raw = re.split(r"</param>|</function>", raw, maxsplit=1)[0].strip()
+            if not raw:
+                continue
+            try:
+                params[key] = _normalise_json_value(raw)
+            except Exception:
+                continue
 
     return {"name": action_name, "params": params}
+
 
 
 def _coerce_bool(value: Any, *, default: bool = True) -> bool:
@@ -352,6 +355,31 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
 
     action_name = PLANNER_CONTRACT.normalise_action(result.get("name"))
     params = dict(result.get("params") or {})
+    # Preferred: params["action"] is a full JSON action object. Compat: params["k"].
+    action_payload: Dict[str, Any] | None = None
+    if isinstance(params.get("action"), Mapping):
+        action_payload = dict(params.get("action") or {})
+    elif isinstance(params.get("k"), Mapping):
+        action_payload = dict(params.get("k") or {})
+    elif isinstance(params.get("action"), str):
+        # Rare: action arrives as raw JSON string
+        try:
+            obj = json.loads(params.get("action") or "{}")
+            if isinstance(obj, dict):
+                action_payload = obj
+        except Exception:
+            action_payload = None
+
+    if action_payload:
+        # allow payload to carry thought
+        payload_thought = action_payload.pop("thought", None)
+        if payload_thought and not params.get("thought"):
+            params["thought"] = payload_thought
+        # ensure type matches
+        if "type" not in action_payload and action_name:
+            action_payload["type"] = action_name
+        # merge into params so legacy validators can read fields like op/intent/subplan
+        params.update(action_payload)
     meta: Dict[str, Any] = {}
 
     required = PLANNER_CONTRACT.required_params.get(action_name, set())
