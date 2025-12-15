@@ -139,6 +139,12 @@ def main() -> int:
     env = payload.get("env") or {}
     cwd = Path(payload.get("cwd") or "/repo")
 
+    max_stdout_bytes = payload.get("max_stdout_bytes")
+    try:
+        max_stdout_bytes = int(max_stdout_bytes) if max_stdout_bytes is not None else None
+    except Exception:
+        max_stdout_bytes = None
+
     num_runners = int(os.environ.get("GP_NUM_RUNNERS", "1") or "1")
     queue_root = Path(os.environ.get("QUEUE_ROOT", str(Path.home() / "gp_queue"))).expanduser().resolve()
     sif_dir = Path(os.environ.get("GP_SIF_DIR") or os.environ.get("SIF_DIR") or str(Path.home() / "sif" / "sweb")).expanduser().resolve()
@@ -148,6 +154,7 @@ def main() -> int:
         sif_dir=sif_dir,
         num_runners=num_runners,
         default_timeout_sec=timeout,
+        max_stdout_bytes=(max_stdout_bytes if max_stdout_bytes is not None else int(os.environ.get("GP_MAX_STDOUT_BYTES", "20000000"))),
     )
 
     _dbg(f"recv op={op!r} run_id={run_id!r} image={image!r} cwd={str(cwd)!r} queue_root={str(queue_root)!r} sif_dir={str(sif_dir)!r} num_runners={num_runners}")
