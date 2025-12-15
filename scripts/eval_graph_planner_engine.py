@@ -911,7 +911,7 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
-    parser.add_argument("--max-response-tokens", type=int, default=4096)
+    parser.add_argument("--max-response-tokens", "--max_output_tokens", dest="max_response_tokens", type=int, default=4096)
     parser.add_argument("--max-steps", type=int, default=8, help="Upper bound on planner interactions per task")
     parser.add_argument("--parallel", type=int, default=4, help="Number of parallel agent/environment pairs")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on the number of tasks to evaluate")
