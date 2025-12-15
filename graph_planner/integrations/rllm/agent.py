@@ -174,6 +174,7 @@ else:
                 raise RuntimeError("update_from_env must be called before update_from_model")
             thought, action_obj, assistant_msg, parser_meta = self._parse_model_response(response)
             if DEBUG:
+                trace = self._trace_id()
                 tp = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
                 try:
                     action_json = json.dumps(action_obj.__dict__, ensure_ascii=False, default=str)
