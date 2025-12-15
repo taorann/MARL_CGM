@@ -97,7 +97,8 @@ else:
             self._step_index = 0
             self._state = _AgentState()
             self._config: Config = load_config()
-            self._maybe_init_rule_fallback()
+            if self.use_rule_fallback:
+                self._maybe_init_rule_fallback()
             self.reset()
 
         # ------------------------------------------------------------------

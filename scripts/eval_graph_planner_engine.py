@@ -975,7 +975,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--synthesis-strategy", default=None, help="Override the planner CGM synthesis strategy")
     parser.add_argument("--agent-system-prompt", default=None, help="Override the planner agent system prompt text")
     parser.add_argument("--agent-system-prompt-path", type=Path, default=None, help="Path to a file containing a custom system prompt")
-    parser.add_argument("--disable-rule-fallback", action="store_true", help="Disable rule-based fallback actions inside the agent")
+    parser.add_argument(
+        "--enable-rule-fallback",
+        action="store_true",
+        help="Enable rule-based fallback agent (default: disabled)",
+    )
     parser.add_argument(
         "--sandbox-port-forward",
         action="append",
@@ -1539,7 +1543,7 @@ def main() -> None:
         rollout_args["timeout"] = args.planner_timeout
 
     agent_args: Dict[str, Any] = {
-        "use_rule_fallback": not args.disable_rule_fallback,
+        "use_rule_fallback": bool(args.enable_rule_fallback),
     }
     system_prompt_override: str | None = None
     if args.agent_system_prompt_path:
