@@ -10,6 +10,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -19,11 +20,15 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import yaml
-from transformers import AutoTokenizer
 
-from graph_planner.datasets.prepare import ensure_directory, sanitize_identifier
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Ensure repository root is importable even if PYTHONPATH is not pre-set.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from graph_planner.datasets.prepare import ensure_directory, sanitize_identifier
 
 os.environ.setdefault("PYTHONPATH", str(_REPO_ROOT))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -1091,17 +1096,16 @@ def _parse_args() -> argparse.Namespace:
     args.sandbox_port_forward = port_forwardings
 
     missing = [field for field in ("dataset", "planner_model") if getattr(args, field) is None]
-    # CGM can be provided either as a local model path (auto-launch) or as an HTTP endpoint.
-    if getattr(args, "cgm_model_path", None) is None and getattr(args, "cgm_endpoint", None) is None:
-        missing.append("cgm")
+
+    # CGM is required unless explicitly disabled. When using a remote CGM endpoint, cgm_model_path is not required.
+    if not getattr(args, "disable_cgm_synthesis", False):
+        if getattr(args, "cgm_endpoint", None) is None and getattr(args, "cgm_model_path", None) is None:
+            missing.append("cgm_model_path")
 
     if missing:
         parser.error(
-            "Missing required arguments (supply via CLI or config): "
-            + ", ".join(
-                ("--cgm-model-path/--cgm-endpoint" if field == "cgm" else f"--{field.replace('_', '-')}")
-                for field in missing
-            )
+            "The following arguments are required (supply via CLI or config): "
+            + ", ".join(f"--{field.replace('_', '-')}" for field in missing)
         )
 
     return args
@@ -1422,6 +1426,8 @@ def _build_tokenizer(args: argparse.Namespace):
     tokenizer_path = str(tokenizer_ref)
     LOGGER.info("Loading tokenizer from %s", tokenizer_path)
     try:
+        from transformers import AutoTokenizer  # type: ignore
+
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     except Exception as exc:  # pragma: no cover - best-effort remote fallback
         LOGGER.warning(
@@ -1606,3 +1612,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
