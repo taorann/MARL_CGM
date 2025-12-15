@@ -173,7 +173,9 @@ else:
         def close(self) -> None:
             if self._planner is not None:
                 try:
-                    self._planner.close()
+                    close = getattr(self._planner, 'close', None)
+                    if callable(close):
+                        close()
                 finally:
                     self._planner = None
                     self._last_observation = None
