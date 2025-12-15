@@ -130,6 +130,11 @@ class Telemetry:
         self.ctx.episode_id = ep
         self.ctx.step_id = 0
         self._episode_dir = Path(self.cfg.base_dir) / self.ctx.run_id / "episodes" / ep
+        if os.environ.get("DEBUG_PRINT_TRAJECTORY_DIR") == "1":
+            try:
+                print(f"[telemetry] episode_dir={self._episode_dir}")
+            except Exception:
+                pass
         self._episode_started = True
         payload = {
             "ts": _now_ts(),
