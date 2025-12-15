@@ -137,8 +137,17 @@ class SandboxRuntime:
         try:
             # 直接用 docker-py 在容器 root workdir 执行 mkdir，绕开 /testbed 不存在的问题
             self._rt.container.exec_run("bash -lc 'mkdir -p {}'".format(repo_path), workdir="/")
-        except Exception:
-            pass
+        except Exception as e:
+            # Do not silently swallow repo-graph load failures; they are a common root cause of
+            # unexpected fallback to legacy build_graph and missing candidates.
+            if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+                try:
+                    _dbg(f"repo_graph jsonl load failed: {e!r}")
+                except Exception:
+                    pass
+            if os.environ.get("GP_DISABLE_BUILD_GRAPH") == "1":
+                raise
+
 
         # 基本工具 + git 安全目录（现在 chdir 到 repo_path 已不会报 126）
         self._rt.run("python -m pip -q install --upgrade pip >/dev/null 2>&1 || true", timeout=180)
@@ -678,10 +687,21 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             blob = base64.b64decode(b64.encode("ascii"), validate=False)
             raw = gzip.decompress(blob)
         except Exception as exc:
-            raise RuntimeError("failed to decode base64+gzip repo graph payload") from exc
+            raise RuntimeError(
+                f"failed to decode base64+gzip repo graph payload (len={len(b64)} chars)"
+            ) from exc
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_bytes(raw)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            tmp_path.write_bytes(raw)
+            os.replace(str(tmp_path), str(cache_path))
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
         return str(cache_path)
 
 
@@ -710,8 +730,17 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "repo")
             jsonl_path = Path(self.build_repo_graph(repo_id=rid, timeout=int(timeout), force=False))
             return self._load_repo_graph_jsonl(jsonl_path)
-        except Exception:
-            pass
+        except Exception as e:
+            # Do not silently swallow repo-graph load failures; they are a common root cause of
+            # unexpected fallback to legacy build_graph and missing candidates.
+            if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+                try:
+                    _dbg(f"repo_graph jsonl load failed: {e!r}")
+                except Exception:
+                    pass
+            if os.environ.get("GP_DISABLE_BUILD_GRAPH") == "1":
+                raise
+
 
         # Fallback: legacy JSON stdout
         start_timeout = max(float(timeout), 300.0)
@@ -756,8 +785,17 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             payload["dataset_json"] = self.cfg.r2e_ds_json
         try:
             telemetry_mod.log_test_result(payload)
-        except Exception:
-            pass
+        except Exception as e:
+            # Do not silently swallow repo-graph load failures; they are a common root cause of
+            # unexpected fallback to legacy build_graph and missing candidates.
+            if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+                try:
+                    _dbg(f"repo_graph jsonl load failed: {e!r}")
+                except Exception:
+                    pass
+            if os.environ.get("GP_DISABLE_BUILD_GRAPH") == "1":
+                raise
+
         return result
 
     def close(self):
