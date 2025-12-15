@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -50,7 +51,8 @@ from graph_planner.runtime.queue_protocol import QueueResponse
 
 def _dbg(msg: str) -> None:
     if os.environ.get("DEBUG") or os.environ.get("EBUG"):
-        print(f"[swe_proxy] {msg}", file=sys.stderr)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"[swe_proxy {ts}] {msg}", file=sys.stderr, flush=True)
 
 
 def _resp_to_dict(resp: QueueResponse) -> Dict[str, Any]:
@@ -107,8 +109,13 @@ def _instance_roundtrip(
         "meta": {},
     }
 
+    _dbg(f"roundtrip op={op_type} run_id={run_id} runner={runner_id} timeout={timeout} cwd={workdir}")
+
     # Use internal roundtrip for instance ops
+    t0 = time.perf_counter()
     resp = aq._roundtrip(type("_Q", (), req)())  # type: ignore[attr-defined]
+    dt = time.perf_counter() - t0
+    _dbg(f"roundtrip done op={op_type} run_id={run_id} ok={getattr(resp, 'ok', None)!r} rc={getattr(resp, 'returncode', None)!r} dt={dt:.2f}s")
     return resp
 
 
