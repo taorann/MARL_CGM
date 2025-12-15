@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sys
 import subprocess
 import time
 from pathlib import Path
@@ -28,6 +27,11 @@ POLL_INTERVAL_SEC = float(os.environ.get("RUNNER_POLL_INTERVAL", "0.5"))
 # 一个 runner ⇔ 一个容器：名字固定为 gp-00/gp-01/...
 INSTANCE_NAME = f"gp-{RUNNER_ID:02d}"
 
+# Runner liveness markers (used by ApptainerQueueRuntime to avoid routing to pending runners)
+RUNNER_ROOT = QUEUE_ROOT / f"runner-{RUNNER_ID}"
+READY_PATH = RUNNER_ROOT / "ready.json"
+HEARTBEAT_PATH = RUNNER_ROOT / "heartbeat.json"
+
 # 当前 runner 正在服务的 run_id；None 表示空闲
 CURRENT_RUN_ID: Optional[str] = None
 
@@ -40,12 +44,29 @@ def _now() -> float:
     return time.time()
 
 
+def _write_ready() -> None:
+    meta = {
+        "rid": RUNNER_ID,
+        "pid": os.getpid(),
+        "host": os.uname().nodename,
+        "ts": _now(),
+    }
+    _ensure_dir(RUNNER_ROOT)
+    READY_PATH.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
-def _dbg(msg: str) -> None:
-    if os.environ.get('DEBUG') or os.environ.get('EBUG'):
-        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        print(f'[runner {RUNNER_ID:02d} {ts}] {msg}', file=sys.stderr, flush=True)
 
+def _write_heartbeat(extra: Optional[Dict[str, Any]] = None) -> None:
+    meta: Dict[str, Any] = {
+        "rid": RUNNER_ID,
+        "pid": os.getpid(),
+        "host": os.uname().nodename,
+        "ts": _now(),
+        "current_run_id": CURRENT_RUN_ID,
+    }
+    if extra:
+        meta.update(extra)
+    _ensure_dir(RUNNER_ROOT)
+    HEARTBEAT_PATH.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
 
@@ -72,39 +93,42 @@ def main() -> None:
     _ensure_dir(inbox)
     _ensure_dir(outbox)
 
+    # mark runner as ready/alive for proxy-side routing
+    _write_ready()
+    _write_heartbeat()
+
+    last_hb = 0.0
     while True:
+        now = _now()
+        if now - last_hb >= 2.0:
+            _write_heartbeat()
+            last_hb = now
+
         handled = False
         for req_path in sorted(inbox.glob("*.json")):
             handled = True
+            handle_one_request(req_path, outbox)  # must not raise
             try:
-                handle_one_request(req_path, outbox)
-            finally:
-                try:
-                    req_path.unlink()
-                except FileNotFoundError:
-                    pass
+                req_path.unlink()
+            except FileNotFoundError:
+                pass
+
         if not handled:
             time.sleep(POLL_INTERVAL_SEC)
 
 
-
 def handle_one_request(req_path: Path, outbox: Path) -> None:
-    """Handle a single queue request and always write a response.
-
-    IMPORTANT: Never let exceptions crash the runner loop; otherwise the proxy
-    will wait forever for a response file and clients will see timeouts / retries.
-    """
-    t0 = _now()
-    data: Dict[str, Any] = json.loads(req_path.read_text(encoding="utf-8"))
-    req = QueueRequest(**data)
-
-    _dbg(
-        f"recv type={req.type!r} req_id={req.req_id!r} run_id={req.run_id!r} "
-        f"cwd={req.cwd!r} timeout_sec={req.timeout_sec!r} "
-        f"sif={req.sif_path!r} cmd={(req.cmd[:3] if req.cmd else None)!r}"
-    )
-
+    """Always write a response JSON, even if execution fails."""
+    req_id = req_path.stem
     try:
+        data: Dict[str, Any] = json.loads(req_path.read_text(encoding="utf-8"))
+        req = QueueRequest(**data)
+        # keep CURRENT_RUN_ID up to date for monitoring
+        global CURRENT_RUN_ID
+        CURRENT_RUN_ID = req.run_id
+
+        _write_heartbeat({"last_req_id": req.req_id, "type": req.type})
+
         if req.type == "exec":
             resp = handle_exec(req)
         elif req.type == "instance_start":
@@ -127,41 +151,24 @@ def handle_one_request(req_path: Path, outbox: Path) -> None:
                 type=req.type,
                 ok=True,
             )
-    except subprocess.TimeoutExpired as e:
-        _dbg(f"timeout type={req.type!r} run_id={req.run_id!r}: {e}")
-        resp = QueueResponse(
-            req_id=req.req_id,
-            runner_id=req.runner_id,
-            run_id=req.run_id,
-            type=req.type,
-            ok=False,
-            returncode=124,
-            stdout="",
-            stderr=str(e),
-            runtime_sec=_now() - t0,
-            error="timeout",
-        )
     except Exception as e:
-        _dbg(f"error type={req.type!r} run_id={req.run_id!r}: {e!r}")
+        # If parsing failed, still return a response keyed by filename.
         resp = QueueResponse(
-            req_id=req.req_id,
-            runner_id=req.runner_id,
-            run_id=req.run_id,
-            type=req.type,
+            req_id=req_id,
+            runner_id=RUNNER_ID,
+            run_id=CURRENT_RUN_ID or "",
+            type="noop",
             ok=False,
             returncode=1,
             stdout="",
-            stderr=repr(e),
-            runtime_sec=_now() - t0,
-            error=repr(e),
+            stderr="",
+            runtime_sec=0.0,
+            error=f"runner_exception: {repr(e)}",
         )
 
     resp_path = outbox / f"{resp.req_id}.json"
     resp_path.write_text(json.dumps(resp.__dict__, ensure_ascii=False), encoding="utf-8")
-    _dbg(
-        f"sent type={req.type!r} req_id={req.req_id!r} ok={resp.ok!r} "
-        f"rc={getattr(resp, 'returncode', None)!r} dt={_now()-t0:.2f}s"
-    )
+    _write_heartbeat({"last_resp_id": resp.req_id, "ok": str(resp.ok)})
 
 
 # ----------------- 一次性 exec（直接对 SIF 调用） -----------------
