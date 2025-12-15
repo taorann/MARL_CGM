@@ -6,6 +6,7 @@ import os
 import sys
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -57,19 +58,48 @@ class RemoteSweSession:
 
 
     def _call_proxy(self, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
-        _dbg(f"call op={payload.get('op')!r} run_id={payload.get('run_id')!r} image={payload.get('image')!r} cwd={payload.get('cwd')!r} timeout={timeout}")
+        # NOTE: login24 side uses ApptainerQueueRuntime._roundtrip(), whose own wait
+        # budget is `payload.timeout * 1.5`. If we set the outer SSH timeout equal
+        # to payload.timeout, the SSH layer may kill the request prematurely and
+        # trigger a spurious retry (you observed duplicate `start`).
+        payload_timeout = float(payload.get("timeout") or 0.0)
+        ssh_timeout = float(timeout or 0.0)
+        if ssh_timeout <= 0.0:
+            ssh_timeout = payload_timeout
+        # Give the proxy+runner time to finish: 2x payload timeout + small buffer.
+        ssh_timeout = max(ssh_timeout, payload_timeout * 2.0 + 30.0, 120.0)
+
+        _dbg(
+            "call "
+            f"op={payload.get('op')!r} "
+            f"run_id={payload.get('run_id')!r} "
+            f"image={payload.get('image')!r} "
+            f"cwd={payload.get('cwd')!r} "
+            f"payload_timeout={payload_timeout:.1f}s ssh_timeout={ssh_timeout:.1f}s"
+        )
+
+        t0 = time.perf_counter()
         proc = subprocess.run(
             self._build_ssh_cmd(),
             input=json.dumps(payload).encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            timeout=ssh_timeout,
+        )
+        dt = time.perf_counter() - t0
+        _dbg(
+            f"done op={payload.get('op')!r} run_id={payload.get('run_id')!r} "
+            f"rc={proc.returncode} dt={dt:.2f}s stdout_bytes={len(proc.stdout)} stderr_bytes={len(proc.stderr)}"
         )
         if proc.returncode != 0:
             raise RuntimeError(
                 f"Remote swe_proxy failed (rc={proc.returncode}). "
                 f"stderr={proc.stderr.decode('utf-8', errors='ignore')}"
             )
+        # Forward remote stderr to local log when DEBUG is on (runner/proxy writes progress there).
+        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and proc.stderr:
+            stderr_preview = proc.stderr.decode("utf-8", errors="ignore")
+            print("[remote_swe_session][remote_stderr]" + stderr_preview, file=sys.stderr)
         try:
             return json.loads(proc.stdout.decode("utf-8"))
         except json.JSONDecodeError as exc:
@@ -103,7 +133,7 @@ class RemoteSweSession:
             )
         self._runners_ensured = True
 
-    def start(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def start(self, timeout: Optional[float] = None, cwd: str = "/repo") -> Dict[str, Any]:
         self._ensure_remote_runners()
         # Allow plenty of time for the initial container bootstrap even if callers
         # pass a smaller timeout (e.g., snippet-level defaults).
@@ -113,6 +143,7 @@ class RemoteSweSession:
             "run_id": self.run_id,
             "image": self.image,
             "timeout": effective_timeout,
+            "cwd": cwd or "/repo",
         }
         return self._call_proxy(payload, timeout=effective_timeout)
 
