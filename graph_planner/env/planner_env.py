@@ -105,6 +105,8 @@ try:
         RepairAction,
         SubmitAction,
     )
+    # Shared protocol/contract error type used by the agent parser.
+    from ..agents.common.contracts import ProtocolError
     from ..infra.config import Config, load as load_config
     from ..infra import telemetry as telemetry_mod
     try:
@@ -137,6 +139,7 @@ except Exception as _IMPORT_ERROR:  # pragma: no cover
     SandboxRuntime = object  # type: ignore[assignment]
     Plan = PlanTarget = object  # type: ignore[assignment]
     subgraph_store = text_memory = graph_adapter = mem_candidates = object()  # type: ignore[assignment]
+    ProtocolError = ValueError  # type: ignore[assignment]
 
 
 DEFAULT_MEMORY_CAPS = {
@@ -443,9 +446,46 @@ class PlannerEnv:
     # ------------------------------------------------------------------
     # Action 解析与 reward
     # ------------------------------------------------------------------
-    def _parse_action(self, payload: Dict[str, Any]) -> ActionUnion:
+
+    def _parse_action(self, payload: Any) -> ActionUnion:
+        """Parse an incoming action.
+
+        The rLLM stack may pass:
+        - a plain dict (our canonical representation)
+        - a Pydantic model instance (e.g. ExploreAction / NoopAction)
+        - a JSON string
+
+        We normalise all of them to a mapping and then instantiate the corresponding
+        action model.
+        """
+
+        # Fast path: already a typed action.
+        if isinstance(payload, (ExploreAction, MemoryAction, RepairAction, SubmitAction, NoopAction)):
+            return payload
+
+        # Sometimes the upstream executor serialises actions as JSON strings.
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception as exc:
+                raise ProtocolError("invalid-payload", f"action payload must be JSON: {exc}") from exc
+
+        # Pydantic v2: BaseModel.model_dump(); v1: BaseModel.dict()
+        if not isinstance(payload, Mapping):
+            if hasattr(payload, "model_dump"):
+                try:
+                    payload = payload.model_dump()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            elif hasattr(payload, "dict"):
+                try:
+                    payload = payload.dict()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
         if not isinstance(payload, Mapping):
             raise ProtocolError("invalid-payload", "action payload must be a mapping")
+
         action_type = payload.get("type")
         if action_type == "explore":
             # Backward compatibility: normalize legacy explore.read to explore.expand hop=0
