@@ -35,19 +35,29 @@ fi
 NEED_REMOTE_SWE=0
 HAS_SSH_TARGET=0
 HAS_REMOTE_REPO=0
-for arg in "$@"; do
-  if [[ "$arg" == "--sandbox-backend" || "$arg" == "--sandbox-backend=remote_swe" ]]; then
-    NEED_REMOTE_SWE=1
-  fi
-  if [[ "$arg" == "remote_swe" ]]; then
-    NEED_REMOTE_SWE=1
-  fi
-  if [[ "$arg" == --sandbox-ssh-target || "$arg" == --sandbox-ssh-target=* ]]; then
-    HAS_SSH_TARGET=1
-  fi
-  if [[ "$arg" == --sandbox-remote-repo || "$arg" == --sandbox-remote-repo=* ]]; then
-    HAS_REMOTE_REPO=1
-  fi
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  arg="${args[$i]}"
+  next_arg="${args[$((i + 1))]:-}"
+
+  case "$arg" in
+    --sandbox-backend=*)
+      backend_value="${arg#--sandbox-backend=}"
+      [[ "$backend_value" == "remote_swe" ]] && NEED_REMOTE_SWE=1
+      ;;
+    --sandbox-backend)
+      [[ "$next_arg" == "remote_swe" ]] && NEED_REMOTE_SWE=1
+      ;;
+  esac
+
+  case "$arg" in
+    --sandbox-ssh-target|--sandbox-ssh-target=*)
+      HAS_SSH_TARGET=1
+      ;;
+    --sandbox-remote-repo|--sandbox-remote-repo=*)
+      HAS_REMOTE_REPO=1
+      ;;
+  esac
 done
 
 if [[ $NEED_REMOTE_SWE -eq 1 ]]; then

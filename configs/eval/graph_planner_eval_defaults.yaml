@@ -20,6 +20,7 @@ planner_timeout: 180
 max_prompt_tokens: 4096
 max_response_tokens: 4096
 max_steps: 8
+enable_rule_fallback: false
 parallel: 4
 cgm_model_path: models/CodeFuse-CGM
 cgm_tokenizer_path: models/CodeFuse-CGM
