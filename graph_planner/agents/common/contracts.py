@@ -135,12 +135,17 @@ PLANNER_SYSTEM_PROMPT = (
 PLANNER_CONTRACT = PlannerContract(
     SYSTEM_PROMPT=PLANNER_SYSTEM_PROMPT,
     ACTIONS=("explore", "memory", "repair", "submit", "noop"),
+    # NOTE: Be tolerant to slightly malformed model outputs.
+    # - Some prompts (and some models) emit a single generic param name "k" that
+    #   contains a JSON dict with the real fields.
+    # - Older prompts include an (ignored) "scope" field for memory.
+    # We accept these and normalise downstream.
     allowed_params={
-        "explore": {"thought", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
-        "memory": {"thought", "target", "intent", "selector"},
-        "repair": {"thought", "subplan", "focus_ids", "apply"},
-        "submit": {"thought"},
-        "noop": {"thought"},
+        "explore": {"thought", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k", "k"},
+        "memory": {"thought", "target", "intent", "selector", "scope", "k"},
+        "repair": {"thought", "subplan", "focus_ids", "apply", "k"},
+        "submit": {"thought", "k"},
+        "noop": {"thought", "reason", "error", "k"},
     },
     required_params={
         "repair": {"subplan"},
@@ -323,6 +328,14 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
 
     action_name = PLANNER_CONTRACT.normalise_action(result.get("name"))
     params = dict(result.get("params") or {})
+
+    # Backward/robustness: some prompts encourage emitting a single param name
+    # "k" that contains the actual payload as a JSON dict. Merge it in.
+    k_payload = params.pop("k", None)
+    if isinstance(k_payload, Mapping):
+        for key, value in k_payload.items():
+            # Do not override explicitly provided params.
+            params.setdefault(str(key), value)
     meta: Dict[str, Any] = {}
 
     required = PLANNER_CONTRACT.required_params.get(action_name, set())
