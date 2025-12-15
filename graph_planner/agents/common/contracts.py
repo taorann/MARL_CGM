@@ -118,34 +118,36 @@ PLANNER_SYSTEM_PROMPT = (
     "Every reply MUST contain exactly one text-trajectory block in the format:\n\n"
     "<function=ACTION_NAME>\n"
     "  <param name=\"thought\"><![CDATA[free-form reasoning]]></param>\n"
-    "  <param name=\"k\">JSON or text values</param>\n"
+    "  <param name=\"k\">{JSON}</param>\n"
     "</function>\n\n"
     "Replace ACTION_NAME with one of: explore, memory, repair, submit, noop.\n"
     "Do not emit any other text outside the block.\n\n"
-    "For each action:\n"
-    "- explore: params may include op (find|expand|read), anchors (list), nodes (list), hop (int), limit (int).\n"
-    "- memory: provide target (explore|observation), scope (turn|session), intent (commit|delete) and optional selector (\"latest\" or specific id).\n"
-    "- repair: set subplan (multi-line steps, wrap in CDATA), optional focus_ids (list of graph node ids) and apply (true/false).\n"
-    "- submit: no extra params besides thought.\n"
-    "- noop: empty operation when no action fits.\n\n"
-    "Encode lists/dicts as JSON. Use CDATA for multi-line text."
+    "The k param MUST be a JSON object containing the action parameters (excluding thought).\n"
+    "Use JSON arrays/objects for lists/dicts. Use CDATA for multi-line text in thought/subplan.\n\n"
+    "Action schemas (k JSON):\n"
+    "- explore: {op: \"find\"|\"expand\", anchors?: [anchor...], nodes?: [node_id...], query?: str, hop?: int, limit?: int, max_per_anchor?: int, total_limit?: int, dir_diversity_k?: int}\n"
+    "    * REQUIRED: if op=\"find\", you MUST provide (non-empty query) OR (non-empty anchors).\n"
+    "    * REQUIRED: if op=\"expand\", you MUST provide non-empty anchors (or provide nodes AND also convert them to anchors).\n"
+    "    * anchors must be a JSON list; each anchor is typically {id: \"<graph_node_id>\"} or {path: \"<file_path>\"} or {symbol: \"<name>\"}.\n"
+    "- memory: {target: \"explore\"|\"observation\", intent: \"commit\"|\"delete\", selector?: \"latest\"|str|object}\n"
+    "    * Use memory sparingly. Do NOT use it as a default safe action.\n"
+    "    * Commit only distilled, durable facts (e.g., identified files/functions, reproduction commands, failing test names, confirmed root cause), not the raw issue text.\n"
+    "- repair: {subplan: str, focus_ids?: [node_id...], apply?: true|false}\n"
+    "- submit: {}\n"
+    "- noop: {}\n\n"
+    "If you lack anchors, start with explore.find using a short query derived from the issue.\n"
 )
 
 
 PLANNER_CONTRACT = PlannerContract(
     SYSTEM_PROMPT=PLANNER_SYSTEM_PROMPT,
     ACTIONS=("explore", "memory", "repair", "submit", "noop"),
-    # NOTE: Be tolerant to slightly malformed model outputs.
-    # - Some prompts (and some models) emit a single generic param name "k" that
-    #   contains a JSON dict with the real fields.
-    # - Older prompts include an (ignored) "scope" field for memory.
-    # We accept these and normalise downstream.
     allowed_params={
-        "explore": {"thought", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k", "k"},
-        "memory": {"thought", "target", "intent", "selector", "scope", "k"},
-        "repair": {"thought", "subplan", "focus_ids", "apply", "k"},
-        "submit": {"thought", "k"},
-        "noop": {"thought", "reason", "error", "k"},
+        "explore": {"thought", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
+        "memory": {"thought", "target", "intent", "selector"},
+        "repair": {"thought", "subplan", "focus_ids", "apply"},
+        "submit": {"thought"},
+        "noop": {"thought"},
     },
     required_params={
         "repair": {"subplan"},
@@ -328,14 +330,6 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
 
     action_name = PLANNER_CONTRACT.normalise_action(result.get("name"))
     params = dict(result.get("params") or {})
-
-    # Backward/robustness: some prompts encourage emitting a single param name
-    # "k" that contains the actual payload as a JSON dict. Merge it in.
-    k_payload = params.pop("k", None)
-    if isinstance(k_payload, Mapping):
-        for key, value in k_payload.items():
-            # Do not override explicitly provided params.
-            params.setdefault(str(key), value)
     meta: Dict[str, Any] = {}
 
     required = PLANNER_CONTRACT.required_params.get(action_name, set())
