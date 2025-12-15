@@ -213,9 +213,13 @@ class RemoteSweSession:
 
         resp = self._call_proxy(payload, timeout=float(timeout))
         if not resp.get("ok", False):
+            rc = resp.get("returncode", None)
+            stderr = (resp.get("stderr") or "")
+            err = resp.get("error", None)
+            stdout_preview = (resp.get("stdout") or "")[:2000]
             raise RuntimeError(
-                f"remote build_repo_graph failed (rc={resp.get('returncode')}). "
-                f"stderr={resp.get('stderr', '')}"
+                f"remote build_repo_graph failed (returncode={rc!r}). "
+                f"error={err!r} stderr={stderr[:2000]!r} stdout_preview={stdout_preview!r}"
             )
 
         raw = (resp.get("stdout") or "").strip()
