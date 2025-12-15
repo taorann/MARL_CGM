@@ -88,6 +88,19 @@ else:
         # 默认关闭规则 fallback，保持“纯模型”行为
         use_rule_fallback: bool = False
 
+        def _trace_id(self) -> str:
+            obs = self._last_env_observation or {}
+            if isinstance(obs, dict):
+                issue = obs.get('issue') or {}
+                if isinstance(issue, dict):
+                    rid = str(issue.get('run_id') or '')
+                    if rid:
+                        return rid
+                    iid = str(issue.get('id') or '')
+                    if iid:
+                        return iid
+            return 'unknown'
+
         def __post_init__(self) -> None:
             """初始化轨迹、消息列表以及可选的规则后备代理。"""
 
@@ -134,10 +147,11 @@ else:
 
             info = info or {}
             if DEBUG:
+                trace = self._trace_id()
                 kind = info.get("kind")
                 op = info.get("op")
                 print(
-                    f"[gp-agent] step={self._step_index} update_from_env: "
+                    f"[gp-agent {trace}] step={self._step_index} update_from_env: "
                     f"reward={reward} done={done} kind={kind} op={op}"
                 )
             text, metadata = summarise_observation(observation, reward, done, info)
@@ -169,7 +183,7 @@ else:
                     action_json = action_json[:600] + "...<truncated>"
                 thought_preview = thought if len(thought) <= 400 else thought[:400] + "...<truncated>"
                 print(
-                    f"[gp-agent] step={self._step_index} parsed_from_model: "
+                    f"[gp-agent {trace}] step={self._step_index} parsed_from_model: "
                     f"type={tp} thought={thought_preview!r} action={action_json}"
                 )
             self._messages.append({"role": "assistant", "content": assistant_msg})
@@ -258,7 +272,7 @@ else:
                 # a visible debug log so you can spot prompt / parser issues.
                 if os.environ.get("DEBUG") or os.environ.get("EBUG"):
                     print(
-                        "[gp-agent] rule fallback disabled; returning noop: "
+                        f"[gp-agent {self._trace_id()}] rule fallback disabled; returning noop: "
                         f"reason={reason!r} error={error!r} "
                         f"response_prefix={response[:200]!r}",
                         file=sys.stderr,
