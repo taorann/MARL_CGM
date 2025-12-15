@@ -174,10 +174,10 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
             "limit": action.limit,
         }
     if isinstance(action, MemoryAction):
+        # MemoryAction schema no longer uses `scope` (kept extra='ignore' for legacy payloads).
         return {
             "type": "memory",
-            "target": action.target,
-            "scope": action.scope,
+            "target": getattr(action, "target", "explore"),
             "intent": action.intent,
             "selector": action.selector,
         }
