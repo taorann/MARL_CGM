@@ -232,17 +232,17 @@ def parse_action_block(text: str) -> Dict[str, Any]:
         raise ProtocolError(PlannerErrorCode.INVALID_MULTI_BLOCK.value, "response must contain exactly one function block")
 
     match = matches[0]
-    prefix = text[: match.start()]
-    if prefix.strip():
-        raise ProtocolError(PlannerErrorCode.EXTRA_TEXT.value, "unexpected text before function block")
+    # Be tolerant to chatty models that prepend analysis / role tags / polite
+    # text before the function block. We still require exactly one function
+    # block in the entire response (checked above).
+    _ = text[: match.start()]
 
     end_match = _END_RE.search(text, match.end())
     if not end_match:
         raise ProtocolError(PlannerErrorCode.MISSING_FUNCTION_TAG.value, "missing </function> terminator")
 
-    suffix = text[end_match.end() :]
-    if suffix.strip():
-        raise ProtocolError(PlannerErrorCode.EXTRA_TEXT.value, "unexpected text after function block")
+    # Same tolerance for suffix text (e.g. trailing newlines).
+    _ = text[end_match.end() :]
 
     action_name = PLANNER_CONTRACT.normalise_action(match.group(1))
 
