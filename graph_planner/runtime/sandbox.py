@@ -343,10 +343,18 @@ class SandboxRuntime:
             t0 = time.perf_counter()
             resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/repo")
             dt = time.perf_counter() - t0
+            ok = bool(resp.get("ok", False))
+            rc = resp.get("returncode", None)
+            err = resp.get("error", None)
+            stderr = resp.get("stderr", "") or ""
             _dbg(
                 f"remote_swe started: run_id={self.run_id} dt={dt:.2f}s "
-                f"ok={resp.get('ok', True)!r} msg={resp.get('message', '')!r}"
+                f"ok={ok!r} rc={rc!r} error={err!r} stderr_bytes={len(stderr)}"
             )
+            if not ok:
+                raise RuntimeError(
+                    f"remote_swe start failed: rc={rc!r} error={err!r} stderr={stderr[:2000]!r}"
+                )
             self._remote_started = True
 
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
