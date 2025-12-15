@@ -31,6 +31,34 @@ if [[ $CONFIG_FLAG_PRESENT -eq 0 ]]; then
   set -- --config "${GRAPH_PLANNER_EVAL_CONFIG:-$DEFAULT_CONFIG}" "$@"
 fi
 
+# If using remote_swe backend and required fields are missing, inject defaults.
+NEED_REMOTE_SWE=0
+HAS_SSH_TARGET=0
+HAS_REMOTE_REPO=0
+for arg in "$@"; do
+  if [[ "$arg" == "--sandbox-backend" || "$arg" == "--sandbox-backend=remote_swe" ]]; then
+    NEED_REMOTE_SWE=1
+  fi
+  if [[ "$arg" == "remote_swe" ]]; then
+    NEED_REMOTE_SWE=1
+  fi
+  if [[ "$arg" == --sandbox-ssh-target || "$arg" == --sandbox-ssh-target=* ]]; then
+    HAS_SSH_TARGET=1
+  fi
+  if [[ "$arg" == --sandbox-remote-repo || "$arg" == --sandbox-remote-repo=* ]]; then
+    HAS_REMOTE_REPO=1
+  fi
+done
+
+if [[ $NEED_REMOTE_SWE -eq 1 ]]; then
+  if [[ $HAS_SSH_TARGET -eq 0 ]]; then
+    set -- --sandbox-ssh-target "${GP_SANDBOX_SSH_TARGET:-$SSH_TARGET}" "$@"
+  fi
+  if [[ $HAS_REMOTE_REPO -eq 0 ]]; then
+    set -- --sandbox-remote-repo "${GP_SANDBOX_REMOTE_REPO:-$REMOTE_REPO}" "$@"
+  fi
+fi
+
 PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
 TOKENIZERS_PARALLELISM="false" \
 python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" \
