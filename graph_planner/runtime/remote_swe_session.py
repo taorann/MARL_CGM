@@ -204,6 +204,7 @@ class RemoteSweSession:
             "image": self.image,
             "repo_id": repo_id,
             "timeout": float(timeout),
+            "max_stdout_bytes": int(os.environ.get("GP_BUILD_REPO_GRAPH_STDOUT_BYTES", "200000000")),
         }
         if cwd is not None:
             payload["cwd"] = cwd
