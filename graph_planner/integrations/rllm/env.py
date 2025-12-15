@@ -129,6 +129,13 @@ else:
                     "synthesis_strategy": self.synthesis_strategy,
                 },
             }
+            try:
+                issue = observation.get('issue') or {}
+                if isinstance(issue, dict):
+                    info.setdefault('task_id', str(issue.get('task_id') or ''))
+                    info.setdefault('run_id', str(issue.get('run_id') or issue.get('id') or ''))
+            except Exception:
+                pass
             return observation, info
 
         def step(self, action: Any) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
