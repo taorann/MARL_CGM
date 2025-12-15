@@ -191,6 +191,12 @@ class PlannerEnv:
             or issue.get("run_id", "")
             or str(self.issue.get("id") or "__default__")
         )
+        # Deterministic runner slot for concise logs (00/01/..). Should match apptainer_queue routing.
+        try:
+            self.runner_id: int = int(hash(effective_run_id) % max(int(getattr(sandbox_cfg, 'num_runners', 1) or 1), 1))
+        except Exception:
+            self.runner_id = 0
+
         self.box = SandboxRuntime(sandbox_cfg, run_id=effective_run_id)
         self.config: Config = load_config()
         self.config_dict: Dict[str, Any] = self.config.to_dict()
@@ -361,6 +367,25 @@ class PlannerEnv:
 
         return self._obs()
 
+    def close(self) -> None:
+        """Close underlying sandbox resources.
+
+        Called by rLLM wrapper when a trajectory terminates.
+        """
+        try:
+            box = getattr(self, "box", None)
+            if box is not None and hasattr(box, "close"):
+                box.close()
+        finally:
+            # best-effort telemetry flush
+            try:
+                tel = getattr(self, "telemetry", None)
+                flush = getattr(tel, "flush", None) or getattr(tel, "close", None)
+                if callable(flush):
+                    flush()
+            except Exception:
+                pass
+
     def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """单步：接受一个 action 字典，返回 (obs, reward, done, info)。"""
         self.steps += 1
@@ -503,6 +528,16 @@ class PlannerEnv:
         if action_type == "memory":
             return MemoryAction(**payload)
         if action_type == "repair":
+            # Guardrail: require at least one explore before repair to avoid blind patching.
+            try:
+                if int(getattr(self, "steps", 0)) <= 1:
+                    stats = subgraph_store.stats(self.working_subgraph)
+                    if not stats.get("n_nodes"):
+                        title = str((self.issue or {}).get("title") or "")
+                        query = title.strip() or "locate relevant code for the issue"
+                        return ExploreAction(type="explore", op="find", query=query, anchors=[], nodes=[])
+            except Exception:
+                pass
             return RepairAction(**payload)
         if action_type == "submit":
             return SubmitAction(**payload)
@@ -1004,6 +1039,7 @@ class PlannerEnv:
         obs_pack = self._observation_pack(mem_stats=memory_stats, query_stats=None)
 
         return {
+            "runner_id": getattr(self, "runner_id", 0),
             "issue": self.issue,
             "steps": self.steps,
             "last_info": self.last_info,
