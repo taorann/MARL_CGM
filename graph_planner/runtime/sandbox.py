@@ -1,5 +1,6 @@
 # graph_planner/runtime/sandbox.py
 import os, json, random, string, time, shutil, tempfile, base64, shlex
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -86,6 +87,11 @@ class SandboxRuntime:
         self._env = None  # only populated when using RepoEnv as the backend
         self._aq: Optional[ApptainerQueueRuntime] = None
         self._remote: Optional[RemoteSweSession] = None
+        # remote_swe: avoid duplicated expensive `start` calls within one SandboxRuntime.
+        # (Multiple helpers call into _exec/build_repo_graph, which used to call start
+        # every time and could race with SSH timeout.)
+        self._remote_started: bool = False
+        self._remote_start_lock = threading.Lock()
 
         if self._mode == "repoenv":
             try:
@@ -310,11 +316,35 @@ class SandboxRuntime:
                     )
 
     # ---------- 通用执行 ----------
+    def _ensure_remote_started(self, *, timeout: float) -> None:
+        """Start remote SWE instance once per SandboxRuntime.
+
+        Important: `swe_proxy` uses an internal wait budget that can exceed the
+        nominal payload timeout. We therefore rely on RemoteSweSession._call_proxy
+        to apply a larger outer SSH timeout, and we keep this call idempotent.
+        """
+        if self._mode != "remote_swe":
+            return
+        assert self._remote is not None, "remote_swe backend not initialized"
+        if self._remote_started:
+            return
+        with self._remote_start_lock:
+            if self._remote_started:
+                return
+            t0 = time.perf_counter()
+            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/repo")
+            dt = time.perf_counter() - t0
+            _dbg(
+                f"remote_swe started: run_id={self.run_id} dt={dt:.2f}s "
+                f"ok={resp.get('ok', True)!r} msg={resp.get('message', '')!r}"
+            )
+            self._remote_started = True
+
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         if self._mode == "remote_swe":
             assert self._remote is not None, "remote_swe backend not initialized"
             start_timeout = max(float(timeout), 300.0)
-            self._remote.start(timeout=start_timeout)
+            self._ensure_remote_started(timeout=start_timeout)
             resp = self._remote.exec(
                 cmd,
                 timeout=float(timeout),
@@ -626,7 +656,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
 
         # Ensure remote instance started (idempotent)
         start_timeout = max(float(timeout), 300.0)
-        self._remote.start(timeout=start_timeout)
+        self._ensure_remote_started(timeout=start_timeout)
 
         # Resolve repo id for caching
         rid = (repo_id or "").strip()
@@ -685,7 +715,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
 
         # Fallback: legacy JSON stdout
         start_timeout = max(float(timeout), 300.0)
-        self._remote.start(timeout=start_timeout)
+        self._ensure_remote_started(timeout=start_timeout)
         return self._remote.build_graph(
             issue_id=issue_id,
             timeout=float(timeout),
