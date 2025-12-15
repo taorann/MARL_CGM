@@ -308,7 +308,7 @@ class AgentExecutionEngine:
                 cur = agent.get_current_state()
                 cur_info = (cur.info if cur is not None else {}) or {}
                 print(
-                    f"[engine] traj={idx} step={step_idx} "
+                    f"[engine] app={application_id} traj={idx} step={step_idx} "
                     f"total_time={total_time:.2f}s "
                     f"last_reward={getattr(cur, 'reward', None)} "
                     f"last_done={getattr(cur, 'done', None)} "
@@ -367,7 +367,7 @@ class AgentExecutionEngine:
                     action_json = repr(action)
                 if len(action_json) > 600:
                     action_json = action_json[:600] + "...<truncated>"
-                print(f"[engine] traj={idx} step={step_idx} parsed_action={action_json}")
+                print(f"[engine] app={application_id} traj={idx} step={step_idx} parsed_action={action_json}")
 
             # Take step in environment using the executor
             start_time = time.time()
