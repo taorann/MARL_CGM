@@ -89,27 +89,29 @@ else:
         use_rule_fallback: bool = False
 
         def _trace_id(self) -> str:
-            """Concise trace tag for logs: <runner>/<run_id>.
-
-            - runner is 2-digit runner_id when available (00/01/02...).
-            - run_id is truncated to first 6 chars to avoid log spam.
-            """
             obs = self._last_env_observation or {}
-            runner_id = None
-            run_id = None
             if isinstance(obs, dict):
+                # Prefer runner index for concise logs (00/01/02...)
                 runner_id = obs.get("runner_id")
-                run_id = obs.get("run_id")
+                if runner_id is None:
+                    issue = obs.get("issue") or {}
+                    if isinstance(issue, dict):
+                        runner_id = issue.get("runner_id")
+                try:
+                    if runner_id is not None:
+                        return f"{int(runner_id):02d}"
+                except Exception:
+                    pass
+
                 issue = obs.get("issue") or {}
                 if isinstance(issue, dict):
-                    runner_id = runner_id if runner_id is not None else issue.get("runner_id")
-                    run_id = run_id or issue.get("run_id") or issue.get("id")
-            try:
-                runner = int(runner_id) if runner_id is not None else 0
-            except Exception:
-                runner = 0
-            rs = str(run_id or "no_run")
-            return f"{runner:02d}/{rs[:6]}"
+                    rid = str(issue.get("run_id") or "")
+                    if rid:
+                        return rid
+                    iid = str(issue.get("id") or "")
+                    if iid:
+                        return iid
+            return "unknown"
 
         def __post_init__(self) -> None:
             """初始化轨迹、消息列表以及可选的规则后备代理。"""
@@ -158,27 +160,6 @@ else:
             # Ensure trace_id can read current observation
             self._last_env_observation = observation
             info = info or {}
-            if DEBUG and os.environ.get("DEBUG_ACTION_RESULT") == "1":
-                trace = self._trace_id()
-                try:
-                    max_chars = int(os.environ.get("DEBUG_MAX_CHARS", "50000"))
-                except Exception:
-                    max_chars = 50000
-                try:
-                    dumped_info = json.dumps(info, ensure_ascii=False, default=str)
-                except Exception:
-                    dumped_info = repr(info)
-                try:
-                    dumped_obs = json.dumps(observation, ensure_ascii=False, default=str)
-                except Exception:
-                    dumped_obs = repr(observation)
-                if max_chars and len(dumped_info) > max_chars:
-                    dumped_info = dumped_info[:max_chars] + "...<truncated>"
-                if max_chars and len(dumped_obs) > max_chars:
-                    dumped_obs = dumped_obs[:max_chars] + "...<truncated>"
-                print(f"[gp-agent {trace}] env_info={dumped_info}")
-                print(f"[gp-agent {trace}] env_observation={dumped_obs}")
-
             if DEBUG:
                 trace = self._trace_id()
                 kind = info.get("kind")
@@ -187,7 +168,10 @@ else:
                     f"[gp-agent {trace}] step={self._step_index} update_from_env: "
                     f"reward={reward} done={done} kind={kind} op={op}"
                 )
-            text, metadata = summarise_observation(observation, reward, done, info)
+            text, metadata = summarise_observation(
+                observation, reward, done, info, include_issue=not self._sent_issue_once
+            )
+            self._sent_issue_once = True
             if self._trajectory.steps:
                 prior = self._trajectory.steps[-1]
                 prior.next_observation = text
@@ -206,10 +190,6 @@ else:
             if self._cur_step is None:
                 raise RuntimeError("update_from_env must be called before update_from_model")
             thought, action_obj, assistant_msg, parser_meta = self._parse_model_response(response)
-            if DEBUG and os.environ.get("DEBUG_FULL_MODEL_OUTPUT") == "1":
-                trace = self._trace_id()
-                print(f"[gp-agent {trace}] raw_model_output:\n{response}\n[/raw_model_output]")
-
             if DEBUG:
                 trace = self._trace_id()
                 tp = getattr(action_obj, "type", None) or getattr(action_obj, "kind", None)
@@ -223,12 +203,9 @@ else:
                     action_json = json.dumps(payload, ensure_ascii=False, default=str)
                 except Exception:
                     action_json = repr(action_obj)
-                no_trunc = (os.environ.get("DEBUG_NO_TRUNCATION") == "1") or (os.environ.get("DEBUG_FULL_MODEL_OUTPUT") == "1")
-                if (not no_trunc) and len(action_json) > 600:
+                if len(action_json) > 600:
                     action_json = action_json[:600] + "...<truncated>"
-                thought_preview = thought
-                if (not no_trunc) and len(thought_preview) > 400:
-                    thought_preview = thought_preview[:400] + "...<truncated>"
+                thought_preview = thought if len(thought) <= 400 else thought[:400] + "...<truncated>"
                 print(
                     f"[gp-agent {trace}] step={self._step_index} parsed_from_model: "
                     f"type={tp} thought={thought_preview!r} action={action_json}"
