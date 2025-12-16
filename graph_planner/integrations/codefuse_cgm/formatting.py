@@ -34,7 +34,17 @@ import json
 from collections import defaultdict
 
 import torch
-from transformers import PreTrainedTokenizerBase
+
+# NOTE:
+# `transformers` is only required for local CGM/LLM tokenization paths.
+# For the common remote-service workflow (HTTP CGM endpoint), we should not
+# hard-require the dependency just to import formatting helpers.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from transformers import PreTrainedTokenizerBase
+else:  # pragma: no cover
+    PreTrainedTokenizerBase = Any  # type: ignore[misc,assignment]
 
 from aci.schema import CollateMeta
 from ...agents.common.contracts import CGM_SYSTEM_PROMPT, CGM_CONTRACT
