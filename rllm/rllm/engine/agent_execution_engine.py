@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 import os
 import json
+import re
 
 import numpy as np
 import openai
@@ -96,6 +97,43 @@ class AgentExecutionEngine:
         self.max_prompt_length = max_prompt_length
         self.enforce_max_prompt_length = enforce_max_prompt_length and tokenizer is not None
 
+        # Cap per-step generation length to avoid starving the prompt budget.
+        # If not provided, derive a sensible default from the total response budget and max_steps.
+        self.max_tokens_per_step = kwargs.get("max_tokens_per_step")
+        if self.max_tokens_per_step is None:
+            if self.max_steps and self.max_steps > 0:
+                self.max_tokens_per_step = max(256, int(self.max_response_length / max(1, self.max_steps)))
+            else:
+                self.max_tokens_per_step = min(1024, int(self.max_response_length))
+
+        # Model context budgeting: prompt tokens + completion tokens must fit within the model context.
+        # We keep this logic inside the engine to guard against config misunderstandings where
+        # `max_tokens` is accidentally set to the *context length* (e.g., 8192) instead of the
+        # completion length, which would make the effective prompt budget ~0.
+        self.context_safety_margin = int(
+            kwargs.pop(
+                "context_safety_margin",
+                os.environ.get("RLLM_CONTEXT_MARGIN", 64),
+            )
+        )
+        self.min_completion_tokens = int(
+            kwargs.pop(
+                "min_completion_tokens",
+                os.environ.get("RLLM_MIN_COMPLETION_TOKENS", 256),
+            )
+        )
+        self.retry_on_context_error = bool(kwargs.pop("retry_on_context_error", True))
+
+        model_max_length = kwargs.pop("model_max_length", None)
+        if model_max_length is None:
+            env_max = os.environ.get("RLLM_MODEL_MAX_LEN")
+            model_max_length = int(env_max) if (env_max and env_max.isdigit()) else None
+        # Conservative default: assume context ~= prompt_cap + min(response_budget, prompt_cap).
+        # This prevents overshooting smaller-context models while still allowing reasonable output.
+        if model_max_length is None:
+            model_max_length = int(self.max_prompt_length) + int(min(self.max_response_length, self.max_prompt_length))
+        self.model_max_length = int(model_max_length)
+
         self.agent_class = agent_class
         self.agent_args = agent_args
         self.env_class = env_class
@@ -180,6 +218,33 @@ class AgentExecutionEngine:
             env.idx = idx
         self.agents = agents
         self.n_parallel_agents = len(envs)
+
+    def _approx_token_len(self, text: str) -> int:
+        # Conservative heuristic for token count when tokenizer is unavailable.
+        # English-ish: ~4 chars/token; mixed text tends to have fewer chars/token.
+        n_chars = len(text or "")
+        return max(1, n_chars // 4)
+
+    def _prompt_token_len(self, prompt_str: str) -> int:
+        if self.tokenizer is not None:
+            return len(self.tokenizer.encode(prompt_str, add_special_tokens=False))
+        return self._approx_token_len(prompt_str)
+
+    def _infer_model_max_length_from_context_error(self, err_msg: str, requested_max_tokens: int) -> Optional[int]:
+        """Best-effort inference of model context length from OpenAI/vLLM-style errors.
+
+        vLLM (OpenAI compat) often reports *max input tokens given current max_tokens*, e.g.
+        "maximum context length is 1682 tokens" + "... has 3436 input tokens".
+        In that case, total_ctx ~= max_input + requested_max_tokens.
+        Some providers report total context directly (no "input tokens" phrasing).
+        """
+        m = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_msg)
+        if not m:
+            return None
+        reported = int(m.group(1))
+        if "input tokens" in err_msg.lower() or "prompt tokens" in err_msg.lower():
+            return reported + max(0, int(requested_max_tokens))
+        return reported
 
     async def _get_verl_async(self, prompt, application_id, **kwargs):
         batch = self._convert_prompt_verl([prompt], **kwargs)
@@ -317,6 +382,14 @@ class AgentExecutionEngine:
                 )
             # Get action from agent
             prompt_messages = agent.chat_completions.copy()
+
+            # Build the actual prompt string once; we will reuse it for budgeting and logging.
+            prompt_str = self.chat_parser.parse(
+                prompt_messages,
+                add_generation_prompt=True,
+                is_first_msg=True,
+            )
+            prompt_len = self._prompt_token_len(prompt_str)
             # Max remaining tokens left for the response
             # For enforced max prompt at each step, no need to deduct here
             if not self.enforce_max_prompt_length:
@@ -324,23 +397,62 @@ class AgentExecutionEngine:
             else:
                 max_tokens = self.max_response_length
 
-                # since max prompt is enforced, we filter out too long prompts.
-                prompt_len = 0
-                if self.tokenizer is not None:
+            # --- Hard prompt cap (leave room for a minimum completion) ---
+            hard_prompt_cap = min(
+                self.max_prompt_length,
+                max(1, self.model_max_length - self.context_safety_margin - self.min_completion_tokens),
+            )
+            if prompt_len > hard_prompt_cap:
+                # Drop the oldest non-system messages until we fit.
+                while prompt_len > hard_prompt_cap and len(prompt_messages) > 1:
+                    # Prefer keeping the first system message intact.
+                    drop_idx = 1 if (prompt_messages and prompt_messages[0].get("role") == "system") else 0
+                    if drop_idx >= len(prompt_messages):
+                        break
+                    prompt_messages.pop(drop_idx)
                     prompt_str = self.chat_parser.parse(
                         prompt_messages,
                         add_generation_prompt=True,
                         is_first_msg=True,
                     )
-                    prompt_len = len(self.tokenizer.encode(prompt_str, add_special_tokens=False))
-                if prompt_len > self.max_prompt_length:
+                    prompt_len = self._prompt_token_len(prompt_str)
+
+                if prompt_len > hard_prompt_cap:
                     termination_reason = "PROMPT_TRUNCATION"
                     break
+
+            # --- Completion cap (prompt + completion must fit model context) ---
+            context_completion_cap = max(0, self.model_max_length - prompt_len - self.context_safety_margin)
+
+            # Cap per step + remaining response budget + model context.
+            max_tokens = min(max_tokens, self.max_tokens_per_step, context_completion_cap)
+            if max_tokens < 1:
+                termination_reason = "PROMPT_TRUNCATION"
+                break
 
             kwargs["max_tokens"] = max_tokens
 
             start_time = time.time()
-            response = await self.get_model_response(prompt_messages, application_id, **kwargs)
+            # Query model (with one optional adaptive retry when the backend returns a context-length error)
+            try:
+                response = await self.get_model_response(prompt_messages, application_id, **kwargs)
+            except Exception as e:
+                if self.retry_on_context_error:
+                    inferred = self._infer_model_max_length_from_context_error(str(e), int(kwargs.get("max_tokens", 0)))
+                    if inferred is not None and inferred > 0:
+                        self.model_max_length = inferred
+                        # Recompute completion cap and retry once.
+                        context_completion_cap = max(0, self.model_max_length - prompt_len - self.context_safety_margin)
+                        retry_max_tokens = min(int(kwargs.get("max_tokens", 0)), context_completion_cap)
+                        if retry_max_tokens >= 1:
+                            kwargs["max_tokens"] = retry_max_tokens
+                            response = await self.get_model_response(prompt_messages, application_id, **kwargs)
+                        else:
+                            raise
+                    else:
+                        raise
+                else:
+                    raise
             delta_time = time.time() - start_time
             llm_time += delta_time
             total_time += delta_time
