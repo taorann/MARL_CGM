@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from .text_compact import compact_issue_text
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -27,6 +28,9 @@ def summarise_observation(
     reward: float,
     done: bool,
     info: Dict[str, Any] | None,
+    *,
+    include_issue: bool = True,
+    issue_target_tokens: int = 320,
 ) -> Tuple[str, Dict[str, Any]]:
     issue = obs.get("issue") or {}
     steps = obs.get("steps", 0)
@@ -36,10 +40,15 @@ def summarise_observation(
     lines = [
         f"Issue: {issue.get('id', 'unknown')} | step={steps} | reward={reward} | done={done}",
     ]
-    if issue.get("title"):
-        lines.append(f"Title: {issue['title']}")
-    if issue.get("body"):
-        lines.append(f"Body: {issue['body'][:240]}")
+    if include_issue:
+        issue_compact = compact_issue_text(
+            str(issue.get('title', '')).strip(),
+            str(issue.get('body', '') or ''),
+            target_tokens=issue_target_tokens,
+        )
+        if issue_compact:
+            lines.append('Issue context:')
+            lines.append(issue_compact)
     if pack.get("failure_frame"):
         ff = pack["failure_frame"]
         file_hint = ff.get("path") or ff.get("file")
@@ -174,10 +183,10 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
             "limit": action.limit,
         }
     if isinstance(action, MemoryAction):
-        # MemoryAction schema no longer uses `scope` (kept extra='ignore' for legacy payloads).
         return {
             "type": "memory",
-            "target": getattr(action, "target", "explore"),
+            "target": action.target,
+            "scope": action.scope,
             "intent": action.intent,
             "selector": action.selector,
         }
