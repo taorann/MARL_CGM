@@ -124,3 +124,46 @@ def compact_issue(issue: Dict[str, Any], cfg: Optional[CompactIssueConfig] = Non
     out = _hard_truncate(out, cfg.max_chars)
 
     return {"title": title, "body": out}
+
+
+def compact_issue_text(
+    title: str,
+    body: str,
+    *,
+    target_tokens: int = 320,
+    cfg: Optional[CompactIssueConfig] = None,
+) -> str:
+    """Return a compact, prompt-friendly *string* for an issue.
+
+    The planner stack historically used a helper named ``compact_issue_text``
+    that accepts raw ``title``/``body`` strings and a ``target_tokens`` hint.
+    Newer refactors consolidated the implementation into :func:`compact_issue`.
+
+    To preserve compatibility (and avoid import errors in downstream agent
+    code), we keep this wrapper with the original call signature.
+
+    Notes:
+      - ``target_tokens`` is an approximate budget. We convert it to a
+        character budget using a conservative heuristic (~4 chars/token).
+      - If a ``cfg`` is provided, its non-size parameters are respected.
+    """
+
+    # Rough, conservative estimate: 1 token ~ 4 chars for English-ish text.
+    # Keep a small floor to avoid over-truncating short issues.
+    est_max_chars = max(512, int(target_tokens) * 4)
+
+    if cfg is None:
+        cfg = CompactIssueConfig(max_chars=est_max_chars)
+    else:
+        # Respect all config fields but adapt size budget to the call-site.
+        cfg = CompactIssueConfig(
+            max_chars=min(cfg.max_chars, est_max_chars),
+            max_code_blocks=cfg.max_code_blocks,
+            max_code_lines=cfg.max_code_lines,
+            prose_chars=min(cfg.prose_chars, est_max_chars),
+            keep_order=cfg.keep_order,
+        )
+
+    packed = compact_issue({"title": title, "body": body}, cfg=cfg)
+    # ``compact_issue`` returns a dict; callers want a string.
+    return packed.get("body", "")
