@@ -49,6 +49,47 @@ from graph_planner.runtime.apptainer_queue_runtime import ApptainerQueueRuntime
 from graph_planner.runtime.queue_protocol import QueueRequest, QueueResponse
 
 
+def _canon_pwd(val: Any) -> str | None:
+    """Canonicalize a container working directory.
+
+    We keep this intentionally conservative because `--pwd` failures are noisy
+    in Apptainer/Singularity.
+
+    Rules:
+    - Non-string / empty -> None (caller should default)
+    - Normalize path separators; collapse '.' and '..'
+    - Force absolute paths
+    - Map common legacy '/repo' to '/testbed'
+    - Reject path traversal (anything that still contains '..')
+    """
+
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s:
+        return None
+
+    # Normalize Windows-style separators just in case.
+    s = s.replace("\\", "/")
+
+    # Force absolute.
+    if not s.startswith("/"):
+        s = "/" + s
+
+    # Collapse '/a/../b' etc.
+    s = os.path.normpath(s)
+
+    # Some SWE-bench tooling uses /repo; our images use /testbed.
+    if s == "/repo":
+        s = "/testbed"
+
+    # Basic traversal guard.
+    if ".." in Path(s).parts:
+        return None
+
+    return s
+
+
 def _dbg(msg: str) -> None:
     if os.environ.get("DEBUG") or os.environ.get("EBUG"):
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
