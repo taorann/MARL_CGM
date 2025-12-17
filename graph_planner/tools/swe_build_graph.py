@@ -264,7 +264,7 @@ def emit_base64_gzip(text: str) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Build repo-level code graph (JSON/JSONL/base64+gzip(JSONL)).")
-    p.add_argument("--repo", required=True, help="Path to repository root (inside container usually /repo).")
+    p.add_argument("--repo", required=True, help="Path to repository root (inside container usually /testbed).")
     # legacy arg (accepted but ignored)
     p.add_argument("--issue-id", default=None, help="(legacy) accepted but ignored; repo-level graph is built.")
     p.add_argument("--output", default="-", help="Output path. Use '-' for stdout. Default: stdout.")
