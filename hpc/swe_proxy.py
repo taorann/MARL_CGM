@@ -137,7 +137,7 @@ def main() -> int:
     cmd = payload.get("cmd")
     timeout = float(payload.get("timeout") or 600.0)
     env = payload.get("env") or {}
-    cwd = Path(payload.get("cwd") or "/testbed")
+    cwd = Path(_canon_pwd(payload.get("cwd")) or "/testbed")
 
     max_stdout_bytes = payload.get("max_stdout_bytes")
     try:
@@ -201,7 +201,7 @@ def main() -> int:
                 if not issue_id:
                     print(json.dumps({"ok": False, "error": "issue_id is required for op=build_graph"}))
                     return 1
-                repo = str(payload.get("repo") or "/testbed")
+                repo = str(_canon_pwd(payload.get("repo")) or "/testbed")
                 py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/mnt/share/MARL_CGM-main:/gp"
                 build_cmd = (
                     f"{py} python -m graph_planner.tools.swe_build_graph "
@@ -218,7 +218,7 @@ def main() -> int:
                     cwd=cwd,
                 )
             elif op == "build_repo_graph":
-                repo = str(payload.get("repo") or "/testbed")
+                repo = str(_canon_pwd(payload.get("repo")) or "/testbed")
                 py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/mnt/share/MARL_CGM-main:/gp"
                 build_cmd = (
                     f"{py} python -m graph_planner.tools.swe_build_graph "
