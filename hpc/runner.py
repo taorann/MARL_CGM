@@ -73,8 +73,8 @@ def _write_heartbeat(extra: Optional[Dict[str, Any]] = None) -> None:
 def _resolve_cwd(req_cwd: str | None, run_id: str) -> tuple[Path, str | None]:
     """Split cwd into a safe host-side cwd and an optional container-side pwd.
 
-    remote_swe often passes container paths like "/repo". The runner must NOT treat
-    them as host paths (would attempt mkdir /repo and fail). We instead:
+    remote_swe often passes container paths like "/testbed". The runner must NOT treat
+    them as host paths (would attempt mkdir /testbed and fail). We instead:
       - use a per-run directory under $SHARE_ROOT/gp_work as host cwd;
       - pass the container path via apptainer --pwd when it looks like an absolute POSIX path.
     """
@@ -254,6 +254,9 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             f"{SHARE_ROOT}:/mnt/share",
             req.sif_path,
             INSTANCE_NAME,
+            "/bin/sh",
+            "-lc",
+            "trap : TERM INT; while true; do sleep 3600; done",
         ]
         t0 = _now()
         proc = subprocess.run(
