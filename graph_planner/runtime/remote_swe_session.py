@@ -133,7 +133,7 @@ class RemoteSweSession:
             )
         self._runners_ensured = True
 
-    def start(self, timeout: Optional[float] = None, cwd: str = "/repo") -> Dict[str, Any]:
+    def start(self, timeout: Optional[float] = None, cwd: str = "/testbed") -> Dict[str, Any]:
         self._ensure_remote_runners()
         # Allow plenty of time for the initial container bootstrap even if callers
         # pass a smaller timeout (e.g., snippet-level defaults).
@@ -143,7 +143,7 @@ class RemoteSweSession:
             "run_id": self.run_id,
             "image": self.image,
             "timeout": effective_timeout,
-            "cwd": cwd or "/repo",
+            "cwd": cwd or "/testbed",
         }
         return self._call_proxy(payload, timeout=effective_timeout)
 
