@@ -124,6 +124,15 @@ Every reply MUST contain exactly one action block in the format:
 Replace ACTION_NAME with one of: explore, memory, repair, submit, noop.
 The "action" param MUST be a single JSON object describing the full action,
 including "type" (matching ACTION_NAME) and required fields (e.g. memory.intent).
+
+For explore actions, set:
+- op="find"  (use anchors and/or a free-text query to retrieve candidates)
+- op="expand" (use anchors to expand/merge into the working subgraph)
+
+Do NOT use a separate "read" op (deprecated). If you need code context, rely on:
+(1) the working subgraph snippets already in the observation, and/or
+(2) candidate snippets attached by explore.find.
+
 Do not emit any other text outside the block.
 """
 
