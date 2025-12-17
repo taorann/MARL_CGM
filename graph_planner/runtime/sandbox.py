@@ -226,7 +226,7 @@ class SandboxRuntime:
             num_runners=num_runners,
             ensure_runners=True,
         )
-        self.workdir = "/testbed"  # remote_swe 强制统一 repo root
+        self.workdir = "/testbed"  # remote_swe: SWE-bench images use /testbed as repo root
         _dbg(
             f"remote_swe backend initialized: ssh={cfg.ssh_target!r}, "
             f"repo={cfg.remote_repo!r}, workdir={self.workdir!r}, num_runners={num_runners}"
@@ -549,10 +549,10 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         selector_tuple: Tuple[str, ...] = tuple(selector or ())
         sel = " ".join(selector_tuple)
 
-        # remote_swe: prefer /testbed (workdir) run_tests.sh if present, else fallback pytest
+        # remote_swe: prefer /repo (workdir) run_tests.sh if present, else fallback pytest
         if self._mode == "remote_swe":
-            wd = (self.workdir or "/testbed").rstrip("/")
-            for script in (f"{wd}/run_tests.sh", "/testbed/run_tests.sh"):
+            wd = (self.workdir or "/repo").rstrip("/")
+            for script in (f"{wd}/run_tests.sh", "/repo/run_tests.sh"):
                 # Some SWE-bench images ship run_tests.sh without +x; accept if file exists.
                 if self._exec(f"test -f {script}")[1] == 0:
                     # SWE-bench run_tests.sh typically does not accept extra positional args; run full suite.
@@ -628,19 +628,9 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         )
 
     def _aci_root(self) -> Path:
-        """Host-side cache root for GraphPlanner artifacts.
-
-        Historical default was ".aci". We now default to a non-hidden directory
-        ("gp_cache") as requested, while still honoring GP_ACI_ROOT for backward
-        compatibility.
-
-        Priority:
-          1) GP_GRAPH_CACHE_ROOT (preferred)
-          2) GP_ACI_ROOT (legacy)
-          3) "gp_cache" (default)
-        """
-        root = os.environ.get("GP_GRAPH_CACHE_ROOT") or os.environ.get("GP_ACI_ROOT") or "gp_cache"
-        return Path(root)
+        # Host-side cache root for GraphPlanner artifacts
+        # Default: .aci (relative to current working directory)
+        return Path(os.environ.get("GP_ACI_ROOT", ".aci"))
 
     def _repo_graph_cache_path(self, repo_id: str) -> Path:
         rid = (repo_id or "").strip() or "repo"
@@ -697,7 +687,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             return str(cache_path)
 
         _dbg(f"remote_swe build_repo_graph: repo_id={rid} workdir={self.workdir} image={self.cfg.docker_image}")
-        b64 = self._remote.build_repo_graph(repo_id=rid, timeout=int(timeout), cwd=self.workdir or "/testbed", repo=self.workdir or "/testbed")
+        b64 = self._remote.build_repo_graph(repo_id=rid, timeout=int(timeout), cwd="/testbed", repo="/testbed")
         if not b64:
             raise RuntimeError("build_repo_graph returned empty base64 payload")
 
