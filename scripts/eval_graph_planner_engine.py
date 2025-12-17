@@ -1316,7 +1316,7 @@ def _merge_sandbox_overrides(
     Invariants we enforce:
       - entry["sandbox"] is a dict
       - sandbox has docker_image/workdir/mounts/env (with safe defaults)
-      - if backend == "remote_swe", default workdir is /repo (unless explicitly overridden)
+      - if backend == "remote_swe", default workdir is /testbed (unless explicitly overridden)
     """
     sandbox = entry.get("sandbox")
     if not isinstance(sandbox, dict):
@@ -1364,12 +1364,12 @@ def _merge_sandbox_overrides(
 
     if backend == "remote_swe":
         if prefer_testbed_for_remote_swe and (not sandbox_overrides or "workdir" not in sandbox_overrides):
-            sandbox["workdir"] = "/repo"
+            sandbox["workdir"] = "/testbed"
         elif not isinstance(sandbox.get("workdir"), str) or not sandbox.get("workdir", "").strip():
-            sandbox["workdir"] = "/repo"
+            sandbox["workdir"] = "/testbed"
     else:
         if not isinstance(sandbox.get("workdir"), str) or not sandbox.get("workdir", "").strip():
-            sandbox["workdir"] = "/repo"
+            sandbox["workdir"] = "/testbed"
 
     entry = dict(entry)
     entry["sandbox"] = sandbox
