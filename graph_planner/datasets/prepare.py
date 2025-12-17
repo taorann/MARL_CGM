@@ -440,7 +440,7 @@ def convert_swebench_entries(
                 },
                 "sandbox": {
                     "docker_image": docker_image,
-                    "workdir": "/repo",
+                    "workdir": "/testbed",
                     "mounts": {},
                     "env": {},
                     "backend": "repoenv",
