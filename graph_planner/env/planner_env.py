@@ -247,7 +247,7 @@ class PlannerEnv:
         self.memory_text_store: Optional[text_memory.NoteTextStore] = None
         self.memory_state: Optional[text_memory.TurnState] = None
 
-        # 最近一步 explore/read 的结果
+        # 最近一步 explore/find|expand 的结果
         self.last_candidates: List[Dict[str, Any]] = []
         self.last_reads: List[Dict[str, Any]] = []
 
@@ -561,10 +561,9 @@ class PlannerEnv:
     # ------------------------------------------------------------------
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
         """
-        实现 ExploreAction 的三个子操作：
-        - find:  根据 anchors 在 repo 图中做候选检索，不修改 working_subgraph；
-        - expand: 围绕 anchors/nodes 在图上扩展，并 merge 进 working_subgraph；
-        - read:  对指定 nodes 读取代码片段（snippets），并将这些节点标记为 explored。
+        实现 ExploreAction 的两个子操作：
+        - find:  根据 anchors/query 在 repo 图中做候选检索，不修改 working_subgraph；
+        - expand: 围绕 anchors 在图上扩展，并 merge 进 working_subgraph；
         """
 
         info: Dict[str, Any] = {"kind": "explore", "op": act.op}
@@ -653,36 +652,6 @@ class PlannerEnv:
                     node_ids.append(nid)
 
             self._merge_repo_nodes_into_working(node_ids, status="explored")
-            info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
-            return info
-
-        # -------- op = read --------
-        if act.op == "read":
-            node_ids = list(act.nodes)
-            if not node_ids and getattr(self, "last_candidates", None):
-                for c in self.last_candidates:
-                    nid = c.get("id")
-                    if isinstance(nid, str):
-                        node_ids.append(nid)
-
-            # 去重并做 limit 截断
-            uniq_ids: List[str] = []
-            for nid in node_ids:
-                if isinstance(nid, str) and nid not in uniq_ids:
-                    uniq_ids.append(nid)
-            if total_limit:
-                uniq_ids = uniq_ids[: total_limit]
-
-            snippets = []
-            for nid in uniq_ids:
-                snippet = self._read_node_snippet(nid)
-                if snippet:
-                    snippets.append(snippet)
-
-            self.last_reads = snippets
-            info["snippets"] = snippets
-
-            self._merge_repo_nodes_into_working(uniq_ids, status="explored")
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -1472,7 +1441,19 @@ print(json.dumps({'snippet_lines': snippet}))
             repo_node = self._repo_nodes_by_id.get(nid)
             if not repo_node:
                 continue
+            existing = working_nodes_by_id.get(nid)
             node_copy = dict(repo_node)
+            # Preserve any extra fields already stored in working_subgraph (e.g., snippet_lines/text).
+            if isinstance(existing, dict):
+                for k, v in existing.items():
+                    if k not in node_copy:
+                        node_copy[k] = v
+            # Recency metadata (used by planner prompt selection)
+            if isinstance(existing, dict) and "gp_added_step" in existing:
+                node_copy["gp_added_step"] = existing.get("gp_added_step")
+            else:
+                node_copy["gp_added_step"] = getattr(self, "steps", 0)
+            node_copy["gp_last_touched_step"] = getattr(self, "steps", 0)
             node_copy["status"] = status
             tags = set(node_copy.get("tags") or [])
             tags.add(status)
