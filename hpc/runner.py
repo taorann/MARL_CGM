@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import hashlib
 import os
 import shutil
 import subprocess
@@ -25,8 +27,31 @@ SHARE_ROOT = Path(os.environ["SHARE_ROOT"])
 POLL_INTERVAL_SEC = float(os.environ.get("RUNNER_POLL_INTERVAL", "0.5"))
 
 # 一个 runner ⇔ 一个容器：名字固定为 gp-00/gp-01/...
-INSTANCE_NAME = f"gp-{RUNNER_ID:02d}"
+RUNNER_LABEL = f"gp-{RUNNER_ID:02d}"
+def _instance_name_for_run(run_id: str) -> str:
+    """Derive a stable apptainer instance name from run_id.
 
+    - Must be consistent across start/exec/stop.
+    - Avoid special chars and overly long names.
+    """
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run_id))
+    s = s.strip("-") or "gp"
+    if len(s) > 96:
+        h = hashlib.sha1(str(run_id).encode("utf-8")).hexdigest()[:10]
+        s = f"{s[:80]}-{h}"
+    return s
+
+def _instance_exists(name: str) -> bool:
+    try:
+        proc = subprocess.run(
+            [APPTAINER_BIN, "instance", "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return name in (proc.stdout or "")
+    except Exception:
+        return False
 # Runner liveness markers (used by ApptainerQueueRuntime to avoid routing to pending runners)
 RUNNER_ROOT = QUEUE_ROOT / f"runner-{RUNNER_ID}"
 READY_PATH = RUNNER_ROOT / "ready.json"
@@ -73,8 +98,8 @@ def _write_heartbeat(extra: Optional[Dict[str, Any]] = None) -> None:
 def _resolve_cwd(req_cwd: str | None, run_id: str) -> tuple[Path, str | None]:
     """Split cwd into a safe host-side cwd and an optional container-side pwd.
 
-    remote_swe often passes container paths like "/testbed". The runner must NOT treat
-    them as host paths (would attempt mkdir /testbed and fail). We instead:
+    remote_swe often passes container paths like "/repo". The runner must NOT treat
+    them as host paths (would attempt mkdir /repo and fail). We instead:
       - use a per-run directory under $SHARE_ROOT/gp_work as host cwd;
       - pass the container path via apptainer --pwd when it looks like an absolute POSIX path.
     """
@@ -83,7 +108,7 @@ def _resolve_cwd(req_cwd: str | None, run_id: str) -> tuple[Path, str | None]:
         container_pwd = req_cwd
 
     host_base = Path(os.environ.get('RUNNER_WORKDIR_HOST', str(SHARE_ROOT / 'gp_work')))
-    host_cwd = host_base / run_id / INSTANCE_NAME
+    host_cwd = host_base / run_id / _instance_name_for_run(run_id)
     _ensure_dir(host_cwd)
     return host_cwd, container_pwd
 
@@ -244,6 +269,12 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
     if req.env:
         env.update(req.env)
 
+
+    inst_name = inst_name
+    if CURRENT_RUN_ID == req.run_id and not _instance_exists(inst_name):
+        # The instance may have exited immediately after start; allow restart.
+        CURRENT_RUN_ID = None
+
     if CURRENT_RUN_ID is None:
         cmd = [
             APPTAINER_BIN,
@@ -253,10 +284,10 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             "--bind",
             f"{SHARE_ROOT}:/mnt/share",
             req.sif_path,
-            INSTANCE_NAME,
+            inst_name,
             "/bin/sh",
             "-lc",
-            "trap : TERM INT; while true; do sleep 3600; done",
+            "while true; do sleep 3600; done",
         ]
         t0 = _now()
         proc = subprocess.run(
@@ -325,6 +356,22 @@ def handle_instance_exec(req: QueueRequest) -> QueueResponse:
     if req.env:
         env.update(req.env)
 
+    inst_name = _instance_name_for_run(req.run_id)
+    if not _instance_exists(inst_name):
+        msg = f"no instance found with name {inst_name}; call instance_start first"
+        return QueueResponse(
+            req_id=req.req_id,
+            runner_id=req.runner_id,
+            run_id=req.run_id,
+            type=req.type,
+            ok=False,
+            returncode=255,
+            stdout="",
+            stderr=msg,
+            runtime_sec=0.0,
+            error=msg,
+        )
+
     if CURRENT_RUN_ID is None:
         msg = "no active run_id on this runner; call instance_start first"
         return QueueResponse(
@@ -365,7 +412,7 @@ def handle_instance_exec(req: QueueRequest) -> QueueResponse:
     if container_pwd:
         cmd.extend(["--pwd", container_pwd])
     cmd.extend([
-        f"instance://{INSTANCE_NAME}",
+        f"instance://{inst_name}",
         *req.cmd,
     ])
 
@@ -404,6 +451,8 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
     if req.env:
         env.update(req.env)
 
+    inst_name = _instance_name_for_run(req.run_id)
+
     if CURRENT_RUN_ID is None:
         return QueueResponse(
             req_id=req.req_id,
@@ -433,7 +482,7 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
             error=msg,
         )
 
-    cmd = [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME]
+        cmd = [APPTAINER_BIN, "instance", "stop", inst_name]
 
     t0 = _now()
     proc = subprocess.run(
