@@ -151,9 +151,12 @@ else:
             self._state = _AgentState()
             # Planner chat history trimming (keep last N turns, plus system).
             try:
-                self._max_history_turns = int(os.environ.get(\"GP_PLANNER_MAX_HISTORY_TURNS\", \"4\"))
+                self._max_history_turns = int(os.environ.get("GP_PLANNER_MAX_HISTORY_TURNS", "4"))
             except Exception:
                 self._max_history_turns = 4
+            # Whether we have already included the full issue payload in the observation.
+            # The rLLM engine may pass include_issue=not self._sent_issue_once.
+            self._sent_issue_once = False
             self._config: Config = load_config()
             if self.use_rule_fallback:
                 self._maybe_init_rule_fallback()
@@ -171,6 +174,7 @@ else:
             self._last_env_observation = None
             self._step_index = 0
             self._state = _AgentState()
+            self._sent_issue_once = False
 
         def _maybe_init_rule_fallback(self) -> None:
             """Lazy initialiser for optional rule-based fallback agent."""
@@ -186,7 +190,15 @@ else:
 
             self._rule_agent = RuleFallbackAgent()
 
-        def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any] | None, **kwargs):
+        def update_from_env(
+            self,
+            observation: Any,
+            reward: float,
+            done: bool,
+            info: Dict[str, Any] | None,
+            include_issue: bool | None = None,
+            **kwargs,
+        ):
             """根据环境返回的观察值更新轨迹和内部状态。"""
 
             # Ensure trace_id can read current observation
@@ -200,9 +212,21 @@ else:
                     f"[gp-agent {trace}] step={self._step_index} update_from_env: "
                     f"reward={reward} done={done} kind={kind} op={op}"
                 )
+            # Decide whether to include the raw issue content this turn.
+            # If the caller provides include_issue, honor it. Otherwise default to:
+            #   - include every turn when GP_INCLUDE_ISSUE_EVERY_TURN=1
+            #   - else include only once
+            if include_issue is None:
+                include_issue = bool(os.environ.get("GP_INCLUDE_ISSUE_EVERY_TURN")) or (not self._sent_issue_once)
+            else:
+                if os.environ.get("GP_INCLUDE_ISSUE_EVERY_TURN"):
+                    include_issue = True
+
             text, metadata = summarise_observation(
-                observation, reward, done, info, include_issue=True
+                observation, reward, done, info, include_issue=bool(include_issue)
             )
+            if include_issue:
+                self._sent_issue_once = True
             if self._trajectory.steps:
                 prior = self._trajectory.steps[-1]
                 prior.next_observation = text
