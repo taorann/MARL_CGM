@@ -9,6 +9,10 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+def _canon_cwd(cwd: str) -> str:
+    # Backward compatibility: older configs used /repo for SWE-bench images.
+    return "/testbed" if cwd == "/repo" else cwd
+
 
 def _dbg(msg: str) -> None:
     if os.environ.get("DEBUG") or os.environ.get("EBUG"):
@@ -143,7 +147,7 @@ class RemoteSweSession:
             "run_id": self.run_id,
             "image": self.image,
             "timeout": effective_timeout,
-            "cwd": cwd or "/testbed",
+            "cwd": _canon_cwd(cwd or "/testbed"),
         }
         return self._call_proxy(payload, timeout=effective_timeout)
 
