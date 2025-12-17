@@ -226,7 +226,7 @@ class SandboxRuntime:
             num_runners=num_runners,
             ensure_runners=True,
         )
-        self.workdir = "/testbed"  # remote_swe: SWE-bench images use /testbed as repo root
+        self.workdir = "/repo"  # remote_swe 强制统一 repo root
         _dbg(
             f"remote_swe backend initialized: ssh={cfg.ssh_target!r}, "
             f"repo={cfg.remote_repo!r}, workdir={self.workdir!r}, num_runners={num_runners}"
@@ -341,7 +341,7 @@ class SandboxRuntime:
             if self._remote_started:
                 return
             t0 = time.perf_counter()
-            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
+            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/repo")
             dt = time.perf_counter() - t0
             ok = bool(resp.get("ok", False))
             rc = resp.get("returncode", None)
@@ -687,7 +687,14 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             return str(cache_path)
 
         _dbg(f"remote_swe build_repo_graph: repo_id={rid} workdir={self.workdir} image={self.cfg.docker_image}")
-        b64 = self._remote.build_repo_graph(repo_id=rid, timeout=int(timeout), cwd="/testbed", repo="/testbed")
+        # NOTE: SWE-bench images typically use /testbed as the working directory.
+        #       In our remote_swe backend, self.workdir is the canonical in-container cwd.
+        b64 = self._remote.build_repo_graph(
+            repo_id=rid,
+            timeout=int(timeout),
+            cwd=self.workdir,
+            repo=self.workdir,
+        )
         if not b64:
             raise RuntimeError("build_repo_graph returned empty base64 payload")
 
