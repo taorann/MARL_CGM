@@ -14,21 +14,21 @@ Supported request formats:
      "run_id": "...",
      "image": "<docker image string>",
      "cmd": "<shell command>",
-     "cwd": "/repo",           # optional
+     "cwd": "/testbed",           # optional
      "timeout": 600,            # optional
      "env": {"K": "V"}         # optional
    }
 
 2) Trajectory / instance mode (explicit "op"):
-   - start: {"op":"start", "run_id":"...", "image":"...", "cwd":"/repo", "timeout":600, "env":{...}}
-   - exec : {"op":"exec",  "run_id":"...", "image":"...", "cmd":"...", "cwd":"/repo", "timeout":600, "env":{...}}
+   - start: {"op":"start", "run_id":"...", "image":"...", "cwd":"/testbed", "timeout":600, "env":{...}}
+   - exec : {"op":"exec",  "run_id":"...", "image":"...", "cmd":"...", "cwd":"/testbed", "timeout":600, "env":{...}}
    - stop : {"op":"stop",  "run_id":"...", "timeout":600}
 
 3) Helpers used by SandboxRuntime (remote_swe):
    - build_graph:
-     {"op":"build_graph", "run_id":"...", "image":"...", "issue_id":"...", "repo":"/repo", "cwd":"/repo"}
+     {"op":"build_graph", "run_id":"...", "image":"...", "issue_id":"...", "repo":"/testbed", "cwd":"/testbed"}
    - build_repo_graph:
-     {"op":"build_repo_graph", "run_id":"...", "image":"...", "repo":"/repo", "cwd":"/repo"}
+     {"op":"build_repo_graph", "run_id":"...", "image":"...", "repo":"/testbed", "cwd":"/testbed"}
 
 Env:
   - GP_NUM_RUNNERS (default 1)
@@ -90,7 +90,7 @@ def _instance_roundtrip(
     else:
         cmd_list = ["bash", "-lc", cmd]
 
-    workdir = cwd or Path("/repo")
+    workdir = cwd or Path("/testbed")
 
     # Build raw QueueRequest without importing it here (avoid duplicate protocol deps)
     req = {
@@ -137,7 +137,7 @@ def main() -> int:
     cmd = payload.get("cmd")
     timeout = float(payload.get("timeout") or 600.0)
     env = payload.get("env") or {}
-    cwd = Path(payload.get("cwd") or "/repo")
+    cwd = Path(payload.get("cwd") or "/testbed")
 
     max_stdout_bytes = payload.get("max_stdout_bytes")
     try:
@@ -201,7 +201,7 @@ def main() -> int:
                 if not issue_id:
                     print(json.dumps({"ok": False, "error": "issue_id is required for op=build_graph"}))
                     return 1
-                repo = str(payload.get("repo") or "/repo")
+                repo = str(payload.get("repo") or "/testbed")
                 py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/mnt/share/MARL_CGM-main:/gp"
                 build_cmd = (
                     f"{py} python -m graph_planner.tools.swe_build_graph "
@@ -218,7 +218,7 @@ def main() -> int:
                     cwd=cwd,
                 )
             elif op == "build_repo_graph":
-                repo = str(payload.get("repo") or "/repo")
+                repo = str(payload.get("repo") or "/testbed")
                 py = "PYTHONPATH=$PYTHONPATH:/mnt/share/MARL_CGM:/mnt/share/MARL_CGM-main:/gp"
                 build_cmd = (
                     f"{py} python -m graph_planner.tools.swe_build_graph "
