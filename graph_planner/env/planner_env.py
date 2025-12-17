@@ -228,7 +228,7 @@ class PlannerEnv:
         self.last_info: Dict[str, Any] = {}
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
         if getattr(self.box, "_mode", None) == "remote_swe":
-            self.repo_root_in_container = "/testbed"
+            self.repo_root_in_container = "/repo"
         # Optional host repo root for per-env graph scanning.
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
@@ -282,11 +282,8 @@ class PlannerEnv:
                 repo_json = self.box.build_issue_subgraph(self.issue_id)
                 self.repo_graph = subgraph_store.wrap(repo_json)
 
-            except Exception as exc:
-                # Fail fast: without repo_graph, explore/find/expand would silently degrade and waste steps.
-                raise RuntimeError(
-                    f"remote_swe build_issue_subgraph failed (issue_id={self.issue_id}, workdir={self.repo_root_in_container})"
-                ) from exc
+            except Exception:
+                self.repo_graph = subgraph_store.new()
         else:
             # 本地 backend：从 ACI 子图缓存加载（如有需要可触发扫描构图）
             if hasattr(graph_adapter, "set_repo_root") and self.repo_root_host:
@@ -302,8 +299,16 @@ class PlannerEnv:
 
 
         # Keep graph_adapter aligned with repo_graph (mem_candidates / expand).
+        # NOTE:
+        #   - subgraph_store.wrap() normalizes "nodes" into a dict keyed by node_id.
+        #   - Iterating a dict yields keys (str), not node dicts.
+        #   - For remote_swe, container workdir is typically /testbed (not /repo).
         try:
-            root = "/testbed" if getattr(self.box, "_mode", None) == "remote_swe" else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
+            root = (
+                (getattr(self.box, "workdir", None) or "/testbed")
+                if getattr(self.box, "_mode", None) == "remote_swe"
+                else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
+            )
             if hasattr(graph_adapter, "set_repo_root"):
                 graph_adapter.set_repo_root(root)
             if hasattr(graph_adapter, "connect_from_subgraph"):
@@ -317,10 +322,17 @@ class PlannerEnv:
         self._repo_nodes_by_id = {}
         self._repo_edges = []
         if self.repo_graph is not None:
-            for n in getattr(self.repo_graph, "nodes", []):
-                nid = n.get("id")
-                if isinstance(nid, str):
-                    self._repo_nodes_by_id[nid] = n
+            nodes_store = getattr(self.repo_graph, "nodes", {}) or {}
+            it = nodes_store.values() if isinstance(nodes_store, dict) else nodes_store
+            for n in it:
+                if isinstance(n, dict):
+                    nid = n.get("id")
+                    if isinstance(nid, str):
+                        self._repo_nodes_by_id[nid] = n
+                elif isinstance(n, str):
+                    # best-effort: allow callers to pass node ids
+                    # (we may fill full node dict later when needed)
+                    self._repo_nodes_by_id.setdefault(n, {"id": n})
             self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
 
         # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
@@ -1239,7 +1251,7 @@ class PlannerEnv:
         """Read snippet lines for a node.
 
         - local backends: read from evaluator filesystem
-        - remote_swe: read inside remote container (repo root fixed at /testbed)
+        - remote_swe: read inside remote container (repo root fixed at /repo)
         """
         try:
             if isinstance(node, str):
@@ -1259,7 +1271,7 @@ class PlannerEnv:
 
             # remote_swe: run inside container
             if getattr(self.box, "_mode", None) == "remote_swe":
-                abs_path = os.path.join("/testbed", path)
+                abs_path = os.path.join("/repo", path)
                 req = {"path": abs_path, "start": start_line, "end": end_line}
                 b64 = base64.b64encode(json.dumps(req).encode("utf-8")).decode("ascii")
                 py = r"""
