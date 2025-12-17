@@ -1,5 +1,6 @@
 # ===== caches & tmp =====
 .cache/
+gp_cache/
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 __pycache__/
