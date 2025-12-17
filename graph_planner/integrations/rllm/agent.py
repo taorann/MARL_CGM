@@ -88,6 +88,33 @@ else:
         # 默认关闭规则 fallback，保持“纯模型”行为
         use_rule_fallback: bool = False
 
+        def _trim_messages(self) -> None:
+            """Keep chat history bounded to avoid exceeding model context.
+
+            We preserve the system message and keep only the most recent
+            ``self._max_history_turns`` conversation turns (a turn is typically a
+            user + assistant pair). This function is safe to call even if the
+            history is shorter than the budget.
+            """
+            try:
+                max_turns = int(getattr(self, "_max_history_turns", 4) or 4)
+            except Exception:
+                max_turns = 4
+            if max_turns <= 0:
+                # Keep system only.
+                if self._messages:
+                    self._messages = [self._messages[0]]
+                return
+            if not getattr(self, "_messages", None):
+                return
+            system = self._messages[0]
+            tail = list(self._messages[1:])
+            # Keep last 2*max_turns messages from tail (user/assistant pairs).
+            keep = 2 * max_turns
+            if len(tail) > keep:
+                tail = tail[-keep:]
+            self._messages = [system] + tail
+
         def _trace_id(self) -> str:
             obs = self._last_env_observation or {}
             if isinstance(obs, dict):
@@ -122,6 +149,11 @@ else:
             self._last_env_observation: Dict[str, Any] | None = None
             self._step_index = 0
             self._state = _AgentState()
+            # Planner chat history trimming (keep last N turns, plus system).
+            try:
+                self._max_history_turns = int(os.environ.get(\"GP_PLANNER_MAX_HISTORY_TURNS\", \"4\"))
+            except Exception:
+                self._max_history_turns = 4
             self._config: Config = load_config()
             if self.use_rule_fallback:
                 self._maybe_init_rule_fallback()
@@ -169,9 +201,8 @@ else:
                     f"reward={reward} done={done} kind={kind} op={op}"
                 )
             text, metadata = summarise_observation(
-                observation, reward, done, info, include_issue=not self._sent_issue_once
+                observation, reward, done, info, include_issue=True
             )
-            self._sent_issue_once = True
             if self._trajectory.steps:
                 prior = self._trajectory.steps[-1]
                 prior.next_observation = text
@@ -179,6 +210,7 @@ else:
                 prior.done = done
                 prior.info = {**prior.info, **metadata}
             self._messages.append({"role": "user", "content": text})
+            self._trim_messages()
             self._cur_step = Step(observation=text, info=metadata)
             self._cur_step.chat_completions = list(self._messages)
             self._last_env_observation = observation
@@ -211,6 +243,7 @@ else:
                     f"type={tp} thought={thought_preview!r} action={action_json}"
                 )
             self._messages.append({"role": "assistant", "content": assistant_msg})
+            self._trim_messages()
 
             self._cur_step.thought = thought
             self._cur_step.action = action_to_payload(action_obj)
@@ -340,22 +373,26 @@ else:
         # ------------------------------------------------------------------
         # Patch helpers
         # ------------------------------------------------------------------
+        
         def _update_state(self, observation: Dict[str, Any]) -> None:
             """保存最近一次环境信息，供补丁生成器使用。"""
 
             issue = observation.get("issue") or {}
             if issue and not self._state.issue:
                 self._state.issue = issue
+
             info = observation.get("last_info") or {}
             kind = info.get("kind")
-            if kind == "explore" and info.get("op") == "expand":
+            op = info.get("op")
+
+            # Explore: op is either find or expand
+            if kind == "explore" and op in ("find", "expand"):
                 self._state.last_candidates = info.get("candidates", [])
+                # no separate read phase anymore
                 self._state.phase = "memory"
             elif kind == "memory":
                 self._state.last_memory = info
-                self._state.phase = "read"
-            elif kind == "explore" and info.get("op") == "read":
-                self._state.last_snippets = info.get("snippets", [])
+                # after memory, proceed to planning/repair
                 self._state.phase = "plan"
             elif kind == "repair":
                 self._state.last_repair = info
