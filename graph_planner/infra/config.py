@@ -10,7 +10,7 @@ Step 4.0：配置定稿
 - Collater 配置（预算、片段上限、是否交错测试片段、轻量重排开关）
 - CGM 配置（是否启用、endpoint/key/model/温度/超时/最大tokens）
 
-优先级：环境变量 > .aci/config.json > 默认值
+优先级：环境变量 > gp_cache/config.json（legacy: .aci/config.json） > 默认值
 """
 
 import argparse
@@ -980,7 +980,7 @@ def serialise_resolved_config(config: Mapping[str, Any], path: Path) -> None:
 
 def load() -> Config:
     """
-    读取仓库默认配置和 .aci/config.json（若存在）并套用环境变量覆盖。
+    读取仓库默认配置和 gp_cache/config.json（若存在，legacy: .aci/config.json）并套用环境变量覆盖。
     """
     cfg = Config()  # defaults
 
@@ -992,8 +992,15 @@ def load() -> Config:
         cfg = _dict_to_config(merged_defaults)
 
     # 1) 从文件合并
-    file_path = os.environ.get("ACI_CONFIG", os.path.join(".aci", "config.json"))
+    # 1) 从文件合并
+    # Prefer a non-hidden cache dir (gp_cache/config.json) but keep legacy .aci/config.json as fallback.
+    cache_root = os.environ.get("GP_GRAPH_CACHE_ROOT") or os.environ.get("GP_ACI_ROOT") or "gp_cache"
+    file_path = os.environ.get("ACI_CONFIG") or os.path.join(cache_root, "config.json")
     raw = _load_json_file(file_path)
+    if not raw:
+        legacy_path = os.path.join(".aci", "config.json")
+        if legacy_path != file_path:
+            raw = _load_json_file(legacy_path)
     if raw:
         # dataclass -> dict
         merged = asdict(cfg)
