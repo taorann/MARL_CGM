@@ -79,8 +79,8 @@ def choose_executable(candidates: List[List[str]]) -> Optional[List[str]]:
 
 def ensure_backup(path: str) -> str:
     """
-    为被编辑的文件创建时间戳备份：.aci/backups/<relpath>.<ts>.bak
-    Create timestamped backup under .aci/backups preserving relative tree.
+    为被编辑的文件创建时间戳备份：graph_planner/backups/<relpath>.<ts>.bak
+    Create timestamped backup under graph_planner/backups preserving relative tree.
     """
     root = repo_root()
     rel = os.path.relpath(os.path.abspath(path), root)
