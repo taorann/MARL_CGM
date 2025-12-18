@@ -138,18 +138,17 @@ Do NOT use a separate "read" op (deprecated). If you need code context, rely on:
 (1) the working subgraph snippets already in the observation, and/or
 (2) candidate snippets attached by explore.find.
 
+
 For memory actions, set:
-- intent MUST be exactly one of: "commit" or "delete" (no other words like "analyze").
-  Use "commit" to store a note; use "delete" to remove a note/tag/nodes.
-- target is optional and should usually be "explore".
-- selector is optional (e.g., "latest", a tag string, or a JSON object).
-- Do NOT include a "scope" field (deprecated).
+- intent must be exactly one of: "commit" or "delete".
+  (You may use natural synonyms like "save"/"remove"; the system will normalise them.)
 
-  Example commit:
-    {"type":"memory","intent":"commit","target":"explore","selector":{"note":"...","tag":"..."}}
+For repair actions, set:
+- plan: a concise step-by-step plan (string or list of short steps). REQUIRED when apply=true.
+- focus_ids: optional list of node ids to focus the patch context (keep it small, e.g. <= 3).
+- apply: true to call CGM and apply a patch; false to only propose a plan.
 
-  Example delete:
-    {"type":"memory","intent":"delete","target":"explore","selector":"latest"}
+If the task is complex, break it into small steps and iterate: explore → repair(apply=true) → test → repeat.
 
 Do not emit any other text outside the block.
 """
@@ -163,12 +162,12 @@ PLANNER_CONTRACT = PlannerContract(
         # Compat: accept legacy params (op/anchors/...) and older "k" wrapper if emitted by older prompts.
         "explore": {"thought", "action", "k", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
         "memory": {"thought", "action", "k", "target", "intent", "selector"},
-        "repair": {"thought", "action", "k", "subplan", "focus_ids", "apply"},
+        "repair": {"thought", "action", "k", "plan", "subplan", "focus_ids", "apply"},
         "submit": {"thought", "action", "k"},
         "noop": {"thought", "action", "k"},
     },
     required_params={
-        "repair": {"subplan"},
+        "repair": set(),
         "memory": {"intent"},
         "explore": set(),
     },
@@ -336,20 +335,6 @@ def parse_action_block(text: str) -> Dict[str, Any]:
 
 
 
-def _normalize_memory_intent(value: Any) -> str:
-    """Coerce memory.intent into {'commit','delete'}.
-
-    Some models emit synonyms (e.g. 'analyze') even though the schema only allows
-    'commit' or 'delete'. Normalising here prevents hard validation failures that
-    would otherwise turn the step into a noop.
-    """
-    raw = str(value or "").strip().lower()
-    if raw in {"commit", "add", "save", "store", "remember", "keep", "record", "log", "write", "analysis", "analyze"}:
-        return "commit"
-    if raw in {"delete", "remove", "forget", "drop", "clear", "purge"}:
-        return "delete"
-    return "commit"
-
 def _coerce_bool(value: Any, *, default: bool = True) -> bool:
     if value is None:
         return default
@@ -471,7 +456,7 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         # ensure type matches
         if "type" not in action_payload and action_name:
             action_payload["type"] = action_name
-        # merge into params so legacy validators can read fields like op/intent/subplan
+        # merge into params so legacy validators can read fields like op/intent/plan
         params.update(action_payload)
     meta: Dict[str, Any] = {}
 
@@ -628,25 +613,60 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         )
     if action_name == "memory":
         target = str(params.get("target", "explore"))
-        intent = _normalize_memory_intent(params.get("intent", "commit"))
+        intent_raw = str(params.get("intent", "commit") or "commit").strip().lower()
+        # Normalise natural synonyms to strict intents.
+        if intent_raw in {"commit", "save", "store", "remember", "keep", "add"}:
+            intent = "commit"
+        elif intent_raw in {"delete", "remove", "drop", "forget", "clear"}:
+            intent = "delete"
+        else:
+            raise ProtocolError(
+                PlannerErrorCode.UNKNOWN_PARAM.value,
+                f"unknown memory intent: {intent_raw!r} (use 'commit' or 'delete')",
+            )
         selector = params.get("selector")
         # 兼容旧版：scope 字段存在时忽略
         if isinstance(selector, str):
             selector = selector.strip() or None
         return _attach_meta(MemoryAction(target=target, intent=intent, selector=selector), meta)
+
     if action_name == "repair":
-        subplan = params.get("subplan")
-        if not isinstance(subplan, str) or not subplan.strip():
-            raise ProtocolError(PlannerErrorCode.MISSING_REQUIRED_PARAM.value, "repair action requires non-empty subplan")
-        focus_ids = _ensure_str_list(params.get("focus_ids"))
         apply_flag = _coerce_bool(params.get("apply"), default=True)
-        plan_targets = [
-            {"id": fid, "why": "planner-focus"}
-            for fid in focus_ids
-            if fid
-        ]
+
+        # Unified field name: prefer `plan`, but accept legacy `subplan`.
+        plan_raw = params.get("plan")
+        if plan_raw is None:
+            plan_raw = params.get("subplan")
+
+        plan_text = ""
+        if isinstance(plan_raw, list):
+            steps = [str(s).strip() for s in plan_raw if str(s).strip()]
+            plan_text = "\n".join(f"- {s}" for s in steps)
+        elif isinstance(plan_raw, str):
+            plan_text = plan_raw.strip()
+        elif plan_raw is None:
+            plan_text = ""
+        else:
+            plan_text = str(plan_raw).strip()
+
+        # Be strict when we're about to apply a patch.
+        if apply_flag and not plan_text:
+            raise ProtocolError(
+                PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                "repair action requires non-empty plan when apply=true",
+            )
+
+        focus_ids = _ensure_str_list(params.get("focus_ids"))
+        plan_targets = [{"id": fid, "why": "planner-focus"} for fid in focus_ids if fid]
+
         return _attach_meta(
-            RepairAction(apply=apply_flag, issue={}, plan=subplan.strip(), plan_targets=plan_targets, patch=None),
+            RepairAction(
+                apply=apply_flag,
+                issue={},
+                plan=(plan_text or None),
+                plan_targets=plan_targets,
+                patch=None,
+            ),
             meta,
         )
 
