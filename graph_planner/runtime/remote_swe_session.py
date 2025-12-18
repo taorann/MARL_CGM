@@ -143,7 +143,7 @@ class RemoteSweSession:
             "run_id": self.run_id,
             "image": self.image,
             "timeout": effective_timeout,
-            "cwd": cwd or "/testbed",
+            "cwd": cwd or "/repo",
         }
         return self._call_proxy(payload, timeout=effective_timeout)
 
