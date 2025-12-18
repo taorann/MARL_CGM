@@ -36,6 +36,11 @@ HEARTBEAT_PATH = RUNNER_ROOT / "heartbeat.json"
 # 当前 runner 正在服务的 run_id；None 表示空闲
 CURRENT_RUN_ID: Optional[str] = None
 
+# Lock timestamp (seconds since epoch). Used to detect stale locks.
+CURRENT_LOCK_TS: Optional[float] = None
+# The .sif path currently running in this runner's instance (best-effort).
+CURRENT_SIF_PATH: Optional[str] = None
+
 
 def _image_to_sif(image: str) -> Path:
     """Best-effort map a docker_image string to a local .sif path.
@@ -133,6 +138,25 @@ def _ensure_dir(p: Path) -> None:
 
 def _now() -> float:
     return time.time()
+
+
+def _instance_is_running() -> bool:
+    """Return True iff the apptainer instance name is currently running."""
+    try:
+        proc = subprocess.run(
+            [APPTAINER_BIN, "instance", "list"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    # apptainer instance list prints a table; substring match is good enough
+    return INSTANCE_NAME in (proc.stdout or "")
+
 
 
 def _write_ready() -> None:
@@ -334,14 +358,41 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
       - If CURRENT_RUN_ID == req.run_id: idempotent start (ok=True).
       - Otherwise: return busy.
     """
-    global CURRENT_RUN_ID
+    global CURRENT_RUN_ID, CURRENT_LOCK_TS, CURRENT_SIF_PATH
     assert req.sif_path
 
-    workdir_host, _ = _resolve_cwd(req.cwd, req.run_id)
+    workdir_host, container_pwd = _resolve_cwd(req.cwd, req.run_id)
 
     env = os.environ.copy()
     if req.env:
         env.update(req.env)
+
+    # If the runner believes it's busy but the underlying instance is gone, release the lock.
+    if CURRENT_RUN_ID is not None and not _instance_is_running():
+        CURRENT_RUN_ID = None
+        CURRENT_LOCK_TS = None
+        CURRENT_SIF_PATH = None
+
+    # If runner is idle but an old instance still exists (e.g., previous run crashed), stop it.
+    if CURRENT_RUN_ID is None and _instance_is_running():
+        try:
+            subprocess.run(
+                [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+        except Exception:
+            pass
+        CURRENT_SIF_PATH = None
+
+    # Stale-lock TTL: if the lock is old and instance is not running, drop it.
+    ttl = float(os.environ.get("GP_RUNNER_LOCK_TTL_SEC", "3600"))
+    if CURRENT_LOCK_TS is not None and (_now() - CURRENT_LOCK_TS) > ttl and not _instance_is_running():
+        CURRENT_RUN_ID = None
+        CURRENT_LOCK_TS = None
+        CURRENT_SIF_PATH = None
 
     if CURRENT_RUN_ID is None:
         cmd = [
@@ -351,9 +402,16 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             "--cleanenv",
             "--bind",
             f"{SHARE_ROOT}:/mnt/share",
+        ]
+        if container_pwd:
+            cmd.extend(["--pwd", container_pwd])
+        cmd.extend([
             req.sif_path,
             INSTANCE_NAME,
-        ]
+            "/bin/sh",
+            "-lc",
+            "while true; do sleep 3600; done",
+        ])
         t0 = _now()
         proc = subprocess.run(
             cmd,
@@ -368,6 +426,8 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
 
         if proc.returncode == 0:
             CURRENT_RUN_ID = req.run_id
+        CURRENT_LOCK_TS = _now()
+        CURRENT_SIF_PATH = req.sif_path
 
         return QueueResponse(
             req_id=req.req_id,
@@ -383,43 +443,34 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
         )
 
     if CURRENT_RUN_ID == req.run_id:
-        return QueueResponse(
-            req_id=req.req_id,
-            runner_id=req.runner_id,
-            run_id=req.run_id,
-            type=req.type,
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="instance already started for this run_id",
-            runtime_sec=0.0,
-            error=None,
-        )
-
-    msg = f"runner busy: current_run_id={CURRENT_RUN_ID}, new_run_id={req.run_id}"
-    return QueueResponse(
-        req_id=req.req_id,
-        runner_id=req.runner_id,
-        run_id=req.run_id,
-        type=req.type,
-        ok=False,
-        returncode=1,
-        stdout="",
-        stderr=msg,
-        runtime_sec=0.0,
-        error=msg,
-    )
-
-def handle_instance_exec(req: QueueRequest) -> QueueResponse:
-    """Execute a command inside this runner's apptainer instance."""
-    global CURRENT_RUN_ID
-    assert req.cmd
-
-    workdir_host, container_pwd = _resolve_cwd(req.cwd, req.run_id)
-
-    env = os.environ.copy()
-    if req.env:
-        env.update(req.env)
+        # Idempotent start: if instance is alive and image matches, we are done.
+        if _instance_is_running() and (CURRENT_SIF_PATH is None or CURRENT_SIF_PATH == req.sif_path):
+            return QueueResponse(
+                req_id=req.req_id,
+                runner_id=req.runner_id,
+                run_id=req.run_id,
+                type=req.type,
+                ok=True,
+                returncode=0,
+                stdout="",
+                stderr="instance already started for this run_id",
+                runtime_sec=0.0,
+                error=None,
+            )
+        # Otherwise, restart the instance (e.g., instance exited).
+        try:
+            subprocess.run(
+                [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+        except Exception:
+            pass
+        CURRENT_RUN_ID = None
+        CURRENT_LOCK_TS = None
+        CURRENT_SIF_PATH = None
 
     if CURRENT_RUN_ID is None:
         msg = "no active run_id on this runner; call instance_start first"
@@ -492,7 +543,7 @@ def handle_instance_exec(req: QueueRequest) -> QueueResponse:
 
 def handle_instance_stop(req: QueueRequest) -> QueueResponse:
     """Stop this runner's apptainer instance."""
-    global CURRENT_RUN_ID
+    global CURRENT_RUN_ID, CURRENT_LOCK_TS, CURRENT_SIF_PATH
 
     workdir_host, _ = _resolve_cwd(req.cwd, req.run_id)
 
@@ -542,6 +593,13 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
         timeout=req.timeout_sec or None,
     )
     t1 = _now()
+    # Even if apptainer reports non-zero (e.g., "no instance found"), if the instance is not running,
+    # release the runner lock so the next container can be started on this runner.
+    if not _instance_is_running():
+        CURRENT_RUN_ID = None
+        CURRENT_LOCK_TS = None
+        CURRENT_SIF_PATH = None
+
 
     if proc.returncode == 0:
         CURRENT_RUN_ID = None
