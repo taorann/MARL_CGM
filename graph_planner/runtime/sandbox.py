@@ -1,5 +1,5 @@
 # graph_planner/runtime/sandbox.py
-import os, json, random, string, time, shutil, tempfile, base64, shlex
+import os, json, random, string, time, shutil, tempfile, base64, shlex, re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
