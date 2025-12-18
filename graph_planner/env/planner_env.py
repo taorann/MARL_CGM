@@ -228,7 +228,7 @@ class PlannerEnv:
         self.last_info: Dict[str, Any] = {}
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
         if getattr(self.box, "_mode", None) == "remote_swe":
-            self.repo_root_in_container = "/repo"
+            self.repo_root_in_container = "/testbed"
         # Optional host repo root for per-env graph scanning.
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
@@ -276,57 +276,63 @@ class PlannerEnv:
         backend_mode = getattr(self.box, "_mode", None)
 
         # === 1) 构建完整仓库图 repo_graph ===
-        if backend_mode == "remote_swe" and hasattr(self.box, "build_repo_graph"):
-            # remote_swe 模式：先确保有一份可用的全仓库 repo_graph（通常只需要构建/加载一次）
+        # === 1) 构建/加载完整仓库图 repo_graph（只读） ===
+        if backend_mode == "remote_swe":
+            # remote_swe：repo_graph 与容器实例（task_id + image）绑定；不做 issue-conditioned 初始子图。
             try:
-                cache_path = self.box.build_repo_graph(self.issue_id)
-                from pathlib import Path
-
-                if hasattr(self.box, "_load_repo_graph_jsonl"):
-                    repo_json = self.box._load_repo_graph_jsonl(Path(cache_path))
+                if hasattr(self.box, "load_repo_graph"):
+                    repo_id = str(self.issue.get("repo") or self.issue.get("repo_id") or "repo")
+                    repo_json = self.box.load_repo_graph(repo_id=repo_id)
+                elif hasattr(self.box, "build_issue_subgraph"):
+                    # 向后兼容：旧接口名叫 build_issue_subgraph，但语义应等价于加载 repo_graph。
+                    repo_json = self.box.build_issue_subgraph(self.issue_id)
                 else:
-                    # Fallback: treat as empty graph if loader is unavailable
                     repo_json = {"nodes": [], "edges": []}
-
                 self.repo_graph = subgraph_store.wrap(repo_json)
             except Exception:
                 self.repo_graph = subgraph_store.new()
-
-        elif backend_mode == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
-            # 兼容旧实现：如果没有 build_repo_graph，则退化为 build_issue_subgraph（但仍按“全仓库图”对待）
+        else:
+            # 本地 backend：从 ACI 子图缓存加载（如有需要可触发扫描构图）
+            graph_adapter.set_repo_root(self.repo_root_host)
             try:
-                repo_json = self.box.build_issue_subgraph(self.issue_id)
-                self.repo_graph = subgraph_store.wrap(repo_json)
+                graph_adapter.connect()
+            except Exception:
+                pass
+            try:
+                self.repo_graph = subgraph_store.load(self.issue_id)
             except Exception:
                 self.repo_graph = subgraph_store.new()
 
-            # NOTE:
-            # repo_graph.nodes 的具体形态可能是：
-            #   - list[dict]   (每个元素是 {id:..., ...})
-            #   - dict[str,dict] (id -> node)
-            #   - list[str]   (仅包含 node id)
-            # 为了避免 reset 阶段因为 "str has no attribute get" 直接崩溃，这里做一次兼容。
 
-            nodes_obj = getattr(self.repo_graph, "nodes", [])
+        # Keep graph_adapter aligned with repo_graph (mem_candidates / expand).
+        try:
+            root = "/testbed" if getattr(self.box, "_mode", None) == "remote_swe" else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
+            if hasattr(graph_adapter, "set_repo_root"):
+                graph_adapter.set_repo_root(root)
+            if hasattr(graph_adapter, "connect_from_subgraph"):
+                graph_adapter.connect_from_subgraph(self.repo_graph, root=root)
+            elif hasattr(graph_adapter, "connect_from_nodes_edges"):
+                graph_adapter.connect_from_nodes_edges(list(getattr(self.repo_graph, "nodes", {}).values()) if isinstance(getattr(self.repo_graph, "nodes", None), dict) else getattr(self.repo_graph, "nodes", []), getattr(self.repo_graph, "edges", []), root=root)  # type: ignore
+        except Exception:
+            pass
+
+        # Repo 索引
+        self._repo_nodes_by_id = {}
+        self._repo_edges = []
+        if self.repo_graph is not None:
+            nodes_obj = getattr(self.repo_graph, "nodes", {})
             if isinstance(nodes_obj, dict):
-                node_iter = nodes_obj.values()
+                nodes_iter = nodes_obj.values()
+            elif isinstance(nodes_obj, list):
+                nodes_iter = nodes_obj
             else:
-                node_iter = nodes_obj or []
-
-            for n in node_iter:
-                # 1) 最常见：dict node
-                if isinstance(n, dict):
-                    nid = n.get("id")
-                    if isinstance(nid, str) and nid:
-                        self._repo_nodes_by_id[nid] = n
+                nodes_iter = []
+            for n in nodes_iter:
+                if not isinstance(n, dict):
                     continue
-
-                # 2) 退化：直接给了字符串 id
-                if isinstance(n, str) and n:
-                    self._repo_nodes_by_id[n] = {"id": n}
-                    continue
-
-                # 3) 其它类型：忽略
+                nid = n.get("id")
+                if isinstance(nid, str):
+                    self._repo_nodes_by_id[nid] = n
             self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
 
         # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
