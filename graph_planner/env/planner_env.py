@@ -393,13 +393,33 @@ class PlannerEnv:
             pass
 
         # Repo 索引
+        # NOTE: WorkingSubgraph.nodes 在不同实现里可能是:
+        #   1) List[Dict]  (json obj 直接透传)
+        #   2) Dict[str, Dict]  (wrap 后按 id 索引)
+        # 旧代码直接 `for n in nodes: n.get(...)` 会在 Dict 情况下拿到 key(str) 而崩溃。
         self._repo_nodes_by_id = {}
         self._repo_edges = []
         if self.repo_graph is not None:
-            for n in getattr(self.repo_graph, "nodes", []):
-                nid = n.get("id")
-                if isinstance(nid, str):
-                    self._repo_nodes_by_id[nid] = n
+            nodes_store = getattr(self.repo_graph, "nodes", None)
+            if isinstance(nodes_store, dict):
+                # nodes_store: id -> node
+                for nid, node in nodes_store.items():
+                    if isinstance(nid, str) and isinstance(node, dict):
+                        self._repo_nodes_by_id[nid] = node
+                    elif isinstance(nid, str):
+                        # 极端兜底：至少保留 id
+                        self._repo_nodes_by_id[nid] = {"id": nid}
+            else:
+                for n in (nodes_store or []):
+                    if isinstance(n, dict):
+                        nid = n.get("id")
+                        if isinstance(nid, str):
+                            self._repo_nodes_by_id[nid] = n
+                    elif isinstance(n, str) and isinstance(nodes_store, dict):
+                        # 兼容：如果混入了 id 字符串
+                        node = nodes_store.get(n)
+                        if isinstance(node, dict):
+                            self._repo_nodes_by_id[n] = node
             self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
 
         # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
