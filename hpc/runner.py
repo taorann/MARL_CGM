@@ -353,8 +353,6 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
         "--bind",
         f"{SHARE_ROOT}:/mnt/share",
     ]
-    if container_pwd:
-        cmd.extend(["--pwd", container_pwd])
     cmd.extend([req.sif_path, INSTANCE_NAME, "bash", "-lc", keepalive_cmd])
 
     t0 = _now()
