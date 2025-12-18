@@ -1,6 +1,5 @@
 # ===== caches & tmp =====
 .cache/
-gp_cache/
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 __pycache__/
@@ -32,3 +31,7 @@ datasets/*
 !datasets/**/eval.jsonl
 
 
+
+# ===== GraphPlanner artifacts (local) =====
+gp_artifacts/
+.aci/
