@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
 
-DEBUG = bool(os.environ.get("DEBUG"))
+DEBUG = str(os.environ.get("DEBUG", "")).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _dbg(msg: str) -> None:
@@ -478,6 +478,124 @@ class PlannerEnv:
                 flush = getattr(tel, "flush", None) or getattr(tel, "close", None)
                 if callable(flush):
                     flush()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Telemetry helpers
+    # ------------------------------------------------------------------
+    def _telemetry_obs_summary(self) -> Dict[str, Any]:
+        """Return a compact, structured summary of the current observation state.
+
+        Keep this small and stable: it will be written to JSONL and may be printed.
+        """
+
+        def _sg_stats(sg: Any) -> Dict[str, Any]:
+            try:
+                return subgraph_store.stats(sg)
+            except Exception:
+                return {"nodes": 0, "edges": 0}
+
+        summary: Dict[str, Any] = {
+            "step": int(getattr(self, "steps", 0) or 0),
+            "backend_mode": getattr(getattr(self, "box", None), "_mode", None),
+            "repo": _sg_stats(getattr(self, "repo_graph", None)) if getattr(self, "repo_graph", None) else None,
+            "working": _sg_stats(getattr(self, "working_subgraph", None)),
+            "memory": _sg_stats(getattr(self, "memory_subgraph", None)),
+            "last_candidates": len(getattr(self, "last_candidates", None) or []),
+            "last_reads": len(getattr(self, "last_reads", None) or []),
+        }
+        try:
+            if isinstance(getattr(self, "last_info", None), dict):
+                k = self.last_info.get("kind")
+                op = self.last_info.get("op")
+                if k:
+                    summary["last_kind"] = k
+                if op:
+                    summary["last_op"] = op
+        except Exception:
+            pass
+        return summary
+
+    def _telemetry_log_step_end(
+        self,
+        *,
+        action: Dict[str, Any],
+        info: Dict[str, Any],
+        reward: float,
+        done: bool,
+        t0: float,
+    ) -> None:
+        """Best-effort step logging and console debug prints."""
+
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        kind = (info.get("kind") if isinstance(info, dict) else None) or None
+        op = (info.get("op") if isinstance(info, dict) else None) or None
+        stop_reason = (info.get("stop_reason") if isinstance(info, dict) else None) or None
+
+        obs_summary = self._telemetry_obs_summary()
+
+        # JSONL trajectory
+        try:
+            self.telemetry.set_step(self.steps)
+            self.telemetry.log_step(
+                {
+                    "action": action,
+                    "kind": kind,
+                    "op": op,
+                    "reward": float(reward),
+                    "done": bool(done),
+                    "stop_reason": stop_reason,
+                    "dt_ms": float(dt_ms),
+                    "info": info,
+                    "obs_summary": obs_summary,
+                }
+            )
+            # A couple of cheap scalar metrics for quick grepping
+            self.telemetry.metric("env.reward", float(reward), step_id=self.steps)
+            if stop_reason:
+                self.telemetry.metric(f"env.stop_reason.{stop_reason}", 1.0, step_id=self.steps)
+        except Exception:
+            pass
+
+        # Console prints (one line per step; gated by env var)
+        try:
+            print_ops = _safe_bool(os.environ.get("GP_PRINT_OPS"), default=DEBUG) or _safe_bool(
+                os.environ.get("GRAPH_PLANNER_PRINT_OPS"), default=False
+            )
+            if print_ops:
+                rid = int(getattr(self, "runner_id", 0) or 0)
+                cand_n = 0
+                try:
+                    cand_n = len((info.get("candidates") if isinstance(info, dict) else None) or (getattr(self, "last_candidates", None) or []))
+                except Exception:
+                    cand_n = len(getattr(self, "last_candidates", None) or [])
+                w_nodes = (obs_summary.get("working") or {}).get("nodes") if isinstance(obs_summary.get("working"), dict) else None
+                m_nodes = (obs_summary.get("memory") or {}).get("nodes") if isinstance(obs_summary.get("memory"), dict) else None
+                extra = ""
+                if kind == "explore" and isinstance(info, dict) and info.get("query_terms"):
+                    try:
+                        extra = f" query={info.get('query_terms')[:6]}"
+                    except Exception:
+                        extra = ""
+                print(
+                    f"[gp-env {rid:02d}] step={self.steps} kind={kind} op={op} reward={reward:.4f} done={done}"
+                    f" stop={stop_reason} cand={cand_n} working_nodes={w_nodes} memory_nodes={m_nodes} dt_ms={dt_ms:.1f}{extra}"
+                )
+        except Exception:
+            pass
+
+        # Episode lifecycle
+        if done:
+            try:
+                self.telemetry.end_episode(
+                    status=str(stop_reason or "done"),
+                    summary={
+                        "steps": int(getattr(self, "steps", 0) or 0),
+                        "stop_reason": stop_reason,
+                        "final_obs_summary": obs_summary,
+                    },
+                )
             except Exception:
                 pass
 
