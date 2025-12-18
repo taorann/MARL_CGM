@@ -5,9 +5,8 @@ import os
 import shutil
 import subprocess
 import time
-import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from graph_planner.runtime.queue_protocol import (
     QueueRequest,
@@ -25,111 +24,22 @@ RUNNER_ID = int(os.environ["RUNNER_ID"])
 SHARE_ROOT = Path(os.environ["SHARE_ROOT"])
 POLL_INTERVAL_SEC = float(os.environ.get("RUNNER_POLL_INTERVAL", "0.5"))
 
-# 一个 runner ⇔ 一个容器：名字固定为 gp-00/gp-01/...
+# 一个 runner ⇔ 一个 apptainer instance（名字固定为 gp-00/gp-01/...）
 INSTANCE_NAME = f"gp-{RUNNER_ID:02d}"
 
-# Runner liveness markers (used by ApptainerQueueRuntime to avoid routing to pending runners)
+# Runner liveness markers (used by proxy-side routing)
 RUNNER_ROOT = QUEUE_ROOT / f"runner-{RUNNER_ID}"
 READY_PATH = RUNNER_ROOT / "ready.json"
 HEARTBEAT_PATH = RUNNER_ROOT / "heartbeat.json"
 
-# 当前 runner 正在服务的 run_id；None 表示空闲
+# 绑定状态（不允许 handle_one_request 无脑覆盖）
 CURRENT_RUN_ID: Optional[str] = None
+CURRENT_TASK_ID: Optional[str] = None
+CURRENT_IMAGE: Optional[str] = None
+CURRENT_SIF: Optional[str] = None
+CURRENT_BOUND_AT: Optional[float] = None
 
-# Lock timestamp (seconds since epoch). Used to detect stale locks.
-CURRENT_LOCK_TS: Optional[float] = None
-# The .sif path currently running in this runner's instance (best-effort).
-CURRENT_SIF_PATH: Optional[str] = None
-
-
-def _image_to_sif(image: str) -> Path:
-    """Best-effort map a docker_image string to a local .sif path.
-
-    This matches ApptainerQueueRuntime._image_to_sif and is used as a compatibility
-    fallback if a legacy request omits `sif_path`.
-    """
-    normalized = image.replace("/", "-").replace(":", "-").replace("@", "-")
-    sif_dir = Path(
-        os.environ.get("GP_SIF_DIR")
-        or os.environ.get("SIF_DIR")
-        or str(Path.home() / "sif" / "sweb")
-    ).expanduser().resolve()
-    return sif_dir / f"{normalized}.sif"
-
-
-def _coerce_legacy_to_queue_request(data: Dict[str, Any], *, req_id_fallback: str) -> QueueRequest:
-    """Coerce older/looser request dicts into the QueueRequest schema.
-
-    We have seen cases where the proxy writes an 'op' style payload directly
-    into the runner inbox (missing req_id/runner_id/type). To avoid hard-failing
-    on the runner side, we translate the minimal fields.
-    """
-
-    run_id = str(data.get("run_id") or "")
-    if not run_id:
-        run_id = "__default__"
-
-    # Determine request type.
-    typ = data.get("type")
-    if not typ:
-        op = str(data.get("op") or "").strip().lower()
-        if op == "start":
-            typ = "instance_start"
-        elif op == "exec":
-            typ = "instance_exec"
-        elif op == "stop":
-            typ = "instance_stop"
-        elif op:
-            # Unknown op -> noop
-            typ = "noop"
-        else:
-            typ = "exec"  # legacy one-shot exec
-    typ = str(typ)
-
-    # Command normalization.
-    cmd_val = data.get("cmd")
-    cmd_list = None
-    if isinstance(cmd_val, list):
-        cmd_list = [str(x) for x in cmd_val]
-    elif isinstance(cmd_val, str) and cmd_val:
-        cmd_list = ["bash", "-lc", cmd_val]
-
-    image = data.get("image")
-    sif_path = data.get("sif_path")
-    if not sif_path and isinstance(image, str) and image:
-        sif_path = str(_image_to_sif(image))
-
-    timeout_sec = data.get("timeout_sec")
-    if timeout_sec is None:
-        timeout_sec = data.get("timeout")
-    try:
-        timeout_sec = float(timeout_sec) if timeout_sec is not None else None
-    except Exception:
-        timeout_sec = None
-
-    rid = data.get("runner_id")
-    try:
-        rid = int(rid) if rid is not None else RUNNER_ID
-    except Exception:
-        rid = RUNNER_ID
-
-    req_id = str(data.get("req_id") or req_id_fallback or uuid.uuid4().hex)
-
-    return QueueRequest(
-        req_id=req_id,
-        runner_id=rid,
-        run_id=run_id,
-        type=typ,  # type: ignore[arg-type]
-        image=str(image) if image is not None else None,
-        sif_path=str(sif_path) if sif_path is not None else None,
-        cmd=cmd_list,
-        cwd=str(data.get("cwd")) if data.get("cwd") is not None else None,
-        env=dict(data.get("env") or {}),
-        timeout_sec=timeout_sec,
-        src=str(data.get("src")) if data.get("src") is not None else None,
-        dst=str(data.get("dst")) if data.get("dst") is not None else None,
-        meta=dict(data.get("meta") or {}),
-    )
+LOCK_TTL_SEC = float(os.environ.get("RUNNER_LOCK_TTL_SEC", "7200"))  # 2h 默认
 
 
 def _ensure_dir(p: Path) -> None:
@@ -140,32 +50,8 @@ def _now() -> float:
     return time.time()
 
 
-def _instance_is_running() -> bool:
-    """Return True iff the apptainer instance name is currently running."""
-    try:
-        proc = subprocess.run(
-            [APPTAINER_BIN, "instance", "list"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-        )
-    except Exception:
-        return False
-    if proc.returncode != 0:
-        return False
-    # apptainer instance list prints a table; substring match is good enough
-    return INSTANCE_NAME in (proc.stdout or "")
-
-
-
 def _write_ready() -> None:
-    meta = {
-        "rid": RUNNER_ID,
-        "pid": os.getpid(),
-        "host": os.uname().nodename,
-        "ts": _now(),
-    }
+    meta = {"rid": RUNNER_ID, "pid": os.getpid(), "host": os.uname().nodename, "ts": _now()}
     _ensure_dir(RUNNER_ROOT)
     READY_PATH.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
@@ -177,6 +63,10 @@ def _write_heartbeat(extra: Optional[Dict[str, Any]] = None) -> None:
         "host": os.uname().nodename,
         "ts": _now(),
         "current_run_id": CURRENT_RUN_ID,
+        "current_task_id": CURRENT_TASK_ID,
+        "current_image": CURRENT_IMAGE,
+        "instance": INSTANCE_NAME,
+        "bound_at": CURRENT_BOUND_AT,
     }
     if extra:
         meta.update(extra)
@@ -184,23 +74,81 @@ def _write_heartbeat(extra: Optional[Dict[str, Any]] = None) -> None:
     HEARTBEAT_PATH.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
+def _parse_task_id(run_id: str) -> str:
+    # 形如 gp-<task_id>__<uuid>；兜底返回 run_id
+    if not isinstance(run_id, str):
+        return ""
+    s = run_id
+    if s.startswith("gp-"):
+        s = s[3:]
+    if "__" in s:
+        return s.split("__", 1)[0]
+    return s
+
+
+def _instance_exists() -> bool:
+    try:
+        proc = subprocess.run(
+            [APPTAINER_BIN, "instance", "list"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return False
+        # 输出通常包含 NAME 一列；粗暴匹配即可
+        return INSTANCE_NAME in (proc.stdout or "")
+    except Exception:
+        return False
+
+
+def _is_lock_stale() -> bool:
+    if CURRENT_BOUND_AT is None:
+        return False
+    return (_now() - float(CURRENT_BOUND_AT)) > float(LOCK_TTL_SEC)
+
+
+def _clear_lock(reason: str = "") -> None:
+    global CURRENT_RUN_ID, CURRENT_TASK_ID, CURRENT_IMAGE, CURRENT_SIF, CURRENT_BOUND_AT
+    CURRENT_RUN_ID = None
+    CURRENT_TASK_ID = None
+    CURRENT_IMAGE = None
+    CURRENT_SIF = None
+    CURRENT_BOUND_AT = None
+    _write_heartbeat({"lock_cleared": reason})
+
 
 def _resolve_cwd(req_cwd: str | None, run_id: str) -> tuple[Path, str | None]:
     """Split cwd into a safe host-side cwd and an optional container-side pwd.
 
-    remote_swe often passes container paths like "/repo". The runner must NOT treat
-    them as host paths (would attempt mkdir /repo and fail). We instead:
-      - use a per-run directory under $SHARE_ROOT/gp_work as host cwd;
-      - pass the container path via apptainer --pwd when it looks like an absolute POSIX path.
+    remote_swe passes container paths like "/testbed". Runner must NOT treat them as host paths.
+    We always execute on a host-side per-run directory under $SHARE_ROOT/gp_work, and pass
+    the container path via apptainer --pwd.
     """
     container_pwd: str | None = None
-    if isinstance(req_cwd, str) and req_cwd.startswith('/'):
+    if isinstance(req_cwd, str) and req_cwd.startswith("/"):
         container_pwd = req_cwd
 
-    host_base = Path(os.environ.get('RUNNER_WORKDIR_HOST', str(SHARE_ROOT / 'gp_work')))
+    host_base = Path(os.environ.get("RUNNER_WORKDIR_HOST", str(SHARE_ROOT / "gp_work")))
     host_cwd = host_base / run_id / INSTANCE_NAME
     _ensure_dir(host_cwd)
     return host_cwd, container_pwd
+
+
+def _job_sig_from_req(req: QueueRequest) -> Tuple[str, str]:
+    task_id = ""
+    if isinstance(req.meta, dict) and req.meta.get("task_id"):
+        task_id = str(req.meta.get("task_id") or "")
+    if not task_id:
+        task_id = _parse_task_id(req.run_id)
+    image = str(req.image or "")
+    return task_id, image
+
+
+def _job_sig_current() -> Tuple[str, str]:
+    return str(CURRENT_TASK_ID or ""), str(CURRENT_IMAGE or "")
+
 
 def main() -> None:
     inbox = runner_inbox(QUEUE_ROOT, RUNNER_ID)
@@ -208,7 +156,6 @@ def main() -> None:
     _ensure_dir(inbox)
     _ensure_dir(outbox)
 
-    # mark runner as ready/alive for proxy-side routing
     _write_ready()
     _write_heartbeat()
 
@@ -216,13 +163,16 @@ def main() -> None:
     while True:
         now = _now()
         if now - last_hb >= 2.0:
+            # stale lock auto-heal：锁过期且 instance 不在了
+            if CURRENT_RUN_ID and _is_lock_stale() and (not _instance_exists()):
+                _clear_lock("stale_lock_instance_missing")
             _write_heartbeat()
             last_hb = now
 
         handled = False
         for req_path in sorted(inbox.glob("*.json")):
             handled = True
-            handle_one_request(req_path, outbox)  # must not raise
+            handle_one_request(req_path, outbox)
             try:
                 req_path.unlink()
             except FileNotFoundError:
@@ -235,22 +185,10 @@ def main() -> None:
 def handle_one_request(req_path: Path, outbox: Path) -> None:
     """Always write a response JSON, even if execution fails."""
     req_id = req_path.stem
-    # If request parsing fails, we still want to include run_id (best effort) in the response.
-    parsed_run_id: str = ""
     try:
         data: Dict[str, Any] = json.loads(req_path.read_text(encoding="utf-8"))
-        parsed_run_id = str(data.get("run_id") or "")
-        try:
-            req = QueueRequest(**data)
-        except TypeError:
-            # Backward compatibility: accept legacy payloads (missing req_id/runner_id/type).
-            req = _coerce_legacy_to_queue_request(data, req_id_fallback=req_id)
-            parsed_run_id = req.run_id
-
-        # NOTE: CURRENT_RUN_ID means "which run_id this runner instance is currently bound to".
-        # It must NOT be overwritten on every incoming request, otherwise instance_start becomes
-        # a no-op and later instance_exec will try to exec into a non-existent instance.
-        _write_heartbeat({"last_req_id": req.req_id, "type": req.type, "req_run_id": req.run_id})
+        req = QueueRequest(**data)
+        _write_heartbeat({"last_req_id": req.req_id, "type": req.type, "seen_run_id": req.run_id})
 
         if req.type == "exec":
             resp = handle_exec(req)
@@ -273,13 +211,16 @@ def handle_one_request(req_path: Path, outbox: Path) -> None:
                 run_id=req.run_id,
                 type=req.type,
                 ok=True,
+                returncode=0,
+                stdout="",
+                stderr="noop",
+                runtime_sec=0.0,
             )
     except Exception as e:
-        # If parsing failed, still return a response keyed by filename.
         resp = QueueResponse(
             req_id=req_id,
             runner_id=RUNNER_ID,
-            run_id=parsed_run_id or (CURRENT_RUN_ID or ""),
+            run_id=CURRENT_RUN_ID or "",
             type="noop",
             ok=False,
             returncode=1,
@@ -306,20 +247,10 @@ def handle_exec(req: QueueRequest) -> QueueResponse:
     if req.env:
         env.update(req.env)
 
-    cmd = [
-        APPTAINER_BIN,
-        "exec",
-        "--cleanenv",
-        "--bind",
-        f"{SHARE_ROOT}:/mnt/share",
-    ]
+    cmd = [APPTAINER_BIN, "exec", "--cleanenv", "--bind", f"{SHARE_ROOT}:/mnt/share"]
     if container_pwd:
         cmd.extend(["--pwd", container_pwd])
-
-    cmd.extend([
-        req.sif_path,
-        *req.cmd,
-    ])
+    cmd.extend([req.sif_path, *req.cmd])
 
     t0 = _now()
     proc = subprocess.run(
@@ -351,100 +282,36 @@ def handle_exec(req: QueueRequest) -> QueueResponse:
 
 
 def handle_instance_start(req: QueueRequest) -> QueueResponse:
-    """Start this runner's single apptainer instance.
+    """Start this runner's apptainer instance.
 
-    Rules:
-      - If CURRENT_RUN_ID is None: bind to req.run_id and start.
-      - If CURRENT_RUN_ID == req.run_id: idempotent start (ok=True).
-      - Otherwise: return busy.
+    关键语义（为“runner 不必关、容器可复用”服务）：
+      - runner 固定只有一个 instance 名（gp-00/gp-01/...）
+      - lock 的“身份”是 (task_id, image) 而不是 (run_id)
+      - 新的 run_id 只要指向同一 (task_id, image)，就允许复用并 rebind CURRENT_RUN_ID
+      - 如果 instance 不存在但 lock 还在：自动清锁并允许重新 start
     """
-    global CURRENT_RUN_ID, CURRENT_LOCK_TS, CURRENT_SIF_PATH
+    global CURRENT_RUN_ID, CURRENT_TASK_ID, CURRENT_IMAGE, CURRENT_SIF, CURRENT_BOUND_AT
     assert req.sif_path
 
     workdir_host, container_pwd = _resolve_cwd(req.cwd, req.run_id)
-
     env = os.environ.copy()
     if req.env:
         env.update(req.env)
 
-    # If the runner believes it's busy but the underlying instance is gone, release the lock.
-    if CURRENT_RUN_ID is not None and not _instance_is_running():
-        CURRENT_RUN_ID = None
-        CURRENT_LOCK_TS = None
-        CURRENT_SIF_PATH = None
+    new_task_id, new_image = _job_sig_from_req(req)
+    new_sif = str(req.sif_path or "")
 
-    # If runner is idle but an old instance still exists (e.g., previous run crashed), stop it.
-    if CURRENT_RUN_ID is None and _instance_is_running():
-        try:
-            subprocess.run(
-                [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60,
-            )
-        except Exception:
-            pass
-        CURRENT_SIF_PATH = None
+    # auto-heal stale lock
+    if CURRENT_RUN_ID and (not _instance_exists()):
+        _clear_lock("lock_but_instance_missing")
 
-    # Stale-lock TTL: if the lock is old and instance is not running, drop it.
-    ttl = float(os.environ.get("GP_RUNNER_LOCK_TTL_SEC", "3600"))
-    if CURRENT_LOCK_TS is not None and (_now() - CURRENT_LOCK_TS) > ttl and not _instance_is_running():
-        CURRENT_RUN_ID = None
-        CURRENT_LOCK_TS = None
-        CURRENT_SIF_PATH = None
-
-    if CURRENT_RUN_ID is None:
-        cmd = [
-            APPTAINER_BIN,
-            "instance",
-            "start",
-            "--cleanenv",
-            "--bind",
-            f"{SHARE_ROOT}:/mnt/share",
-        ]
-        if container_pwd:
-            cmd.extend(["--pwd", container_pwd])
-        cmd.extend([
-            req.sif_path,
-            INSTANCE_NAME,
-            "/bin/sh",
-            "-lc",
-            "while true; do sleep 3600; done",
-        ])
-        t0 = _now()
-        proc = subprocess.run(
-            cmd,
-            cwd=str(workdir_host),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=req.timeout_sec or None,
-        )
-        t1 = _now()
-
-        if proc.returncode == 0:
+    if CURRENT_RUN_ID:
+        cur_task, cur_image = _job_sig_current()
+        # 同一 job：允许复用 + rebind run_id
+        if (cur_task == new_task_id) and (cur_image == new_image):
+            old = CURRENT_RUN_ID
             CURRENT_RUN_ID = req.run_id
-        CURRENT_LOCK_TS = _now()
-        CURRENT_SIF_PATH = req.sif_path
-
-        return QueueResponse(
-            req_id=req.req_id,
-            runner_id=req.runner_id,
-            run_id=req.run_id,
-            type=req.type,
-            ok=(proc.returncode == 0),
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            runtime_sec=t1 - t0,
-            error=None if proc.returncode == 0 else "non-zero return code",
-        )
-
-    if CURRENT_RUN_ID == req.run_id:
-        # Idempotent start: if instance is alive and image matches, we are done.
-        if _instance_is_running() and (CURRENT_SIF_PATH is None or CURRENT_SIF_PATH == req.sif_path):
+            CURRENT_BOUND_AT = _now()
             return QueueResponse(
                 req_id=req.req_id,
                 runner_id=req.runner_id,
@@ -453,27 +320,89 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
                 ok=True,
                 returncode=0,
                 stdout="",
-                stderr="instance already started for this run_id",
+                stderr=f"reused instance {INSTANCE_NAME}; rebound from {old}",
                 runtime_sec=0.0,
-                error=None,
+                meta={"reused": "1", "instance": INSTANCE_NAME, "prev_run_id": old},
             )
-        # Otherwise, restart the instance (e.g., instance exited).
-        try:
-            subprocess.run(
-                [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60,
-            )
-        except Exception:
-            pass
-        CURRENT_RUN_ID = None
-        CURRENT_LOCK_TS = None
-        CURRENT_SIF_PATH = None
+        # 不同 job：busy
+        msg = (
+            f"runner busy: current_run_id={CURRENT_RUN_ID}, current_task_id={cur_task}, current_image={cur_image}, "
+            f"new_run_id={req.run_id}, new_task_id={new_task_id}, new_image={new_image}"
+        )
+        return QueueResponse(
+            req_id=req.req_id,
+            runner_id=req.runner_id,
+            run_id=req.run_id,
+            type=req.type,
+            ok=False,
+            returncode=1,
+            stdout="",
+            stderr=msg,
+            runtime_sec=0.0,
+            error=msg,
+            meta={"busy": "1", "current_run_id": str(CURRENT_RUN_ID)},
+        )
+
+    # CURRENT_RUN_ID is None: start fresh
+    keepalive_cmd = "while true; do sleep 3600; done"
+    cmd = [
+        APPTAINER_BIN,
+        "instance",
+        "start",
+        "--cleanenv",
+        "--bind",
+        f"{SHARE_ROOT}:/mnt/share",
+    ]
+    if container_pwd:
+        cmd.extend(["--pwd", container_pwd])
+    cmd.extend([req.sif_path, INSTANCE_NAME, "bash", "-lc", keepalive_cmd])
+
+    t0 = _now()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(workdir_host),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=req.timeout_sec or None,
+    )
+    t1 = _now()
+
+    if proc.returncode == 0:
+        CURRENT_RUN_ID = req.run_id
+        CURRENT_TASK_ID = new_task_id
+        CURRENT_IMAGE = new_image
+        CURRENT_SIF = new_sif
+        CURRENT_BOUND_AT = _now()
+
+    return QueueResponse(
+        req_id=req.req_id,
+        runner_id=req.runner_id,
+        run_id=req.run_id,
+        type=req.type,
+        ok=(proc.returncode == 0),
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+        runtime_sec=t1 - t0,
+        error=None if proc.returncode == 0 else "non-zero return code",
+        meta={"instance": INSTANCE_NAME, "task_id": new_task_id, "image": new_image},
+    )
+
+
+def handle_instance_exec(req: QueueRequest) -> QueueResponse:
+    global CURRENT_RUN_ID, CURRENT_BOUND_AT
+    assert req.cmd
+
+    workdir_host, container_pwd = _resolve_cwd(req.cwd, req.run_id)
+
+    env = os.environ.copy()
+    if req.env:
+        env.update(req.env)
 
     if CURRENT_RUN_ID is None:
-        msg = "no active run_id on this runner; call instance_start first"
+        msg = "no active instance on this runner; call instance_start first"
         return QueueResponse(
             req_id=req.req_id,
             runner_id=req.runner_id,
@@ -486,6 +415,15 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             runtime_sec=0.0,
             error=msg,
         )
+
+    # allow rebind if job signature matches
+    new_task_id, new_image = _job_sig_from_req(req)
+    cur_task, cur_image = _job_sig_current()
+    if (req.run_id != CURRENT_RUN_ID) and (new_task_id == cur_task) and (new_image == cur_image):
+        old = CURRENT_RUN_ID
+        CURRENT_RUN_ID = req.run_id
+        CURRENT_BOUND_AT = _now()
+        _write_heartbeat({"rebind_on_exec": "1", "prev_run_id": old})
 
     if CURRENT_RUN_ID != req.run_id:
         msg = f"runner bound to run_id={CURRENT_RUN_ID}, but got {req.run_id}"
@@ -502,19 +440,10 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
             error=msg,
         )
 
-    cmd = [
-        APPTAINER_BIN,
-        "exec",
-        "--cleanenv",
-        "--bind",
-        f"{SHARE_ROOT}:/mnt/share",
-    ]
+    cmd = [APPTAINER_BIN, "exec", "--cleanenv", "--bind", f"{SHARE_ROOT}:/mnt/share"]
     if container_pwd:
         cmd.extend(["--pwd", container_pwd])
-    cmd.extend([
-        f"instance://{INSTANCE_NAME}",
-        *req.cmd,
-    ])
+    cmd.extend([f"instance://{INSTANCE_NAME}", *req.cmd])
 
     t0 = _now()
     proc = subprocess.run(
@@ -541,17 +470,14 @@ def handle_instance_start(req: QueueRequest) -> QueueResponse:
         error=None if proc.returncode == 0 else "non-zero return code",
     )
 
+
 def handle_instance_stop(req: QueueRequest) -> QueueResponse:
-    """Stop this runner's apptainer instance."""
-    global CURRENT_RUN_ID, CURRENT_LOCK_TS, CURRENT_SIF_PATH
-
     workdir_host, _ = _resolve_cwd(req.cwd, req.run_id)
-
     env = os.environ.copy()
     if req.env:
         env.update(req.env)
 
-    if CURRENT_RUN_ID is None:
+    if CURRENT_RUN_ID is None and (not _instance_exists()):
         return QueueResponse(
             req_id=req.req_id,
             runner_id=req.runner_id,
@@ -560,28 +486,11 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
             ok=True,
             returncode=0,
             stdout="",
-            stderr="no active run_id; stop is a no-op",
+            stderr="no active instance; stop is no-op",
             runtime_sec=0.0,
-            error=None,
-        )
-
-    if CURRENT_RUN_ID != req.run_id:
-        msg = f"runner bound to run_id={CURRENT_RUN_ID}, cannot stop for {req.run_id}"
-        return QueueResponse(
-            req_id=req.req_id,
-            runner_id=req.runner_id,
-            run_id=req.run_id,
-            type=req.type,
-            ok=False,
-            returncode=1,
-            stdout="",
-            stderr=msg,
-            runtime_sec=0.0,
-            error=msg,
         )
 
     cmd = [APPTAINER_BIN, "instance", "stop", INSTANCE_NAME]
-
     t0 = _now()
     proc = subprocess.run(
         cmd,
@@ -593,16 +502,10 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
         timeout=req.timeout_sec or None,
     )
     t1 = _now()
-    # Even if apptainer reports non-zero (e.g., "no instance found"), if the instance is not running,
-    # release the runner lock so the next container can be started on this runner.
-    if not _instance_is_running():
-        CURRENT_RUN_ID = None
-        CURRENT_LOCK_TS = None
-        CURRENT_SIF_PATH = None
 
-
-    if proc.returncode == 0:
-        CURRENT_RUN_ID = None
+    # regardless of stop result, if instance is gone then clear lock
+    if not _instance_exists():
+        _clear_lock("instance_stop")
 
     return QueueResponse(
         req_id=req.req_id,
@@ -616,6 +519,10 @@ def handle_instance_stop(req: QueueRequest) -> QueueResponse:
         runtime_sec=t1 - t0,
         error=None if proc.returncode == 0 else "non-zero return code",
     )
+
+
+# ----------------- put/get/cleanup -----------------
+
 
 def handle_put(req: QueueRequest) -> QueueResponse:
     assert req.src and req.dst
@@ -678,9 +585,6 @@ def handle_get(req: QueueRequest) -> QueueResponse:
 
 
 def handle_cleanup(req: QueueRequest) -> QueueResponse:
-    t0 = _now()
-    t1 = _now()
-
     return QueueResponse(
         req_id=req.req_id,
         runner_id=req.runner_id,
@@ -689,9 +593,8 @@ def handle_cleanup(req: QueueRequest) -> QueueResponse:
         ok=True,
         returncode=0,
         stdout="",
-        stderr="",
-        runtime_sec=t1 - t0,
-        error=None,
+        stderr="cleanup noop",
+        runtime_sec=0.0,
     )
 
 
