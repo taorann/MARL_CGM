@@ -129,6 +129,19 @@ For explore actions, set:
 - op="find"  (use anchors and/or a free-text query to retrieve candidates)
 - op="expand" (use anchors to expand/merge into the working subgraph)
 
+For memory actions, set:
+- intent="commit" or intent="delete"
+- target="explore"  (graph memory: update memory_subgraph) OR target="observation" (text memory notes)
+- selector can be either:
+  * a string tag (e.g., "bugfix", "hypothesis"), OR
+  * a JSON object like {"tag": "...", "nodes": ["NODE_ID", ...], "note": "optional text summary"}.
+
+Semantics:
+- memory(commit, target="explore") commits either the latest explore candidates (default) OR only the given selector.nodes.
+- memory(delete, target="explore") deletes the latest committed unit (default) OR deletes by selector tag / nodes.
+- memory(commit/delete, target="observation") commits/deletes a text note (selector.note or latest).
+- After ANY memory action, the environment resets working_subgraph := memory_subgraph for the next step.
+
 Do NOT use a separate "read" op (deprecated). If you need code context, rely on:
 (1) the working subgraph snippets already in the observation, and/or
 (2) candidate snippets attached by explore.find.
