@@ -126,21 +126,13 @@ The "action" param MUST be a single JSON object describing the full action,
 including "type" (matching ACTION_NAME) and required fields (e.g. memory.intent).
 
 For explore actions, set:
-- op="find"  (use anchors and/or a free-text query to retrieve candidates)
-- op="expand" (use anchors to expand/merge into the working subgraph)
-
-For memory actions, set:
-- intent="commit" or intent="delete"
-- target="explore"  (graph memory: update memory_subgraph) OR target="observation" (text memory notes)
-- selector can be either:
-  * a string tag (e.g., "bugfix", "hypothesis"), OR
-  * a JSON object like {"tag": "...", "nodes": ["NODE_ID", ...], "note": "optional text summary"}.
-
-Semantics:
-- memory(commit, target="explore") commits either the latest explore candidates (default) OR only the given selector.nodes.
-- memory(delete, target="explore") deletes the latest committed unit (default) OR deletes by selector tag / nodes.
-- memory(commit/delete, target="observation") commits/deletes a text note (selector.note or latest).
-- After ANY memory action, the environment resets working_subgraph := memory_subgraph for the next step.
+- op="find": use either anchors and/or a query (PREFERRED: query as a list of keyword strings).
+  Example:
+    {"type":"explore","op":"find","query":["separability_matrix","CompoundModel","nested"],"limit":50}
+  Do NOT include "hop" for find.
+- op="expand": requires anchors (or nodes that can be converted to anchors) and may include hop (0-2).
+  Example:
+    {"type":"explore","op":"expand","anchors":[{"id":"..."}],"hop":1,"limit":30}
 
 Do NOT use a separate "read" op (deprecated). If you need code context, rely on:
 (1) the working subgraph snippets already in the observation, and/or
@@ -356,6 +348,58 @@ def _ensure_str_list(value: Any) -> List[str]:
         return [text] if text else []
     return []
 
+def _extract_query_terms(query: str, max_terms: int = 16) -> List[str]:
+    """Extract deterministic keyword terms from a free-form query string.
+
+    We prefer identifiers and path-like tokens so the env can run robust repo search
+    without having to parse natural-language sentences.
+    """
+    if not query:
+        return []
+    q = str(query)
+
+    terms: List[str] = []
+    seen: set[str] = set()
+
+    def _push(t: str):
+        t = (t or "").strip()
+        if not t:
+            return
+        tl = t.lower()
+        if tl in {"a","an","the","and","or","of","to","for","in","on","at","by","with","from","as","is","are","was","were","be","been","being"}:
+            return
+        if len(t) <= 1:
+            return
+        if tl in seen:
+            return
+        seen.add(tl)
+        terms.append(t)
+
+    # backtick code spans
+    for m in re.finditer(r"`([^`]{1,80})`", q):
+        frag = m.group(1).strip()
+        if frag:
+            # split by whitespace/punct inside code span
+            for t in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]*", frag):
+                _push(t)
+
+    # path-like tokens
+    for t in re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", q):
+        _push(t)
+
+    # identifiers / dotted names
+    for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", q):
+        _push(t)
+
+    # also accept bare snake_case-ish words longer than 3
+    for t in re.findall(r"[A-Za-z0-9_]{4,}", q):
+        _push(t)
+
+    if len(terms) > max_terms:
+        terms = terms[:max_terms]
+    return terms
+
+
 
 def _ensure_dict_list(value: Any) -> List[Dict[str, Any]]:
     if value is None:
@@ -416,13 +460,36 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         op = str(params.get("op", "find")).lower()
         anchors = _ensure_dict_list(params.get("anchors"))
         nodes = _ensure_str_list(params.get("nodes"))
-        query = params.get("query")
-        if isinstance(query, str):
-            query = query.strip()
+        query_raw = params.get("query")
+
+        query: Any = None
+
+        if isinstance(query_raw, list):
+
+            # Prefer keyword-list form for deterministic parsing.
+
+            q_terms = [str(v).strip() for v in query_raw if isinstance(v, (str, int, float)) and str(v).strip()]
+
+            query = q_terms or None
+
+        elif isinstance(query_raw, str):
+
+            q_terms = _extract_query_terms(query_raw.strip())
+
+            # Fallback: keep the original string as a single term if extraction fails.
+
+            if not q_terms and query_raw.strip():
+
+                q_terms = [query_raw.strip()]
+
+            query = q_terms or None
+
         else:
+
             query = None
 
 
+        # 兼容旧版：explore.read
         # 兼容旧版：explore.read 已弃用；将其规范化为 explore.expand (hop=0)
         # 语义：读取 nodes 的 snippet，但不扩展邻居。
         if op == "read":
