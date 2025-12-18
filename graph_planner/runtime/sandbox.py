@@ -226,7 +226,7 @@ class SandboxRuntime:
             num_runners=num_runners,
             ensure_runners=True,
         )
-        self.workdir = "/repo"  # remote_swe 强制统一 repo root
+        self.workdir = "/testbed"  # remote_swe 强制统一 repo root
         _dbg(
             f"remote_swe backend initialized: ssh={cfg.ssh_target!r}, "
             f"repo={cfg.remote_repo!r}, workdir={self.workdir!r}, num_runners={num_runners}"
@@ -341,7 +341,7 @@ class SandboxRuntime:
             if self._remote_started:
                 return
             t0 = time.perf_counter()
-            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/repo")
+            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
             dt = time.perf_counter() - t0
             ok = bool(resp.get("ok", False))
             rc = resp.get("returncode", None)
@@ -549,10 +549,10 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         selector_tuple: Tuple[str, ...] = tuple(selector or ())
         sel = " ".join(selector_tuple)
 
-        # remote_swe: prefer /repo (workdir) run_tests.sh if present, else fallback pytest
+        # remote_swe: prefer /testbed (workdir) run_tests.sh if present, else fallback pytest
         if self._mode == "remote_swe":
-            wd = (self.workdir or "/repo").rstrip("/")
-            for script in (f"{wd}/run_tests.sh", "/repo/run_tests.sh"):
+            wd = (self.workdir or "/testbed").rstrip("/")
+            for script in (f"{wd}/run_tests.sh", "/testbed/run_tests.sh"):
                 # Some SWE-bench images ship run_tests.sh without +x; accept if file exists.
                 if self._exec(f"test -f {script}")[1] == 0:
                     # SWE-bench run_tests.sh typically does not accept extra positional args; run full suite.
@@ -628,13 +628,32 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         )
 
     def _aci_root(self) -> Path:
-        # Host-side cache root for GraphPlanner artifacts
-        # Default: .aci (relative to current working directory)
-        return Path(os.environ.get("GP_ACI_ROOT", ".aci"))
+        """Host-side cache root for GraphPlanner artifacts.
 
-    def _repo_graph_cache_path(self, repo_id: str) -> Path:
+        Historical default was ".aci". We now default to a non-hidden directory
+        ("gp_cache") as requested, while still honoring GP_ACI_ROOT for backward
+        compatibility.
+
+        Priority:
+          1) GP_GRAPH_CACHE_ROOT (preferred)
+          2) GP_ACI_ROOT (legacy)
+          3) "gp_cache" (default)
+        """
+        root = os.environ.get("GP_GRAPH_CACHE_ROOT") or os.environ.get("GP_ACI_ROOT") or "gp_cache"
+        return Path(root)
+
+    def _repo_graph_cache_path(self, repo_id: str, image_id: str = "") -> Path:
+        """Host-side cache location for a repo-level graph.
+
+        We key the cache by (repo_id, image_id) to avoid collisions across different
+        SWE-bench container images (which may pin different commits/patch levels).
+        """
         rid = (repo_id or "").strip() or "repo"
-        return self._aci_root() / "subgraphs" / rid / "repo" / "repo_graph.jsonl"
+        img = (image_id or "").strip()
+        if not img:
+            img = str(getattr(self.cfg, "docker_image", "") or "").strip()
+        img_key = img.replace("/", "-").replace(":", "-").replace("@", "-") if img else "image"
+        return self._aci_root() / "subgraphs" / rid / img_key / "repo_graph.jsonl"
 
     def _load_repo_graph_jsonl(self, path: Path) -> Dict[str, Any]:
         nodes: List[Dict[str, Any]] = []
@@ -682,19 +701,12 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         if not rid:
             rid = "repo"
 
-        cache_path = self._repo_graph_cache_path(rid)
+        cache_path = self._repo_graph_cache_path(rid, str(self.cfg.docker_image or ""))
         if cache_path.exists() and not force:
             return str(cache_path)
 
         _dbg(f"remote_swe build_repo_graph: repo_id={rid} workdir={self.workdir} image={self.cfg.docker_image}")
-        # NOTE: SWE-bench images typically use /testbed as the working directory.
-        #       In our remote_swe backend, self.workdir is the canonical in-container cwd.
-        b64 = self._remote.build_repo_graph(
-            repo_id=rid,
-            timeout=int(timeout),
-            cwd=self.workdir,
-            repo=self.workdir,
-        )
+        b64 = self._remote.build_repo_graph(repo_id=rid, timeout=int(timeout), cwd=self.workdir or "/testbed", repo=self.workdir or "/testbed")
         if not b64:
             raise RuntimeError("build_repo_graph returned empty base64 payload")
 
