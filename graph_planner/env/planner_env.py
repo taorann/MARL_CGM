@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
 
-DEBUG = str(os.environ.get("DEBUG", "")).strip().lower() in {"1", "true", "yes", "y"}
+DEBUG = bool(os.environ.get("DEBUG"))
 
 
 def _dbg(msg: str) -> None:
@@ -295,6 +295,16 @@ class PlannerEnv:
             self._strict_io = str(strict_env).strip().lower() in {"1", "true", "yes"}
         else:
             self._strict_io = bool(io_cfg.get("strict_planner_io", False))
+        # Step-level trace printing (useful for debugging without opening telemetry files)
+        _print_env = os.environ.get("GP_PRINT_OPS") or os.environ.get("GRAPH_PLANNER_PRINT_OPS")
+        if _print_env is None:
+            self._print_ops = True
+        else:
+            self._print_ops = str(_print_env).strip().lower() not in {"0","false","no","off"}
+        try:
+            self._print_excerpt_chars = int(os.environ.get("GP_PRINT_EXCERPT_CHARS", "360"))
+        except Exception:
+            self._print_excerpt_chars = 360
 
         self.steps: int = 0
         self.last_info: Dict[str, Any] = {}
@@ -378,10 +388,7 @@ class PlannerEnv:
             if hasattr(graph_adapter, "connect_from_subgraph"):
                 graph_adapter.connect_from_subgraph(self.repo_graph, root=root)
             elif hasattr(graph_adapter, "connect_from_nodes_edges"):
-                nodes_store = getattr(self.repo_graph, "nodes", [])  # may be dict[id->node] or list[node]
-                nodes_list = list(nodes_store.values()) if isinstance(nodes_store, dict) else list(nodes_store or [])
-                edges_list = list(getattr(self.repo_graph, "edges", []) or [])
-                graph_adapter.connect_from_nodes_edges(nodes_list, edges_list, root=root)  # type: ignore
+                graph_adapter.connect_from_nodes_edges(self.repo_graph.nodes, self.repo_graph.edges, root=root)  # type: ignore
         except Exception:
             pass
 
@@ -389,29 +396,10 @@ class PlannerEnv:
         self._repo_nodes_by_id = {}
         self._repo_edges = []
         if self.repo_graph is not None:
-            nodes_store = getattr(self.repo_graph, "nodes", []) or []
-            if isinstance(nodes_store, dict):
-                for nid, node in nodes_store.items():
-                    if not isinstance(node, dict):
-                        continue
-                    # Some stores key nodes by id but omit the "id" field inside the node dict.
-                    if not node.get("id") and isinstance(nid, str):
-                        node = dict(node)
-                        node["id"] = nid
-                        try:
-                            nodes_store[nid] = node  # type: ignore[index]
-                        except Exception:
-                            pass
-                    nid2 = node.get("id")
-                    if isinstance(nid2, str):
-                        self._repo_nodes_by_id[nid2] = node
-            else:
-                for node in list(nodes_store):
-                    if not isinstance(node, dict):
-                        continue
-                    nid2 = node.get("id")
-                    if isinstance(nid2, str):
-                        self._repo_nodes_by_id[nid2] = node
+            for n in getattr(self.repo_graph, "nodes", []):
+                nid = n.get("id")
+                if isinstance(nid, str):
+                    self._repo_nodes_by_id[nid] = n
             self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
 
         # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
@@ -478,124 +466,6 @@ class PlannerEnv:
                 flush = getattr(tel, "flush", None) or getattr(tel, "close", None)
                 if callable(flush):
                     flush()
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # Telemetry helpers
-    # ------------------------------------------------------------------
-    def _telemetry_obs_summary(self) -> Dict[str, Any]:
-        """Return a compact, structured summary of the current observation state.
-
-        Keep this small and stable: it will be written to JSONL and may be printed.
-        """
-
-        def _sg_stats(sg: Any) -> Dict[str, Any]:
-            try:
-                return subgraph_store.stats(sg)
-            except Exception:
-                return {"nodes": 0, "edges": 0}
-
-        summary: Dict[str, Any] = {
-            "step": int(getattr(self, "steps", 0) or 0),
-            "backend_mode": getattr(getattr(self, "box", None), "_mode", None),
-            "repo": _sg_stats(getattr(self, "repo_graph", None)) if getattr(self, "repo_graph", None) else None,
-            "working": _sg_stats(getattr(self, "working_subgraph", None)),
-            "memory": _sg_stats(getattr(self, "memory_subgraph", None)),
-            "last_candidates": len(getattr(self, "last_candidates", None) or []),
-            "last_reads": len(getattr(self, "last_reads", None) or []),
-        }
-        try:
-            if isinstance(getattr(self, "last_info", None), dict):
-                k = self.last_info.get("kind")
-                op = self.last_info.get("op")
-                if k:
-                    summary["last_kind"] = k
-                if op:
-                    summary["last_op"] = op
-        except Exception:
-            pass
-        return summary
-
-    def _telemetry_log_step_end(
-        self,
-        *,
-        action: Dict[str, Any],
-        info: Dict[str, Any],
-        reward: float,
-        done: bool,
-        t0: float,
-    ) -> None:
-        """Best-effort step logging and console debug prints."""
-
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        kind = (info.get("kind") if isinstance(info, dict) else None) or None
-        op = (info.get("op") if isinstance(info, dict) else None) or None
-        stop_reason = (info.get("stop_reason") if isinstance(info, dict) else None) or None
-
-        obs_summary = self._telemetry_obs_summary()
-
-        # JSONL trajectory
-        try:
-            self.telemetry.set_step(self.steps)
-            self.telemetry.log_step(
-                {
-                    "action": action,
-                    "kind": kind,
-                    "op": op,
-                    "reward": float(reward),
-                    "done": bool(done),
-                    "stop_reason": stop_reason,
-                    "dt_ms": float(dt_ms),
-                    "info": info,
-                    "obs_summary": obs_summary,
-                }
-            )
-            # A couple of cheap scalar metrics for quick grepping
-            self.telemetry.metric("env.reward", float(reward), step_id=self.steps)
-            if stop_reason:
-                self.telemetry.metric(f"env.stop_reason.{stop_reason}", 1.0, step_id=self.steps)
-        except Exception:
-            pass
-
-        # Console prints (one line per step; gated by env var)
-        try:
-            print_ops = _safe_bool(os.environ.get("GP_PRINT_OPS"), default=DEBUG) or _safe_bool(
-                os.environ.get("GRAPH_PLANNER_PRINT_OPS"), default=False
-            )
-            if print_ops:
-                rid = int(getattr(self, "runner_id", 0) or 0)
-                cand_n = 0
-                try:
-                    cand_n = len((info.get("candidates") if isinstance(info, dict) else None) or (getattr(self, "last_candidates", None) or []))
-                except Exception:
-                    cand_n = len(getattr(self, "last_candidates", None) or [])
-                w_nodes = (obs_summary.get("working") or {}).get("nodes") if isinstance(obs_summary.get("working"), dict) else None
-                m_nodes = (obs_summary.get("memory") or {}).get("nodes") if isinstance(obs_summary.get("memory"), dict) else None
-                extra = ""
-                if kind == "explore" and isinstance(info, dict) and info.get("query_terms"):
-                    try:
-                        extra = f" query={info.get('query_terms')[:6]}"
-                    except Exception:
-                        extra = ""
-                print(
-                    f"[gp-env {rid:02d}] step={self.steps} kind={kind} op={op} reward={reward:.4f} done={done}"
-                    f" stop={stop_reason} cand={cand_n} working_nodes={w_nodes} memory_nodes={m_nodes} dt_ms={dt_ms:.1f}{extra}"
-                )
-        except Exception:
-            pass
-
-        # Episode lifecycle
-        if done:
-            try:
-                self.telemetry.end_episode(
-                    status=str(stop_reason or "done"),
-                    summary={
-                        "steps": int(getattr(self, "steps", 0) or 0),
-                        "stop_reason": stop_reason,
-                        "final_obs_summary": obs_summary,
-                    },
-                )
             except Exception:
                 pass
 
@@ -1644,29 +1514,11 @@ print(json.dumps({'snippet_lines': snippet}))
             return
 
         working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
-        # subgraph_store.WorkingSubgraph stores nodes as a dict keyed by id; older code may store a list.
-        nodes_store = getattr(self.working_subgraph, "nodes", {}) or {}
-        if isinstance(nodes_store, dict):
-            for nid, node in nodes_store.items():
-                if not isinstance(node, dict):
-                    continue
-                if not node.get("id") and isinstance(nid, str):
-                    node = dict(node)
-                    node["id"] = nid
-                    try:
-                        nodes_store[nid] = node  # type: ignore[index]
-                    except Exception:
-                        pass
-                nid2 = node.get("id")
-                if isinstance(nid2, str):
-                    working_nodes_by_id[nid2] = node
-        else:
-            for node in nodes_store:
-                if not isinstance(node, dict):
-                    continue
-                nid2 = node.get("id")
-                if isinstance(nid2, str):
-                    working_nodes_by_id[nid2] = node
+        for n in getattr(self.working_subgraph, "nodes", []):
+            nid = n.get("id")
+            if isinstance(nid, str):
+                working_nodes_by_id[nid] = n
+
         working_edges = list(getattr(self.working_subgraph, "edges", []) or [])
         working_ids = set(working_nodes_by_id.keys())
 
@@ -1783,5 +1635,150 @@ print(json.dumps({'snippet_lines': snippet}))
         if getattr(self, "memory_graph_store", None) is not None:
             try:
                 self.memory_graph_store.subgraph = self.memory_subgraph
+            except Exception:
+                pass
+
+
+    # ------------------------------------------------------------
+    # Telemetry helpers (step-level trajectory + terminal excerpts)
+    # ------------------------------------------------------------
+
+    def _telemetry_obs_summary(self) -> Dict[str, Any]:
+        """A lightweight summary of the observation/state for debugging.
+
+        Keep this stable and small to avoid bloating step logs.
+        """
+        def _safe_stats(sg: Any) -> Dict[str, Any]:
+            try:
+                return subgraph_store.stats(sg)
+            except Exception:
+                return {}
+
+        return {
+            "step": int(getattr(self, "steps", 0)),
+            "max_steps": int(getattr(self, "max_steps", 0) or 0),
+            "working": _safe_stats(getattr(self, "working_subgraph", None)),
+            "memory": _safe_stats(getattr(self, "memory_subgraph", None)),
+            "last_candidates": int(len(getattr(self, "last_candidates", []) or [])),
+        }
+
+    def _telemetry_preview_text(self, action: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+        """Extract a short, human-readable excerpt for terminal printing/log preview."""
+        try:
+            kind = str(info.get("kind") or action.get("type") or "").strip().lower()
+        except Exception:
+            kind = ""
+
+        # Candidates preview (find/expand)
+        if kind == "explore":
+            op = str(info.get("op") or action.get("op") or "").strip().lower()
+            cands = info.get("candidates")
+            if isinstance(cands, list) and cands:
+                first = cands[0] if isinstance(cands[0], dict) else {}
+                nid = first.get("id") if isinstance(first, dict) else None
+                path = first.get("path") if isinstance(first, dict) else None
+                header = f"{op}: {len(cands)} candidates" + (f" | top={nid}" if nid else "") + (f" | {path}" if path else "")
+                # Prefer snippet_lines attached during find
+                snippet_lines = None
+                if isinstance(first, dict):
+                    snippet_lines = first.get("snippet_lines")
+                if not snippet_lines and isinstance(info.get("candidate_snippets"), list) and info.get("candidate_snippets"):
+                    sn0 = info.get("candidate_snippets")[0]
+                    if isinstance(sn0, dict):
+                        snippet_lines = sn0.get("snippet_lines")
+                if isinstance(snippet_lines, list) and snippet_lines:
+                    body = "\n".join(str(x) for x in snippet_lines[:12])
+                    return (header + "\n" + body).strip()
+                return header
+            return f"{op}: 0 candidates"
+
+        if kind == "repair":
+            applied = info.get("applied")
+            plan = info.get("plan")
+            tests = info.get("tests")
+            header = f"repair: applied={bool(applied)}"
+            parts = [header]
+            if isinstance(plan, str) and plan.strip():
+                parts.append("plan: " + plan.strip())
+            if isinstance(tests, dict):
+                # try common keys
+                status = tests.get("status") or tests.get("ok") or tests.get("success")
+                summary = tests.get("summary") or tests.get("stderr") or tests.get("stdout")
+                if status is not None:
+                    parts.append(f"tests: {status}")
+                if isinstance(summary, str) and summary.strip():
+                    parts.append("tests_out: " + summary.strip())
+            return "\n".join(parts)
+
+        if kind == "memory":
+            intent = info.get("intent") or action.get("intent")
+            target = info.get("target") or action.get("target")
+            return f"memory: intent={intent} target={target}"
+
+        if kind == "submit":
+            return "submit"
+
+        return ""
+
+    def _telemetry_log_step_end(
+        self,
+        *,
+        action: Mapping[str, Any],
+        info: Mapping[str, Any],
+        reward: float,
+        done: bool,
+        t0: float,
+    ) -> None:
+        """Write a step record and optionally print a small excerpt to stdout."""
+        dt_ms = None
+        try:
+            dt_ms = (time.perf_counter() - float(t0)) * 1000.0
+        except Exception:
+            dt_ms = None
+
+        # Keep a compact preview inside telemetry to make debugging easier.
+        preview = ""
+        try:
+            preview = self._telemetry_preview_text(action, info)
+        except Exception:
+            preview = ""
+
+        # Reduce payload size: keep full info, but also provide a compact preview.
+        payload: Dict[str, Any] = {
+            "step": int(getattr(self, "steps", 0)),
+            "action": dict(action) if isinstance(action, Mapping) else action,
+            "reward": float(reward),
+            "done": bool(done),
+            "dt_ms": dt_ms,
+            "info": dict(info) if isinstance(info, Mapping) else info,
+            "preview": preview,
+            "obs_summary": self._telemetry_obs_summary(),
+        }
+
+        try:
+            self.telemetry.log_step(payload)
+        except Exception:
+            pass
+
+        # Terminal trace (truncated)
+        if getattr(self, "_print_ops", False):
+            try:
+                excerpt = preview or ""
+                maxc = int(getattr(self, "_print_excerpt_chars", 360) or 360)
+                if len(excerpt) > maxc:
+                    excerpt = excerpt[:maxc] + "..."
+                kind = (info.get("kind") if isinstance(info, Mapping) else None) or (action.get("type") if isinstance(action, Mapping) else None)
+                op = (info.get("op") if isinstance(info, Mapping) else None) or (action.get("op") if isinstance(action, Mapping) else None)
+                line = f"[gp-trace] step={payload['step']} kind={kind} op={op} reward={payload['reward']} done={payload['done']}"
+                print(line)
+                if excerpt:
+                    print(excerpt)
+            except Exception:
+                pass
+
+        # Episode end marker
+        if done:
+            try:
+                self.telemetry.event("episode.end", {"final_step": int(getattr(self, "steps", 0)), "final_reward": float(reward)})
             except Exception:
                 pass
