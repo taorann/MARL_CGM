@@ -138,6 +138,19 @@ Do NOT use a separate "read" op (deprecated). If you need code context, rely on:
 (1) the working subgraph snippets already in the observation, and/or
 (2) candidate snippets attached by explore.find.
 
+For memory actions, set:
+- intent MUST be exactly one of: "commit" or "delete" (no other words like "analyze").
+  Use "commit" to store a note; use "delete" to remove a note/tag/nodes.
+- target is optional and should usually be "explore".
+- selector is optional (e.g., "latest", a tag string, or a JSON object).
+- Do NOT include a "scope" field (deprecated).
+
+  Example commit:
+    {"type":"memory","intent":"commit","target":"explore","selector":{"note":"...","tag":"..."}}
+
+  Example delete:
+    {"type":"memory","intent":"delete","target":"explore","selector":"latest"}
+
 Do not emit any other text outside the block.
 """
 
@@ -322,6 +335,20 @@ def parse_action_block(text: str) -> Dict[str, Any]:
     return {"name": action_name, "params": params}
 
 
+
+def _normalize_memory_intent(value: Any) -> str:
+    """Coerce memory.intent into {'commit','delete'}.
+
+    Some models emit synonyms (e.g. 'analyze') even though the schema only allows
+    'commit' or 'delete'. Normalising here prevents hard validation failures that
+    would otherwise turn the step into a noop.
+    """
+    raw = str(value or "").strip().lower()
+    if raw in {"commit", "add", "save", "store", "remember", "keep", "record", "log", "write", "analysis", "analyze"}:
+        return "commit"
+    if raw in {"delete", "remove", "forget", "drop", "clear", "purge"}:
+        return "delete"
+    return "commit"
 
 def _coerce_bool(value: Any, *, default: bool = True) -> bool:
     if value is None:
@@ -601,7 +628,7 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         )
     if action_name == "memory":
         target = str(params.get("target", "explore"))
-        intent = str(params.get("intent", "commit"))
+        intent = _normalize_memory_intent(params.get("intent", "commit"))
         selector = params.get("selector")
         # 兼容旧版：scope 字段存在时忽略
         if isinstance(selector, str):
