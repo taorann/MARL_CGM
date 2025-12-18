@@ -16,6 +16,7 @@ It keeps backward compatible helpers:
 """
 
 import json
+import atexit
 import os
 import time
 from dataclasses import dataclass
@@ -263,6 +264,25 @@ class Telemetry:
         _append_jsonl(self._run_dir / "run_meta.jsonl", rec)
         self._run_started = False
 
+    def flush(self) -> None:
+        """Compatibility: nothing to flush (we open/close per record)."""
+
+        return
+
+    def close(self) -> None:
+        """Best-effort close: end episode + run if they are still open."""
+
+        try:
+            if self._episode_started:
+                self.end_episode("closed", summary={})
+        except Exception:
+            pass
+        try:
+            if self._run_started:
+                self.end_run("closed", summary={})
+        except Exception:
+            pass
+
 
 # --------------------------
 # Global singleton
@@ -271,10 +291,34 @@ class Telemetry:
 _TELEMETRY: Optional[Telemetry] = None
 
 
+def _finalize_telemetry() -> None:
+    """Ensure run/episode end markers are written at interpreter exit."""
+
+    global _TELEMETRY
+    tel = _TELEMETRY
+    if tel is None:
+        return
+    try:
+        if getattr(tel, "_episode_started", False):
+            tel.end_episode("process_exit", summary={})
+    except Exception:
+        pass
+    try:
+        if getattr(tel, "_run_started", False):
+            tel.end_run("process_exit", summary={})
+    except Exception:
+        pass
+
+
 def get_telemetry(run_id: Optional[str] = None) -> Telemetry:
     global _TELEMETRY
     if _TELEMETRY is None:
         _TELEMETRY = Telemetry()
+        # Avoid missing run/episode end markers if the process is interrupted.
+        try:
+            atexit.register(_finalize_telemetry)
+        except Exception:
+            pass
     if run_id:
         _TELEMETRY.set_run(run_id)
     return _TELEMETRY
