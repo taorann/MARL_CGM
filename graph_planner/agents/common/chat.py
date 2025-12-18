@@ -23,6 +23,21 @@ JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})```", re.DOTALL)
 FALLBACK_REASON_KEY = "fallback_reason"
 
 
+def _normalize_memory_intent(value: Any) -> str:
+    """Coerce memory.intent into {'commit','delete'}.
+
+    The model sometimes emits synonyms like 'analyze' when it means committing a note.
+    We normalize to keep the trajectory running (and to avoid noop fallbacks).
+    """
+    raw = str(value or "").strip().lower()
+    if raw in {"commit", "add", "save", "store", "remember", "keep", "record", "log", "write", "analysis", "analyze"}:
+        return "commit"
+    if raw in {"delete", "remove", "forget", "drop", "clear", "purge"}:
+        return "delete"
+    return "commit"
+
+
+
 def summarise_observation(
     obs: Dict[str, Any],
     reward: float,
@@ -249,14 +264,14 @@ def action_from_payload(payload: Dict[str, Any] | None) -> ActionUnion | None:
             op=str(payload.get("op") or payload.get("operation") or "expand"),
             anchors=list(payload.get("anchors") or []),
             nodes=list(payload.get("nodes") or []),
+            query=payload.get("query"),
             hop=int(payload.get("hop", 1)),
             limit=int(payload.get("limit", 50)),
         )
     if type_name == "memory":
         return MemoryAction(
             target=str(payload.get("target", "explore")),
-            scope=str(payload.get("scope", "turn")),
-            intent=str(payload.get("intent", "commit")),
+            intent=_normalize_memory_intent(payload.get("intent", "commit")),
             selector=payload.get("selector"),
         )
     if type_name == "repair":
@@ -282,6 +297,7 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
             "op": action.op,
             "anchors": action.anchors,
             "nodes": action.nodes,
+            "query": action.query,
             "hop": action.hop,
             "limit": action.limit,
         }
@@ -289,7 +305,6 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
         return {
             "type": "memory",
             "target": action.target,
-            "scope": action.scope,
             "intent": action.intent,
             "selector": action.selector,
         }
