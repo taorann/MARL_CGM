@@ -378,7 +378,9 @@ class PlannerEnv:
             if hasattr(graph_adapter, "connect_from_subgraph"):
                 graph_adapter.connect_from_subgraph(self.repo_graph, root=root)
             elif hasattr(graph_adapter, "connect_from_nodes_edges"):
-                graph_adapter.connect_from_nodes_edges(self.repo_graph.nodes, self.repo_graph.edges, root=root)  # type: ignore
+                nodes_store = getattr(self.repo_graph, "nodes", [])
+                nodes_list = list(nodes_store.values()) if isinstance(nodes_store, dict) else list(nodes_store or [])
+                graph_adapter.connect_from_nodes_edges(nodes_list, getattr(self.repo_graph, "edges", []) or [], root=root)  # type: ignore
         except Exception:
             pass
 
@@ -386,13 +388,26 @@ class PlannerEnv:
         self._repo_nodes_by_id = {}
         self._repo_edges = []
         if self.repo_graph is not None:
-            for n in getattr(self.repo_graph, "nodes", []):
-                nid = n.get("id")
-                if isinstance(nid, str):
-                    self._repo_nodes_by_id[nid] = n
-            self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
-
-        # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
+            nodes_store = getattr(self.repo_graph, "nodes", {}) or {}
+            if isinstance(nodes_store, dict):
+                for nid, node in nodes_store.items():
+                    if not isinstance(node, dict):
+                        continue
+                    if not node.get("id") and isinstance(nid, str):
+                        node = dict(node)
+                        node["id"] = nid
+                        nodes_store[nid] = node
+                    nid2 = node.get("id")
+                    if isinstance(nid2, str):
+                        self._repo_nodes_by_id[nid2] = node
+            else:
+                for node in nodes_store:
+                    if not isinstance(node, dict):
+                        continue
+                    nid2 = node.get("id")
+                    if isinstance(nid2, str):
+                        self._repo_nodes_by_id[nid2] = node
+            self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])# === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
         # 直接 new 一张空的长期记忆图，不再从磁盘加载历史记忆。
         self.memory_subgraph = subgraph_store.new()
 
@@ -1503,11 +1518,28 @@ print(json.dumps({'snippet_lines': snippet}))
         if not node_ids:
             return
 
-        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
-        for n in getattr(self.working_subgraph, "nodes", []):
-            nid = n.get("id")
-            if isinstance(nid, str):
-                working_nodes_by_id[nid] = n
+        # subgraph_store.WorkingSubgraph stores nodes as a dict keyed by id; older code may store a list.
+working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+nodes_store = getattr(self.working_subgraph, "nodes", {}) or {}
+if isinstance(nodes_store, dict):
+    for nid, node in nodes_store.items():
+        if not isinstance(node, dict):
+            continue
+        if not node.get("id") and isinstance(nid, str):
+            node = dict(node)
+            node["id"] = nid
+            nodes_store[nid] = node
+        nid2 = node.get("id")
+        if isinstance(nid2, str):
+            working_nodes_by_id[nid2] = node
+else:
+    for node in nodes_store:
+        if not isinstance(node, dict):
+            continue
+        nid2 = node.get("id")
+        if isinstance(nid2, str):
+            working_nodes_by_id[nid2] = node
+
 
         working_edges = list(getattr(self.working_subgraph, "edges", []) or [])
         working_ids = set(working_nodes_by_id.keys())
