@@ -36,6 +36,78 @@ def _safe_bool(x: Any, default: bool = False) -> bool:
         return default
 
 
+# ----------------------------
+# Explore query normalization
+# ----------------------------
+_QUERY_STOPWORDS = {
+    "a","an","the","and","or","of","to","for","in","on","at","by","with","from","as",
+    "is","are","was","were","be","been","being","this","that","these","those","it","its",
+    "does","do","did","can","could","should","would","may","might","feel","feels","like",
+    "bug","missing","expected","suddenly","again","output","inputs","outputs","model","models",
+}
+
+def _extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
+    """Normalize explore.find query into a small list of keyword terms.
+
+    Accepts:
+      - list[str]: already keywordized
+      - str: free-form sentence; we extract code-ish tokens (identifiers / paths / dotted names)
+    """
+    if query is None:
+        return []
+    terms: List[str] = []
+    seen: set[str] = set()
+
+    def _push(t: str):
+        t = (t or "").strip()
+        if not t:
+            return
+        tl = t.lower()
+        if tl in _QUERY_STOPWORDS:
+            return
+        if len(t) <= 1:
+            return
+        if tl in seen:
+            return
+        seen.add(tl)
+        terms.append(t)
+
+    if isinstance(query, list):
+        for v in query:
+            if isinstance(v, (str, int, float)):
+                _push(str(v))
+        return terms[:max_terms]
+
+    if not isinstance(query, str):
+        _push(str(query))
+        return terms[:max_terms]
+
+    q = query.strip()
+    if not q:
+        return []
+
+    # backtick spans first
+    for m in re.finditer(r"`([^`]{1,80})`", q):
+        frag = (m.group(1) or "").strip()
+        for t in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]*", frag):
+            _push(t)
+
+    # path-like
+    for t in re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", q):
+        _push(t)
+
+    # identifiers / dotted names
+    for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", q):
+        _push(t)
+
+    # fallback long-ish tokens
+    for t in re.findall(r"[A-Za-z0-9_]{4,}", q):
+        _push(t)
+
+    return terms[:max_terms]
+
+
+
 def _safe_str(x: Any, default: str = "") -> str:
     if isinstance(x, str):
         return x
@@ -228,7 +300,7 @@ class PlannerEnv:
         self.last_info: Dict[str, Any] = {}
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
         if getattr(self.box, "_mode", None) == "remote_swe":
-            self.repo_root_in_container = "/testbed"
+            self.repo_root_in_container = "/repo"
         # Optional host repo root for per-env graph scanning.
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
@@ -276,24 +348,18 @@ class PlannerEnv:
         backend_mode = getattr(self.box, "_mode", None)
 
         # === 1) 构建完整仓库图 repo_graph ===
-        # === 1) 构建/加载完整仓库图 repo_graph（只读） ===
-        if backend_mode == "remote_swe":
-            # remote_swe：repo_graph 与容器实例（task_id + image）绑定；不做 issue-conditioned 初始子图。
+        if backend_mode == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
+            # remote_swe 模式：build_issue_subgraph 被视为完整仓库图
             try:
-                if hasattr(self.box, "load_repo_graph"):
-                    repo_id = str(self.issue.get("repo") or self.issue.get("repo_id") or "repo")
-                    repo_json = self.box.load_repo_graph(repo_id=repo_id)
-                elif hasattr(self.box, "build_issue_subgraph"):
-                    # 向后兼容：旧接口名叫 build_issue_subgraph，但语义应等价于加载 repo_graph。
-                    repo_json = self.box.build_issue_subgraph(self.issue_id)
-                else:
-                    repo_json = {"nodes": [], "edges": []}
+                repo_json = self.box.build_issue_subgraph(self.issue_id)
                 self.repo_graph = subgraph_store.wrap(repo_json)
+
             except Exception:
                 self.repo_graph = subgraph_store.new()
         else:
             # 本地 backend：从 ACI 子图缓存加载（如有需要可触发扫描构图）
-            graph_adapter.set_repo_root(self.repo_root_host)
+            if hasattr(graph_adapter, "set_repo_root") and self.repo_root_host:
+                graph_adapter.set_repo_root(self.repo_root_host)
             try:
                 graph_adapter.connect()
             except Exception:
@@ -306,13 +372,13 @@ class PlannerEnv:
 
         # Keep graph_adapter aligned with repo_graph (mem_candidates / expand).
         try:
-            root = "/testbed" if getattr(self.box, "_mode", None) == "remote_swe" else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
+            root = "/repo" if getattr(self.box, "_mode", None) == "remote_swe" else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
             if hasattr(graph_adapter, "set_repo_root"):
                 graph_adapter.set_repo_root(root)
             if hasattr(graph_adapter, "connect_from_subgraph"):
                 graph_adapter.connect_from_subgraph(self.repo_graph, root=root)
             elif hasattr(graph_adapter, "connect_from_nodes_edges"):
-                graph_adapter.connect_from_nodes_edges(list(getattr(self.repo_graph, "nodes", {}).values()) if isinstance(getattr(self.repo_graph, "nodes", None), dict) else getattr(self.repo_graph, "nodes", []), getattr(self.repo_graph, "edges", []), root=root)  # type: ignore
+                graph_adapter.connect_from_nodes_edges(self.repo_graph.nodes, self.repo_graph.edges, root=root)  # type: ignore
         except Exception:
             pass
 
@@ -320,16 +386,7 @@ class PlannerEnv:
         self._repo_nodes_by_id = {}
         self._repo_edges = []
         if self.repo_graph is not None:
-            nodes_obj = getattr(self.repo_graph, "nodes", {})
-            if isinstance(nodes_obj, dict):
-                nodes_iter = nodes_obj.values()
-            elif isinstance(nodes_obj, list):
-                nodes_iter = nodes_obj
-            else:
-                nodes_iter = []
-            for n in nodes_iter:
-                if not isinstance(n, dict):
-                    continue
+            for n in getattr(self.repo_graph, "nodes", []):
                 nid = n.get("id")
                 if isinstance(nid, str):
                     self._repo_nodes_by_id[nid] = n
@@ -591,7 +648,11 @@ class PlannerEnv:
         total_limit = _safe_int(getattr(act, "total_limit", None) or act.limit or 32, 32)
         max_per_anchor = _safe_int(getattr(act, "max_per_anchor", None) or total_limit, total_limit)
         dir_diversity_k = _safe_int(getattr(act, "dir_diversity_k", None) or 4, 4)
-        query = (getattr(act, "query", None) or "").strip()
+        query_terms = _extract_query_terms(getattr(act, "query", None))
+        query = " ".join(query_terms).strip()
+        if query_terms:
+            info["query_terms"] = list(query_terms)
+
 
         # -------- op = find --------
         if act.op == "find":
@@ -1271,7 +1332,8 @@ class PlannerEnv:
 
             # remote_swe: run inside container
             if getattr(self.box, "_mode", None) == "remote_swe":
-                abs_path = os.path.join("/repo", path)
+                base = getattr(self.box, "workdir", None) or "/testbed"
+                abs_path = os.path.join(str(base), path)
                 req = {"path": abs_path, "start": start_line, "end": end_line}
                 b64 = base64.b64encode(json.dumps(req).encode("utf-8")).decode("ascii")
                 py = r"""
