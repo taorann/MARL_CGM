@@ -44,57 +44,36 @@ def _write_file_text(path: str, text: str, encoding: str = "utf-8") -> None:
         pass
 
 
-try:
-    from copy import deepcopy
-except Exception:
-    def deepcopy(x):
-        return x
+from copy import deepcopy
 
-try:
-    from ..core.actions import (
-        ActionUnion,
-        ExploreAction,
-        MemoryAction,
-        NoopAction,
-        RepairAction,
-        SubmitAction,
-    )
-    # Shared protocol/contract error type used by the agent parser.
-    from ..agents.common.contracts import ProtocolError
-    from ..infra.config import Config, load as load_config
-    from ..infra import telemetry as telemetry_mod
-    try:
-        from ..integrations.codefuse_cgm.formatting import GraphLinearizer, SnippetFormatter
-    except Exception:
-        # Lightweight dummies
+from ..core.actions import (
+    ActionUnion,
+    ExploreAction,
+    MemoryAction,
+    NoopAction,
+    RepairAction,
+    SubmitAction,
+)
 
-        class GraphLinearizer:
-            def linearize(self, payload):
-                return "" if payload is None else str(payload)
+from ..agents.common.contracts import ProtocolError
+from ..infra.config import Config, load as load_config
+from ..infra import telemetry as telemetry_mod
 
-        class SnippetFormatter:
-            def format(self, snippets):
-                return "" if not snippets else str(snippets)
-    from ..memory import graph_adapter, mem_candidates, subgraph_store, text_memory
-    from ..memory.subgraph_store import WorkingSubgraph
-    from ..runtime.sandbox import SandboxConfig, SandboxRuntime
-    from .action_utils import normalize_explore_query_and_anchors
-    from aci.schema import Plan, PlanTarget
-    from aci.guard import GuardError, enforce_patch_guard
-    from actor.collater import collate
-    from actor import cgm_adapter
-    from ..infra.test_prioritizer import prioritize_tests
-except Exception as _IMPORT_ERROR:  # pragma: no cover
-    # The environment may not have all dependencies; this file is imported
-    # in tooling contexts where only type information is needed.
-    ActionUnion = object  # type: ignore[assignment]
-    ExploreAction = MemoryAction = RepairAction = SubmitAction = NoopAction = object  # type: ignore[assignment]
-    Config = object  # type: ignore[assignment]
-    SandboxConfig = object  # type: ignore[assignment]
-    SandboxRuntime = object  # type: ignore[assignment]
-    Plan = PlanTarget = object  # type: ignore[assignment]
-    subgraph_store = text_memory = graph_adapter = mem_candidates = object()  # type: ignore[assignment]
-    ProtocolError = ValueError  # type: ignore[assignment]
+from ..integrations.codefuse_cgm.formatting import GraphLinearizer, SnippetFormatter
+
+from ..memory import graph_adapter, mem_candidates, subgraph_store, text_memory
+from ..memory.subgraph_store import WorkingSubgraph
+from ..runtime.sandbox import SandboxConfig, SandboxRuntime
+from .action_utils import normalize_explore_query_and_anchors
+
+from aci.schema import Plan, PlanTarget
+from aci.guard import GuardError, enforce_patch_guard
+
+from actor.collater import collate
+from actor import cgm_adapter
+
+from ..infra.test_prioritizer import prioritize_tests
+
 
 
 DEFAULT_MEMORY_CAPS = {
