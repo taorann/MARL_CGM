@@ -1,287 +1,256 @@
-# -*- coding: utf-8 -*-
+"""Subgraph store utilities (v5 semantics).
+
+We maintain two subgraphs during an episode/trajectory:
+
+- repo_graph (G): read-only full repo code graph (external truth).
+- working_subgraph (W): planner-facing, may be noisy, nodes carry `memorized` flag.
+- memory_subgraph (M): CGM-facing, high-signal; populated by projecting a small induced subgraph from W.
+
+This module provides a lightweight in-memory representation plus helpers:
+- project_to_memory: copy induced subgraph from working to memory
+- prune_working: keep memorized nodes + a small recent unmemorized frontier
+"""
+
 from __future__ import annotations
-"""
-memory/subgraph_store.py
 
-# 2025-10-22 memory hardening
-工作子图存取与线性化（WSD/FULL），标准化为带 .node_ids 的对象：
-  - WorkingSubgraph: .nodes(dict)、.edges(list)、.node_ids(set)
-  - new()/wrap() 便于创建/迁移
-  - load()/save() 读写到 .aci/subgraphs/<issue>.json（nodes 按 list 存）
-  - 仍提供函数式 add_nodes/update_node/remove_nodes/stats/linearize，内部都走对象方法
-
-这样，orchestrator/memory/actors 都可以稳定调用：
-  - subgraph.iter_node_ids() / subgraph.get_node()
-  - 或使用本模块函数式 API（向后兼容）
-"""
-
-from typing import Dict, Any, Iterable, List, Tuple, Optional
-from dataclasses import dataclass
-from collections import defaultdict
-import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+import copy
 import json
-
-try:
-    from aci._utils import repo_root  # 项目已有
-except Exception:
-    repo_root = os.getcwd  # 兜底
+import os
 
 
-# ======================= 基础类 =======================
+Node = Dict[str, Any]
+Edge = Dict[str, Any]
 
-def _norm_posix(path: str | None) -> str:
-    return (path or "").replace("\\", "/")
+
+def _node_id(n: Mapping[str, Any]) -> str:
+    nid = n.get("id") or n.get("node_id") or n.get("nid")
+    return str(nid) if nid is not None else ""
+
+
+def _edge_uv(e: Mapping[str, Any]) -> Tuple[str, str]:
+    u = e.get("u") or e.get("src") or e.get("from")
+    v = e.get("v") or e.get("dst") or e.get("to")
+    return (str(u) if u is not None else "", str(v) if v is not None else "")
 
 
 @dataclass
-class WorkingSubgraph:
-    nodes: Dict[str, Dict[str, Any]]
-    edges: List[Dict[str, Any]]
+class Subgraph:
+    """Generic subgraph structure (nodes as dict keyed by id, edges as list)."""
 
-    def __post_init__(self):
-        # 常驻集合：加速包含/迭代
-        self.node_ids: set[str] = set(self.nodes.keys())
+    nodes: Dict[str, Node] = field(default_factory=dict)
+    edges: List[Edge] = field(default_factory=list)
 
-    # --- 统一接口 ---
-    def iter_node_ids(self) -> Iterable[str]:
-        return iter(self.node_ids)
+    # For working graphs, keep a recency-ordered list of node ids.
+    node_ids: List[str] = field(default_factory=list)
 
-    def get_node(self, node_id: str) -> Dict[str, Any]:
-        return self.nodes.get(node_id, {})
-
-    # --- 变更操作 ---
-    def add_nodes(self, nodes: Iterable[Dict[str, Any]]) -> None:
-        for n in nodes or []:
-            nid = n.get("id")
-            if not nid:
-                continue
-            data = dict(n)
-            if "path" in data:
-                data["path"] = _norm_posix(data.get("path"))
-            self.nodes[nid] = data
-            self.node_ids.add(nid)
-
-    def update_node(self, node_id: str, **patch) -> None:
-        n = self.nodes.get(node_id)
-        if not n:
-            return
-        for k, v in patch.items():
-            if k == "path":
-                n[k] = _norm_posix(v)
-            else:
-                n[k] = v
-
-    def remove_nodes(self, node_ids: Iterable[str]) -> None:
-        ids = set(node_ids or [])
-        if not ids:
-            return
-        for nid in list(ids):
-            self.nodes.pop(nid, None)
-            self.node_ids.discard(nid)
-        if isinstance(self.edges, list):
-            keep = []
-            for e in self.edges:
-                sid = e.get("src")
-                did = e.get("dst")
-                if sid in ids or did in ids:
-                    continue
-                keep.append(e)
-            self.edges[:] = keep
-
-    # --- 序列化 ---
     def to_json_obj(self) -> Dict[str, Any]:
-        return {"nodes": list(self.nodes.values()), "edges": self.edges}
+        return {"nodes": list(self.nodes.values()), "edges": list(self.edges)}
 
+    def get_node(self, node_id: str) -> Optional[Node]:
+        return self.nodes.get(str(node_id))
 
-# ======================= 工厂/迁移 =======================
-
-def new() -> WorkingSubgraph:
-    return WorkingSubgraph(nodes={}, edges=[])
-
-def wrap(obj) -> WorkingSubgraph:
-    """把 dict 或已有对象规范成 WorkingSubgraph。"""
-    if isinstance(obj, WorkingSubgraph):
-        return obj
-    if isinstance(obj, dict):
-        nodes_store = obj.get("nodes", {})
-        # 允许 list 或 dict 两种形态
-        if isinstance(nodes_store, list):
-            nodes = {}
-            for n in nodes_store:
-                if isinstance(n, dict) and "id" in n:
-                    data = dict(n)
-                    if "path" in data:
-                        data["path"] = _norm_posix(data.get("path"))
-                    nodes[data["id"]] = data
-        elif isinstance(nodes_store, dict):
-            nodes = {}
-            for k, v in nodes_store.items():
-                data = dict(v)
-                if "path" in data:
-                    data["path"] = _norm_posix(data.get("path"))
-                nodes[k] = data
+    def add_node(self, node: Node) -> None:
+        nid = _node_id(node)
+        if not nid:
+            return
+        if nid not in self.nodes:
+            self.nodes[nid] = node
+            self.node_ids.append(nid)
         else:
-            nodes = {}
-        edges = [e for e in obj.get("edges", []) if isinstance(e, dict)]
-        return WorkingSubgraph(nodes=nodes, edges=edges)
-    # 极端兜底
-    return WorkingSubgraph(nodes={}, edges=[])
+            # merge fields
+            self.nodes[nid].update(node)
+
+    def add_edge(self, edge: Edge) -> None:
+        if not isinstance(edge, dict):
+            return
+        u, v = _edge_uv(edge)
+        if not u or not v:
+            return
+        self.edges.append(edge)
+
+    def update_node(self, node_id: str, patch: Mapping[str, Any]) -> None:
+        nid = str(node_id)
+        if nid not in self.nodes:
+            return
+        self.nodes[nid].update(dict(patch))
+
+    def touch(self, node_id: str, step: Optional[int] = None) -> None:
+        """Mark node as recently touched (move to end of node_ids)."""
+        nid = str(node_id)
+        if nid in self.node_ids:
+            self.node_ids.remove(nid)
+        self.node_ids.append(nid)
+        if step is not None and nid in self.nodes:
+            self.nodes[nid]["gp_last_touched_step"] = int(step)
 
 
-# ======================= I/O =======================
+def wrap(obj: Any) -> Subgraph:
+    """Wrap a dict/list/Subgraph into our Subgraph class."""
+    if isinstance(obj, Subgraph):
+        return obj
+    sg = Subgraph()
+    if obj is None:
+        return sg
 
-def _store_dir() -> str:
-    """
-    返回当前仓库下的子图缓存目录。
+    if isinstance(obj, Mapping):
+        nodes = obj.get("nodes") or obj.get("Nodes") or []
+        edges = obj.get("edges") or obj.get("Edges") or []
+    else:
+        # If list passed, treat as node list
+        nodes = obj if isinstance(obj, list) else []
+        edges = []
 
-    优先使用环境变量 GRAPH_PLANNER_SUBGRAPHS_DIR；
-    否则默认: <git-root>/graph_planner/subgraphs
-    """
-    # 1) 环境变量覆盖
-    override = os.environ.get("GRAPH_PLANNER_SUBGRAPHS_DIR")
-    if override:
-        d = os.path.abspath(override)
-        os.makedirs(d, exist_ok=True)
-        return d
+    # nodes may be dict keyed by id or list
+    if isinstance(nodes, Mapping):
+        for n in nodes.values():
+            if isinstance(n, Mapping):
+                sg.add_node(dict(n))
+    elif isinstance(nodes, list):
+        for n in nodes:
+            if isinstance(n, Mapping):
+                sg.add_node(dict(n))
 
-    # 2) 默认放在仓库根目录下的 graph_planner/subgraphs
-    root = repo_root() if callable(repo_root) else repo_root
-    d = os.path.join(root, "graph_planner", "subgraphs")
-    os.makedirs(d, exist_ok=True)
-    return d
+    if isinstance(edges, list):
+        for e in edges:
+            if isinstance(e, Mapping):
+                sg.add_edge(dict(e))
 
-def _issue_path(issue_id: str) -> str:
-    return os.path.join(_store_dir(), f"{issue_id}.json")
-
-def load(issue_id: str) -> WorkingSubgraph:
-    p = _issue_path(issue_id)
-    if not os.path.isfile(p):
-        raise FileNotFoundError(p)
-    with open(p, "r", encoding="utf-8") as f:
-        data = json.load(f) or {}
-    return wrap(data)
-
-def save(issue_id: str, subgraph) -> None:
-    sg = wrap(subgraph)
-    with open(_issue_path(issue_id), "w", encoding="utf-8") as f:
-        json.dump(sg.to_json_obj(), f, ensure_ascii=False, indent=2)
+    return sg
 
 
-# ======================= 变更操作（函数式封装） =======================
-
-def add_nodes(subgraph, nodes: Iterable[Dict[str, Any]]) -> None:
-    wrap(subgraph).add_nodes(nodes)
-
-def update_node(subgraph, node_id: str, **patch) -> None:
-    wrap(subgraph).update_node(node_id, **patch)
-
-def remove_nodes(subgraph, node_ids: Iterable[str]) -> None:
-    wrap(subgraph).remove_nodes(node_ids)
+def new() -> Subgraph:
+    return Subgraph()
 
 
-# ======================= 统计 =======================
+def add_nodes(sg: Subgraph, nodes: Sequence[Node]) -> None:
+    if not nodes:
+        return
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        # Ensure memorized flag exists (for working; harmless for memory).
+        if "memorized" not in n:
+            n["memorized"] = bool(n.get("mem", False))
+        sg.add_node(n)
 
-def stats(subgraph) -> Dict[str, Any]:
-    sg = wrap(subgraph)
-    kinds: Dict[str, int] = defaultdict(int)
-    files: Dict[str, None] = {}
-    for n in sg.nodes.values():
-        k = (n.get("kind") or "").lower()
-        kinds[k] += 1
-        p = _norm_posix(n.get("path"))
-        if p:
-            files[p] = None
+
+def add_edges(sg: Subgraph, edges: Sequence[Edge]) -> None:
+    if not edges:
+        return
+    for e in edges:
+        if isinstance(e, dict):
+            sg.add_edge(e)
+
+
+def stats(sg: Subgraph) -> Dict[str, int]:
+    nodes = getattr(sg, "nodes", {}) or {}
+    n_nodes = len(nodes) if isinstance(nodes, dict) else (len(nodes) if nodes is not None else 0)
+    n_edges = len(getattr(sg, "edges", []) or [])
+    n_mem = 0
+    if isinstance(nodes, dict):
+        for n in nodes.values():
+            if isinstance(n, dict) and n.get("memorized"):
+                n_mem += 1
     return {
-        "nodes": len(sg.nodes),
-        "edges": len(sg.edges),
-        "files": len(files),
-        "funcs": kinds.get("function", 0),
-        "classes": kinds.get("class", 0),
-        "kinds": dict(kinds),
+        "n_nodes": int(n_nodes),
+        "n_edges": int(n_edges),
+        "n_memorized": int(n_mem),
+        "n_unmemorized": int(n_nodes - n_mem),
     }
 
 
-# ======================= 线性化 =======================
+def project_to_memory(working: Subgraph, select_ids: Sequence[str]) -> Tuple[List[Node], List[Edge]]:
+    """Project induced subgraph from working.
 
-def _is_tfile_path(path: str) -> bool:
-    p = _norm_posix(path).lower()
-    return ("test" in p) or ("/tests/" in p) or p.endswith("_test.py") or p.endswith("test.py")
-
-def _read_file_lines(rel_path: str) -> List[str]:
-    root = repo_root() if callable(repo_root) else repo_root
-    abspath = os.path.join(root, rel_path)
-    try:
-        with open(abspath, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read().splitlines()
-    except Exception:
-        return []
-
-def _merge_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    if not ranges:
-        return []
-    ranges.sort()
-    merged = [ranges[0]]
-    for s, e in ranges[1:]:
-        ls, le = merged[-1]
-        if s <= le + 1:
-            merged[-1] = (ls, max(le, e))
-        else:
-            merged.append((s, e))
-    return merged
-
-def linearize(subgraph, mode: str = "wsd") -> List[Dict[str, Any]]:
+    Nodes: deep-copied; Edges: keep edges whose endpoints both in select_ids.
     """
-    WSD：以 span 的 function/class/symbol 为主，左右各 ±2 行并合并；无 span 的文件给兜底片段
-    FULL：整文件（全文件上限 800 行）
+    select_set = {str(x) for x in (select_ids or []) if x is not None}
+    if not select_set:
+        return [], []
+    out_nodes: List[Node] = []
+    for nid in select_set:
+        n = working.get_node(nid)
+        if isinstance(n, dict):
+            out_nodes.append(copy.deepcopy(n))
+    out_edges: List[Edge] = []
+    for e in getattr(working, "edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        u, v = _edge_uv(e)
+        if u in select_set and v in select_set:
+            out_edges.append(copy.deepcopy(e))
+    return out_nodes, out_edges
+
+
+def prune_working(
+    working: Subgraph,
+    keep_ids: Optional[Iterable[str]] = None,
+    keep_recent_unmemorized: int = 20,
+) -> int:
+    """Prune working subgraph without clearing it.
+
+    Always keep memorized=True nodes.
+    Also keep any ids in keep_ids.
+    Also keep up to `keep_recent_unmemorized` most recently touched unmemorized nodes (frontier).
+    Returns number of removed (unmemorized) nodes.
     """
-    sg = wrap(subgraph)
-    mode = (mode or "wsd").lower()
-    FULL_LIMIT = 800
-    WSD_PAD = 2
-    WSD_FILE_CAP = 100
-    WSD_TFILE_CAP = 200
+    keep_set = {str(x) for x in (keep_ids or []) if x is not None}
 
-    # 以 path 分组
-    by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for n in sg.nodes.values():
-        p = n.get("path")
-        if p:
-            by_file[p].append(n)
+    nodes = getattr(working, "nodes", {}) or {}
+    if not isinstance(nodes, dict):
+        return 0
 
-    chunks: List[Dict[str, Any]] = []
+    memorized_ids = {nid for nid, n in nodes.items() if isinstance(n, dict) and n.get("memorized")}
+    keep_set |= memorized_ids
 
-    for path, nodes in by_file.items():
-        lines = _read_file_lines(path)
-        n_lines = len(lines)
-        if n_lines == 0:
+    # recent unmemorized frontier by node_ids (recency-ordered)
+    frontier: List[str] = []
+    for nid in reversed(list(getattr(working, "node_ids", []) or [])):
+        if nid in keep_set:
             continue
+        n = nodes.get(nid)
+        if isinstance(n, dict) and not n.get("memorized"):
+            frontier.append(nid)
+        if len(frontier) >= max(int(keep_recent_unmemorized), 0):
+            break
+    keep_set |= set(frontier)
 
-        if mode == "full":
-            end = min(n_lines, FULL_LIMIT)
-            text = "\n".join(lines[:end])
-            chunks.append({"path": path, "start": 1, "end": end, "text": text})
+    removed = 0
+    for nid in list(nodes.keys()):
+        if nid in keep_set:
             continue
+        n = nodes.get(nid)
+        if isinstance(n, dict) and n.get("memorized"):
+            continue
+        del nodes[nid]
+        removed += 1
 
-        # WSD：收集所有 span 窗口并扩展
-        spans: List[Tuple[int, int]] = []
-        for n in nodes:
-            span = n.get("span")
-            if not span:
-                continue
-            s = max(1, int(span.get("start", 1)) - WSD_PAD)
-            e = min(n_lines, int(span.get("end", 1)) + WSD_PAD)
-            if s <= e:
-                spans.append((s, e))
+    # Filter edges to those fully within remaining nodes
+    remaining = set(nodes.keys())
+    new_edges: List[Edge] = []
+    for e in getattr(working, "edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        u, v = _edge_uv(e)
+        if u in remaining and v in remaining:
+            new_edges.append(e)
+    working.edges = new_edges
 
-        if spans:
-            for s, e in _merge_ranges(spans):
-                text = "\n".join(lines[s-1:e])
-                chunks.append({"path": path, "start": s, "end": e, "text": text})
-        else:
-            # 兜底片段：按文件/测试文件限制
-            cap = WSD_TFILE_CAP if _is_tfile_path(path) else WSD_FILE_CAP
-            end = min(n_lines, cap)
-            text = "\n".join(lines[:end])
-            chunks.append({"path": path, "start": 1, "end": end, "text": text})
+    # Refresh node_ids to only remaining ids, keeping order
+    working.node_ids = [nid for nid in getattr(working, "node_ids", []) or [] if nid in remaining]
 
-    return chunks
+    return int(removed)
+
+
+def save(sg: Subgraph, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sg.to_json_obj(), f, ensure_ascii=False, indent=2)
+
+
+def load(path: str) -> Subgraph:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    return wrap(obj)
