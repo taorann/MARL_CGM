@@ -17,13 +17,231 @@ MemCandidates builder for Step 3.1
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Iterable, List, Dict, Set, Tuple
+from typing import Any, Iterable, List, Dict, Set, Tuple
 
 from .types import Anchor, Candidate, Node, SubgraphLike
 from . import graph_adapter
+
+# ----------------------------
+# Query term extraction (shared)
+# ----------------------------
+_QUERY_STOPWORDS = {
+    "a","an","the","and","or","of","to","for","in","on","at","by","with","from","as",
+    "is","are","was","were","be","been","being","this","that","these","those","it","its",
+    "does","do","did","can","could","should","would","may","might","feel","feels","like",
+    "bug","missing","expected","suddenly","again","output","inputs","outputs","model","models",
+}
+
+
+def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
+    """Normalize an explore query to a small list of keyword-ish terms.
+
+    Accepts:
+      - list[str]/list[Any]: will be stringified and de-duplicated
+      - str: free-form sentence; we extract code-ish tokens (identifiers / paths / dotted names)
+    """
+    if query is None:
+        return []
+
+    terms: List[str] = []
+    seen = set()
+
+    def push(t: str) -> None:
+        t = (t or "").strip()
+        if not t:
+            return
+        tl = t.lower()
+        if tl in _QUERY_STOPWORDS:
+            return
+        if len(t) <= 1:
+            return
+        if tl in seen:
+            return
+        seen.add(tl)
+        terms.append(t)
+
+    if isinstance(query, list):
+        for v in query:
+            if isinstance(v, (str, int, float)):
+                push(str(v))
+        return terms[:max_terms]
+
+    if not isinstance(query, str):
+        push(str(query))
+        return terms[:max_terms]
+
+    q = query.strip()
+    if not q:
+        return []
+
+    # backtick spans first
+    for m in re.finditer(r"`([^`]{1,80})`", q):
+        frag = (m.group(1) or "").strip()
+        for t in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]*", frag):
+            push(t)
+
+    # path-like
+    for t in re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", q):
+        push(t)
+
+    # identifiers / dotted names
+    for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", q):
+        push(t)
+
+    # fallback long-ish tokens
+    for t in re.findall(r"[A-Za-z0-9_]{4,}", q):
+        push(t)
+
+    return terms[:max_terms]
+
+
+
+
+def search_repo_candidates_by_query(
+    repo_graph: SubgraphLike,
+    *,
+    query: str,
+    total_limit: int,
+    dir_diversity_k: int = 4,
+) -> List[Candidate]:
+    """Search repo_graph nodes when explore.find is called without anchors.
+
+    We do a lightweight lexical match against node id/name/path.
+
+    Query conventions (best-effort, optional):
+      - "path:<substr>"    prioritize path matches
+      - "symbol:<name>"   prioritize symbol/id/name matches
+    """
+    q = (query or "").strip()
+    if not q or not repo_graph:
+        return []
+
+    q_lower = q.lower()
+    mode = "free"
+    payload = q
+    if q_lower.startswith("path:"):
+        mode, payload = "path", q[5:].strip()
+    elif q_lower.startswith("symbol:"):
+        mode, payload = "symbol", q[7:].strip()
+
+    payload_lower = payload.lower()
+    toks = re.findall(r"[A-Za-z0-9_./:-]+", payload_lower)
+    toks = [t for t in toks if t and len(t) >= 2 and t not in _QUERY_STOPWORDS]
+
+    def norm_dir(p: str) -> str:
+        try:
+            return str(PurePosixPath(_norm_posix(p)).parent)
+        except Exception:
+            return ""
+
+    scored: List[Candidate] = []
+    nodes_store = getattr(repo_graph, "nodes", {}) or {}
+
+    items: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(nodes_store, dict):
+        for nid, node in nodes_store.items():
+            if isinstance(nid, str) and isinstance(node, dict):
+                items.append((nid, node))
+    else:
+        for node in (nodes_store or []):
+            if isinstance(node, dict):
+                nid = node.get("id") or node.get("node_id") or node.get("name")
+                if isinstance(nid, str):
+                    items.append((nid, node))
+
+    for nid, node in items:
+        nid_s = str(nid or node.get("id") or "")
+        name = str(node.get("name") or node.get("symbol") or "")
+        path = str(node.get("path") or "")
+        kind = str(node.get("kind") or "").lower()
+
+        hay = (nid_s + " " + name + " " + path).lower()
+        if not hay:
+            continue
+
+        score = 0.0
+        reasons: List[str] = []
+
+        # Strong substring match on the whole payload
+        if payload_lower and payload_lower in hay:
+            score += 3.0
+            reasons.append("payload")
+
+        # Token matches
+        for t in toks:
+            if t in hay:
+                score += 1.0
+                reasons.append(t)
+
+        # Mode-specific boosts
+        if mode == "path" and payload_lower and payload_lower in path.lower():
+            score += 3.0
+            reasons.append("path")
+        if mode == "symbol" and payload_lower:
+            pl = payload_lower
+            if pl == nid_s.lower() or pl == name.lower():
+                score += 4.0
+                reasons.append("symbol_exact")
+            elif pl in nid_s.lower() or pl in name.lower():
+                score += 2.0
+                reasons.append("symbol")
+
+        if score <= 0:
+            continue
+
+        scored.append(
+            {
+                "id": nid_s,
+                "kind": kind,
+                "path": (node.get("path") or None),
+                "span": node.get("span"),
+                "degree": int(node.get("degree") or 0),
+                "from_anchor": False,
+                "score": float(score),
+                "reasons": list(dict.fromkeys(reasons))[:8],
+                "name": (name or None),
+            }
+        )
+
+    scored.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+    # Directory diversity: round-robin by parent dir to avoid over-concentration.
+    if dir_diversity_k and dir_diversity_k > 0 and scored:
+        buckets: Dict[str, List[Candidate]] = {}
+        order: List[str] = []
+        for c in scored:
+            d = norm_dir(str(c.get("path") or ""))
+            if d not in buckets:
+                buckets[d] = []
+                order.append(d)
+            buckets[d].append(c)
+
+        mixed: List[Candidate] = []
+        rounds = 0
+        while len(mixed) < total_limit:
+            progressed = False
+            for d in list(order):
+                if not buckets.get(d):
+                    continue
+                if rounds < dir_diversity_k:
+                    mixed.append(buckets[d].pop(0))
+                    progressed = True
+                    if len(mixed) >= total_limit:
+                        break
+                else:
+                    while buckets[d] and len(mixed) < total_limit:
+                        mixed.append(buckets[d].pop(0))
+                    progressed = True
+            if not progressed:
+                break
+            rounds += 1
+        scored = mixed
+
+    return scored[:total_limit]
 
 
 # --------------------------
