@@ -209,6 +209,31 @@ def summarise_observation(
     return summary, metadata
 
 
+
+def _normalize_plan_steps(plan, subplan=None):
+    """Normalize repair plan/subplan into a List[str] with de-duplicated, non-empty steps."""
+    def to_list(x):
+        if x is None:
+            return []
+        if isinstance(x, str):
+            s = x.strip()
+            return [s] if s else []
+        if isinstance(x, list):
+            out=[]
+            for v in x:
+                if isinstance(v, str):
+                    s=v.strip()
+                    if s:
+                        out.append(s)
+            return out
+        return []
+
+    steps = to_list(plan)
+    for s in to_list(subplan):
+        if s not in steps:
+            steps.append(s)
+    return steps
+
 def _format_candidates(candidates: List[Dict[str, Any]], *, limit: int = 3) -> str:
     rows = []
     for cand in candidates[:limit]:
@@ -276,13 +301,21 @@ def action_from_payload(payload: Dict[str, Any] | None) -> ActionUnion | None:
         )
     if type_name == "repair":
         plan_targets = payload.get("plan_targets") or payload.get("targets") or []
+        if not isinstance(plan_targets, list):
+            plan_targets = []
+        plan_steps = _normalize_plan_steps(payload.get("plan"), payload.get("subplan"))
+        patch = payload.get("patch")
+        if patch is not None and not isinstance(patch, dict):
+            patch = None
         return RepairAction(
             apply=bool(payload.get("apply", True)),
             issue=dict(payload.get("issue") or {}),
-            plan=payload.get("plan"),
-            plan_targets=list(plan_targets),
-            patch=payload.get("patch"),
+            plan=plan_steps,
+            plan_targets=plan_targets,
+            patch=patch,
         )
+
+
     if type_name == "submit":
         return SubmitAction()
     if type_name == "noop":
@@ -295,9 +328,9 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
         return {
             "type": "explore",
             "op": action.op,
-            "anchors": action.anchors,
+            "anchors": (action.anchors[:1] if isinstance(action.anchors, list) and len(action.anchors)>1 else action.anchors),
             "nodes": action.nodes,
-            "query": action.query,
+            "query": (action.query[0] if isinstance(action.query, list) and action.query else action.query),
             "hop": action.hop,
             "limit": action.limit,
         }
@@ -313,7 +346,7 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
             "type": "repair",
             "apply": action.apply,
             "issue": action.issue,
-            "plan": action.plan,
+            "plan": _normalize_plan_steps(action.plan),
             "plan_targets": action.plan_targets,
             "patch": action.patch,
         }
