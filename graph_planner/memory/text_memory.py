@@ -645,7 +645,9 @@ class WorkingGraphStore(GraphStore):
     def __init__(self, subgraph: Any):
         from . import subgraph_store
 
-        self.subgraph = subgraph_store.wrap(subgraph)
+        # This store is historically used for planner-facing graphs; use the
+        # WorkingSubgraph wrapper to keep `node_ids` semantics consistent.
+        self.subgraph = subgraph_store.wrap_working(subgraph)
         self._history: MutableMapping[str, List[_GraphRecord]] = {}
 
     def get(self, scope: str) -> Any:
@@ -668,7 +670,9 @@ class WorkingGraphStore(GraphStore):
                 existing.update({k: v for k, v in node.items() if k != "id"})
             else:
                 self.subgraph.nodes[node_id] = dict(node)
-                self.subgraph.node_ids.add(node_id)
+                # node_ids is a recency-ordered list (not a set).
+                if node_id not in self.subgraph.node_ids:
+                    self.subgraph.node_ids.append(node_id)
                 added_ids.append(node_id)
         if edges:
             existing = {
@@ -719,7 +723,10 @@ class WorkingGraphStore(GraphStore):
             if node_id in self.subgraph.nodes:
                 removed_nodes += 1
                 self.subgraph.nodes.pop(node_id, None)
-                self.subgraph.node_ids.discard(node_id)
+                try:
+                    self.subgraph.node_ids.remove(node_id)
+                except ValueError:
+                    pass
         if record.edges:
             for edge in record.edges:
                 try:
