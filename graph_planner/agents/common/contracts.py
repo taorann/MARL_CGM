@@ -113,44 +113,37 @@ class CGMPatch:
     summary: Optional[str] = None
 
 
-PLANNER_SYSTEM_PROMPT = """You are the Graph Planner decision model.
-Every reply MUST contain exactly one action block in the format:
+PLANNER_SYSTEM_PROMPT = """You are GraphPlanner, a model-driven planning agent for code repair.
 
-<function=ACTION_NAME>
-  <param name="thought"><![CDATA[free-form reasoning]]></param>
-  <param name="action">{JSON}</param>
-</function>
+Output EXACTLY ONE JSON object inside a fenced ```json block. No extra text.
 
-Replace ACTION_NAME with one of: explore, memory, repair, submit, noop.
-The "action" param MUST be a single JSON object describing the full action,
-including "type" (matching ACTION_NAME) and required fields (e.g. memory.intent).
+Concepts:
+- repo_graph: full repository graph (read-only).
+- working_subgraph (W): planner-facing, for exploration/reading/reasoning; may be noisy.
+- memory_subgraph (M): patch-facing (for CGM); must be small and high-signal.
 
-For explore actions, set:
-- op="find": use either anchors and/or a query (PREFERRED: query as a list of keyword strings).
-  Example:
-    {"type":"explore","op":"find","query":["separability_matrix","CompoundModel","nested"],"limit":50}
-  Do NOT include "hop" for find.
-- op="expand": requires anchors (or nodes that can be converted to anchors) and may include hop (0-2).
-  Example:
-    {"type":"explore","op":"expand","anchors":[{"id":"..."}],"hop":1,"limit":30}
+Actions:
+1) explore/find
+   - HARD RULE: provide at most ONE query term and at most ONE anchor.
+   - Purpose: retrieve candidate code locations + snippets into working_subgraph.
 
-Do NOT use a separate "read" op (deprecated). If you need code context, rely on:
-(1) the working subgraph snippets already in the observation, and/or
-(2) candidate snippets attached by explore.find.
+2) explore/expand
+   - Expand around ONE anchor to bring more code into working_subgraph.
 
+3) memory (intent: commit | delete)
+   - Select a small set of node_ids from working_subgraph and project them into memory_subgraph.
+   - Prefer selector.nodes = [node_id, ...].
+   - Do NOT describe this as "merge then clear working"; keep working readable by pruning unmemorized noise.
 
-For memory actions, set:
-- intent must be exactly one of: "commit" or "delete".
-  (You may use natural synonyms like "save"/"remove"; the system will normalise them.)
+4) repair
+   - HARD RULE: only call repair if memory_subgraph is NON-EMPTY.
+   - Provide plan as a LIST of short steps (plan: ["...", "..."]).
+   - Use memory_subgraph as the main context for patch generation.
 
-For repair actions, set:
-- plan: a concise step-by-step plan (string or list of short steps). REQUIRED when apply=true.
-- focus_ids: optional list of node ids to focus the patch context (keep it small, e.g. <= 3).
-- apply: true to call CGM and apply a patch; false to only propose a plan.
+5) submit
+   - Run tests to validate the patch.
 
-If the task is complex, break it into small steps and iterate: explore → repair(apply=true) → test → repeat.
-
-Do not emit any other text outside the block.
+Always obey the hard rules above.
 """
 
 
@@ -473,9 +466,16 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         anchors = _ensure_dict_list(params.get("anchors"))
         nodes = _ensure_str_list(params.get("nodes"))
         query_raw = params.get("query")
-
-        query: Any = None
-
+        query: Any = query_raw
+        trimmed: Dict[str, Any] = {}
+        if isinstance(query, list) and len(query) > 1:
+            trimmed["query"] = {"from": len(query), "to": 1}
+            query = query[:1]
+        if isinstance(anchors, list) and len(anchors) > 1:
+            trimmed["anchors"] = {"from": len(anchors), "to": 1}
+            anchors = anchors[:1]
+        if trimmed:
+            meta["trimmed"] = trimmed
         if isinstance(query_raw, list):
 
             # Prefer keyword-list form for deterministic parsing.
@@ -631,42 +631,38 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         return _attach_meta(MemoryAction(target=target, intent=intent, selector=selector), meta)
 
     if action_name == "repair":
-        apply_flag = _coerce_bool(params.get("apply"), default=True)
-
-        # Unified field name: prefer `plan`, but accept legacy `subplan`.
-        plan_raw = params.get("plan")
-        if plan_raw is None:
-            plan_raw = params.get("subplan")
-
-        plan_text = ""
-        if isinstance(plan_raw, list):
-            steps = [str(s).strip() for s in plan_raw if str(s).strip()]
-            plan_text = "\n".join(f"- {s}" for s in steps)
-        elif isinstance(plan_raw, str):
-            plan_text = plan_raw.strip()
-        elif plan_raw is None:
-            plan_text = ""
-        else:
-            plan_text = str(plan_raw).strip()
-
-        # Be strict when we're about to apply a patch.
-        if apply_flag and not plan_text:
-            raise ProtocolError(
-                PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
-                "repair action requires non-empty plan when apply=true",
-            )
-
-        focus_ids = _ensure_str_list(params.get("focus_ids"))
-        plan_targets = [{"id": fid, "why": "planner-focus"} for fid in focus_ids if fid]
-
+        apply_flag = bool(payload.get("apply", False))
+        plan_raw = payload.get("plan", [])
+        subplan_raw = payload.get("subplan", None)
+        def _to_steps(x):
+            if x is None:
+                return []
+            if isinstance(x, str):
+                s = x.strip()
+                return [s] if s else []
+            if isinstance(x, list):
+                out = []
+                for v in x:
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if s:
+                            out.append(s)
+                return out
+            return []
+        plan_steps = _to_steps(plan_raw)
+        for s in _to_steps(subplan_raw):
+            if s not in plan_steps:
+                plan_steps.append(s)
+        if (not plan_steps) and apply_flag:
+            meta.setdefault("warnings", []).append("missing-plan")
+        plan_targets = payload.get("plan_targets", [])
+        if not isinstance(plan_targets, list):
+            plan_targets = []
+        patch = payload.get("patch", None)
+        if patch is not None and not isinstance(patch, dict):
+            patch = None
         return _attach_meta(
-            RepairAction(
-                apply=apply_flag,
-                issue={},
-                plan=(plan_text or None),
-                plan_targets=plan_targets,
-                patch=None,
-            ),
+            RepairAction(apply=apply_flag, issue=issue, plan=plan_steps, plan_targets=plan_targets, patch=patch),
             meta,
         )
 
