@@ -751,6 +751,19 @@ class NoteTextStore(TextStore):
         notes.append(_NoteRecord(note_id=note_id, text=note))
         return note_id
 
+    def get(self, scope: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return notes as a list of dicts: {note_id, text} (optionally limited)."""
+        scope_key = scope or "session"
+        notes = self._notes.get(scope_key, [])
+        if limit is not None:
+            try:
+                lim = int(limit)
+            except Exception:
+                lim = 0
+            if lim > 0:
+                notes = notes[-lim:]
+        return [{"note_id": int(n.note_id), "text": str(n.text)} for n in notes]
+
     def remove(self, scope: str, selector: Optional[str] = None) -> int:
         scope_key = scope or "session"
         notes = self._notes.get(scope_key)
