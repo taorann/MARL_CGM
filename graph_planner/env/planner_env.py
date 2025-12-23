@@ -702,6 +702,18 @@ class PlannerEnv:
                         return ExploreAction(type="explore", op="find", query=query, anchors=[], nodes=[])
             except Exception:
                 pass
+            # v5 simplified protocol: the planner only provides a high-level plan.
+            # The environment always applies the patch and supplies issue metadata.
+            try:
+                payload = dict(payload)
+            except Exception:
+                payload = {"type": "repair"}
+            payload.setdefault("apply", True)
+            payload.setdefault("issue", self.issue or {})
+            # Do not accept planner-proposed patches/targets.
+            payload.pop("patch", None)
+            payload.pop("plan_targets", None)
+            payload.pop("targets", None)
             return RepairAction(**payload)
         if action_type == "submit":
             return SubmitAction(**payload)
