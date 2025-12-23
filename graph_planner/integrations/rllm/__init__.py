@@ -1,4 +1,9 @@
-"""RLLM integration helpers with lazy imports to avoid circular dependencies."""
+"""rLLM integration helpers.
+
+GraphPlanner evaluation assumes rLLM and the corresponding environment classes
+are available. We therefore import and register eagerly and allow ImportError to
+surface instead of silently substituting ``None``.
+"""
 
 from __future__ import annotations
 
@@ -16,33 +21,24 @@ from .dataset import (
 )
 from .registry import register_rllm_components
 
-ensure_rllm_importable()
+if not ensure_rllm_importable():
+    raise RuntimeError("Unable to import vendored rLLM modules")
 
-try:  # Best-effort eager registration for Hydra-driven entrypoints
-    from .env import GraphPlannerRLLMEnv as _GraphPlannerRLLMEnv  # noqa: F401
-except ImportError:  # pragma: no cover - optional dependency
-    _GraphPlannerRLLMEnv = None
-    GraphPlannerRLLMEnv = None  # type: ignore[assignment]
-else:
-    try:
-        register_rllm_components(GraphPlannerRLLMAgent, _GraphPlannerRLLMEnv, name="graph_planner_repoenv")
-    except ImportError:  # pragma: no cover - optional dependency
-        GraphPlannerRLLMEnv = None  # type: ignore[assignment]
-    else:
-        GraphPlannerRLLMEnv = _GraphPlannerRLLMEnv
+from .env import GraphPlannerRLLMEnv
 
-try:
-    from .cgm_env import CGMRLLMEnv as _CGMRLLMEnv  # noqa: F401
-except ImportError:  # pragma: no cover - optional dependency
-    _CGMRLLMEnv = None
-    CGMRLLMEnv = None  # type: ignore[assignment]
-else:
-    try:
-        register_rllm_components(CGMRLLMAgent, _CGMRLLMEnv, name="graph_planner_cgm")
-    except ImportError:  # pragma: no cover - optional dependency
-        CGMRLLMEnv = None  # type: ignore[assignment]
-    else:
-        CGMRLLMEnv = _CGMRLLMEnv
+register_rllm_components(
+    GraphPlannerRLLMAgent,
+    GraphPlannerRLLMEnv,
+    name="graph_planner_repoenv",
+)
+
+from .cgm_env import CGMRLLMEnv
+
+register_rllm_components(
+    CGMRLLMAgent,
+    CGMRLLMEnv,
+    name="graph_planner_cgm",
+)
 
 __all__ = [
     "GraphPlannerRLLMAgent",
@@ -59,19 +55,9 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> Any:  # pragma: no cover - trivial dispatcher
-    """延迟导入 rLLM 组件，避免未安装依赖时报错。"""
+def __getattr__(name: str) -> Any:  # pragma: no cover
+    """Lazy-load non-critical symbols."""
 
-    if name == "GraphPlannerRLLMEnv":
-        module = import_module("graph_planner.integrations.rllm.env")
-        env_cls = module.GraphPlannerRLLMEnv
-        register_rllm_components(GraphPlannerRLLMAgent, env_cls, name="graph_planner_repoenv")
-        return env_cls
-    if name == "CGMRLLMEnv":
-        module = import_module("graph_planner.integrations.rllm.cgm_env")
-        env_cls = module.CGMRLLMEnv
-        register_rllm_components(CGMRLLMAgent, env_cls, name="graph_planner_cgm")
-        return env_cls
     if name in {
         "GRAPH_PLANNER_DATASET_NAME",
         "GRAPH_PLANNER_CGM_DATASET_NAME",
