@@ -155,7 +155,10 @@ PLANNER_CONTRACT = PlannerContract(
         # Compat: accept legacy params (op/anchors/...) and older "k" wrapper if emitted by older prompts.
         "explore": {"thought", "action", "k", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
         "memory": {"thought", "action", "k", "target", "intent", "selector"},
-        "repair": {"thought", "action", "k", "plan", "subplan", "focus_ids", "apply"},
+        # v5 simplified: planner should only request a repair with a high-level plan.
+        # The environment will always run CGM + apply edits; the planner must NOT propose patches.
+        # For backward-compat we still accept `subplan` but always normalise to `plan`.
+        "repair": {"thought", "action", "k", "plan", "subplan"},
         "submit": {"thought", "action", "k"},
         "noop": {"thought", "action", "k"},
     },
