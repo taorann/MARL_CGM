@@ -300,19 +300,15 @@ def action_from_payload(payload: Dict[str, Any] | None) -> ActionUnion | None:
             selector=payload.get("selector"),
         )
     if type_name == "repair":
-        plan_targets = payload.get("plan_targets") or payload.get("targets") or []
-        if not isinstance(plan_targets, list):
-            plan_targets = []
+        # v5 simplified protocol: the planner should ONLY provide a high-level plan.
+        # The env will always run CGM and apply edits; ignore any patch/targets the model emits.
         plan_steps = _normalize_plan_steps(payload.get("plan"), payload.get("subplan"))
-        patch = payload.get("patch")
-        if patch is not None and not isinstance(patch, dict):
-            patch = None
         return RepairAction(
-            apply=bool(payload.get("apply", True)),
-            issue=dict(payload.get("issue") or {}),
+            apply=True,
+            issue={},
             plan=plan_steps,
-            plan_targets=plan_targets,
-            patch=patch,
+            plan_targets=[],
+            patch=None,
         )
 
 
@@ -342,13 +338,10 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
             "selector": action.selector,
         }
     if isinstance(action, RepairAction):
+        # Only serialise the minimal planner-facing payload.
         return {
             "type": "repair",
-            "apply": action.apply,
-            "issue": action.issue,
             "plan": _normalize_plan_steps(action.plan),
-            "plan_targets": action.plan_targets,
-            "patch": action.patch,
         }
     if isinstance(action, SubmitAction):
         return {"type": "submit"}
