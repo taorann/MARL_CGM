@@ -360,10 +360,8 @@ class PlannerEnv:
         self._repo_nodes_by_id: Dict[str, Dict[str, Any]] = {}
         self._repo_edges: List[Dict[str, Any]] = []
 
-        # Text memory 相关
-        self.memory_graph_store: Optional[text_memory.WorkingGraphStore] = None
+        # Text memory (planner-only): a simple session-scoped note list.
         self.memory_text_store: Optional[text_memory.NoteTextStore] = None
-        self.memory_state: Optional[text_memory.TurnState] = None
 
         # 最近一步 explore/find|expand 的结果
         self.last_candidates: List[Dict[str, Any]] = []
@@ -465,31 +463,12 @@ class PlannerEnv:
         # === 3) 工作图 = 记忆图的拷贝（此时也是空图） ===
         self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
 
-        # === 4) 初始化 text_memory（基于 memory_subgraph） ===
-        self.memory_graph_store = text_memory.WorkingGraphStore(self.memory_subgraph)
+        # === 4) 初始化 text memory（planner-only） ===
+        # Text memory is a simple list of human-readable notes for the planner.
+        # It is NOT part of the graph memory and is NOT fed into CGM/collate.
         self.memory_text_store = text_memory.NoteTextStore()
-        self.memory_state = text_memory.TurnState(
-            graph_store=self.memory_graph_store,
-            text_store=self.memory_text_store,
-        )
-        # 此时 memory_subgraph 为空，size 从 0 开始计
-        self.memory_state.size = text_memory.Size(
-            nodes=len(self.memory_subgraph.nodes),
-            edges=len(self.memory_subgraph.edges),
-            frontier=0,
-            planner_tokens_est=0,
-            cgm_tokens_est=0,
-        )
-        caps = self.config_dict.get("memory_caps") or DEFAULT_MEMORY_CAPS
-        self.memory_state.caps = text_memory.Size(
-            nodes=int(caps.get("nodes", DEFAULT_MEMORY_CAPS["nodes"])),
-            edges=int(caps.get("edges", DEFAULT_MEMORY_CAPS["edges"])),
-            frontier=int(caps.get("frontier", DEFAULT_MEMORY_CAPS["frontier"])),
-            planner_tokens_est=int(caps.get("planner_tokens", DEFAULT_MEMORY_CAPS["planner_tokens"])),
-            cgm_tokens_est=int(caps.get("cgm_tokens", DEFAULT_MEMORY_CAPS["cgm_tokens"])),
-        )
 
-        # Telemetry: start a fresh episode for this issue/task
+# Telemetry: start a fresh episode for this issue/task
         try:
             self.telemetry.start_episode(
                 task_id=self.issue_id,
@@ -592,15 +571,7 @@ class PlannerEnv:
         else:
             info = {"kind": "noop"}
 
-        kind = info.get("kind")
-        if self.memory_state:
-            if kind == "explore":
-                self.memory_state.latest_explore = info
-            elif kind and kind != "memory":
-                # 将非 explore 的工具输出也视作“observation”，便于 text memory commit
-                self.memory_state.latest_non_explore = info
-                self.memory_state.latest_observation = info
-
+        # NOTE: text memory is handled only via explicit memory actions (target="observation").
         self.last_info = info
         reward = self._compute_reward(info)
         done = bool(info.get("done"))
@@ -1032,93 +1003,148 @@ class PlannerEnv:
             scored = mixed
 
         return scored[:total_limit]
+def _handle_memory(self, act: MemoryAction) -> Dict[str, Any]:
+    """Handle memory action.
+
+    We maintain two distinct memories:
+
+    - **Graph memory** (memory_subgraph): high-signal induced subgraph used for CGM/collate.
+      The planner commits nodes by id (select_ids) and we project W[S] -> M.
+
+    - **Text memory** (memory_text_store): a simple session-scoped list of notes, only exposed
+      to the planner via observation. CGM does *not* see it.
+
+    Selector semantics (v7):
+      - select_ids / commit_ids / nodes / node_ids / ids : the ids to *commit to graph memory*
+      - keep_ids : ids to keep in working only (NOT committed)
+      - note / note_text / text : free-form text to commit to text memory when target="observation"
+      - note_id / note_ids / selector : which note(s) to delete when intent="delete" and target="observation"
+    """
+
+    raw_selector = act.selector
+    if isinstance(raw_selector, dict):
+        selector = raw_selector
+    elif isinstance(raw_selector, (list, tuple)):
+        selector = {"select_ids": list(raw_selector)}
+    elif isinstance(raw_selector, str):
+        # Allow shorthand: a single id or 'latest'
+        selector = ({"selector": raw_selector} if (act.target or "").lower() == "observation" else {"select_ids": [raw_selector]})
+    else:
+        selector = {}
 
 
-    def _handle_memory(self, act: MemoryAction) -> Dict[str, Any]:
-        """Handle memory action (v5 semantics).
+    tag = selector.get("tag") if isinstance(selector.get("tag"), str) else None
 
-        working_subgraph (W): planner-facing, can be noisy, nodes carry `memorized` flag.
-        memory_subgraph (M): CGM-facing, high-signal; populated by projecting a small induced subgraph from W.
+    # ---- text memory path (planner-only) ----
+    if (act.target or "").lower() == "observation":
+        if self.memory_text_store is None:
+            self.memory_text_store = text_memory.NoteTextStore()
 
-        intent=commit:
-          1) select_ids (S) from working
-          2) project W[S] into memory (merge)
-          3) mark selected nodes in working as memorized
-          4) prune working: keep memorized + a small recent unmemorized frontier
+        info: Dict[str, Any] = {"kind": "memory", "target": "observation", "intent": act.intent}
 
-        intent=delete:
-          remove selected nodes from memory, and unmark them in working if present.
-        """
-        selector = act.selector or {}
-        if not isinstance(selector, dict):
-            selector = {}
+        if act.intent == "commit":
+            note_text = (
+                selector.get("note_text")
+                or selector.get("note")
+                or selector.get("text")
+                or selector.get("content")
+            )
+            note_text = _safe_str(note_text, "").strip()
+            if not note_text:
+                info["skipped_reason"] = "empty_note_text"
+                return info
 
-        # --- extract selected ids (best-effort) ---
-        raw_ids = (
-            selector.get("select_ids")
-            or selector.get("commit_ids")
-            or selector.get("keep_ids")
-            or selector.get("nodes")
-            or selector.get("node_ids")
-            or selector.get("ids")
-            or []
-        )
-        if isinstance(raw_ids, str):
-            selected_ids = [raw_ids]
-        else:
-            selected_ids = [str(x) for x in (raw_ids or []) if x is not None]
+            note_id = self.memory_text_store.append("session", note_text)
+            info["note_id"] = note_id
+            info["notes_total"] = len(self.memory_text_store.get("session"))
+            return info
 
-        tag = selector.get("tag") if isinstance(selector.get("tag"), str) else None
-        note = selector.get("note") if isinstance(selector.get("note"), str) else None
-        top_k = selector.get("top_k")
-        try:
-            top_k = int(top_k) if top_k is not None else 8
-        except Exception:
-            top_k = 8
-
-        keep_recent = selector.get("keep_recent_unmemorized")
-        try:
-            keep_recent = int(keep_recent) if keep_recent is not None else 20
-        except Exception:
-            keep_recent = 20
-
-        w_before = subgraph_store.stats(self.working_subgraph)
-        m_before = subgraph_store.stats(self.memory_subgraph)
-
-        info: Dict[str, Any] = {
-            "kind": "memory",
-            "intent": act.intent,
-            "target": act.target,
-            "selected_for_memory": 0,
-            "auto_selected": False,
-            "pruned_unmemorized": 0,
-            "working_nodes_before": w_before.get("n_nodes", 0),
-            "working_memorized_before": w_before.get("n_memorized", 0),
-            "working_unmemorized_before": w_before.get("n_unmemorized", 0),
-            "memory_nodes_before": m_before.get("n_nodes", 0),
-        }
-
-        # Ensure we always have a memory_state for text memory operations.
-        if getattr(self, "memory_state", None) is None:
-            try:
-                self.memory_state = text_memory.MemoryState()
-            except Exception:
-                self.memory_state = None
-
-        # -------------- delete --------------
         if act.intent == "delete":
-            # Delete from memory_subgraph
-            mem_nodes = getattr(self.memory_subgraph, "nodes", {}) or {}
-            mem_edges = getattr(self.memory_subgraph, "edges", []) or []
-            selected_set = set(selected_ids)
+            raw = (
+                selector.get("note_id")
+                or selector.get("note_ids")
+                or selector.get("ids")
+                or selector.get("selector")
+                or "latest"
+            )
+            deleted: List[Any] = []
+            if isinstance(raw, (list, tuple)):
+                for x in raw:
+                    ok = self.memory_text_store.remove("session", selector=str(x))
+                    if ok:
+                        deleted.append(x)
+            else:
+                ok = self.memory_text_store.remove("session", selector=str(raw))
+                if ok:
+                    deleted.append(raw)
 
-            # remove nodes
-            if isinstance(mem_nodes, dict) and selected_set:
+            info["deleted"] = deleted
+            info["notes_total"] = len(self.memory_text_store.get("session"))
+            return info
+
+        info["skipped_reason"] = f"unknown_intent:{act.intent}"
+        return info
+
+    # ---- graph memory path (CGM-facing) ----
+    raw_sel = (
+        selector.get("select_ids")
+        or selector.get("commit_ids")
+        or selector.get("nodes")
+        or selector.get("node_ids")
+        or selector.get("ids")
+        or []
+    )
+    if isinstance(raw_sel, str):
+        selected_ids = [raw_sel]
+    else:
+        selected_ids = [str(x) for x in (raw_sel or []) if x is not None]
+
+    raw_keep = selector.get("keep_ids") or []
+    if isinstance(raw_keep, str):
+        keep_ids = [raw_keep]
+    else:
+        keep_ids = [str(x) for x in (raw_keep or []) if x is not None]
+    keep_set = {x for x in keep_ids if isinstance(x, str) and x}
+
+    top_k = selector.get("top_k")
+    try:
+        top_k = int(top_k) if top_k is not None else 8
+    except Exception:
+        top_k = 8
+
+    keep_recent = selector.get("keep_recent_unmemorized")
+    try:
+        keep_recent = int(keep_recent) if keep_recent is not None else 20
+    except Exception:
+        keep_recent = 20
+
+    w_before = subgraph_store.stats(self.working_subgraph)
+    m_before = subgraph_store.stats(self.memory_subgraph)
+
+    info = {
+        "kind": "memory",
+        "target": act.target or "explore",
+        "intent": act.intent,
+        "selected_for_memory": 0,
+        "auto_selected": False,
+        "pruned_unmemorized": 0,
+        "working_nodes_before": w_before.get("n_nodes", 0),
+        "working_memorized_before": w_before.get("n_memorized", 0),
+        "working_unmemorized_before": w_before.get("n_unmemorized", 0),
+        "memory_nodes_before": m_before.get("n_nodes", 0),
+    }
+
+    # ---------- delete from graph memory ----------
+    if act.intent == "delete":
+        selected_set = {nid for nid in selected_ids if isinstance(nid, str) and nid}
+        if selected_set:
+            mem_nodes = getattr(self.memory_subgraph, "nodes", {}) or {}
+            if isinstance(mem_nodes, dict):
                 for nid in list(mem_nodes.keys()):
                     if nid in selected_set:
                         del mem_nodes[nid]
-            # remove edges incident to deleted nodes
-            if selected_set and isinstance(mem_edges, list):
+            mem_edges = getattr(self.memory_subgraph, "edges", []) or []
+            if isinstance(mem_edges, list):
                 new_edges = []
                 for e in mem_edges:
                     if not isinstance(e, dict):
@@ -1130,137 +1156,15 @@ class PlannerEnv:
                     new_edges.append(e)
                 self.memory_subgraph.edges = new_edges
 
-            # unmark in working if present
-            for nid in selected_ids:
-                wn = self.working_subgraph.get_node(nid)
-                if isinstance(wn, dict):
-                    wn["memorized"] = False
-                    wn["memorized_at_step"] = None
+        for nid in selected_ids:
+            wn = self.working_subgraph.get_node(nid)
+            if isinstance(wn, dict):
+                wn["memorized"] = False
+                wn["memorized_at_step"] = None
 
-            # prune working (do not clear)
-            pruned = subgraph_store.prune_working(
-                self.working_subgraph,
-                keep_ids=set(),
-                keep_recent_unmemorized=keep_recent,
-            )
-            info["pruned_unmemorized"] = int(pruned or 0)
-
-            w_after = subgraph_store.stats(self.working_subgraph)
-            m_after = subgraph_store.stats(self.memory_subgraph)
-            info.update(
-                {
-                    "working_nodes_after": w_after.get("n_nodes", 0),
-                    "working_memorized_after": w_after.get("n_memorized", 0),
-                    "working_unmemorized_after": w_after.get("n_unmemorized", 0),
-                    "memory_nodes_after": m_after.get("n_nodes", 0),
-                }
-            )
-            return info
-
-        # -------------- commit --------------
-        if act.intent != "commit":
-            # Unknown intent -> noop but return structured info.
-            w_after = subgraph_store.stats(self.working_subgraph)
-            m_after = subgraph_store.stats(self.memory_subgraph)
-            info.update(
-                {
-                    "working_nodes_after": w_after.get("n_nodes", 0),
-                    "working_memorized_after": w_after.get("n_memorized", 0),
-                    "working_unmemorized_after": w_after.get("n_unmemorized", 0),
-                    "memory_nodes_after": m_after.get("n_nodes", 0),
-                    "skipped_reason": f"unknown_intent:{act.intent}",
-                }
-            )
-            return info
-
-        # Auto-select if model didn't specify.
-        if not selected_ids:
-            info["auto_selected"] = True
-            # Prefer nodes with snippets, most recently touched.
-            candidates = []
-            node_ids = getattr(self.working_subgraph, "node_ids", [])
-            # node_ids is ordered by recency; reverse it to go newest -> oldest.
-            for nid in reversed(list(node_ids)):
-                n = self.working_subgraph.get_node(nid)
-                if not isinstance(n, dict):
-                    continue
-                if n.get("memorized"):
-                    continue
-                has_snip = bool(n.get("snippet") or n.get("snippet_lines"))
-                touched = n.get("gp_last_touched_step")
-                try:
-                    touched = int(touched) if touched is not None else -1
-                except Exception:
-                    touched = -1
-                score = (1 if has_snip else 0, touched)
-                candidates.append((score, nid))
-            candidates.sort(reverse=True)
-            selected_ids = [nid for _, nid in candidates[:top_k]]
-
-        selected_set = set(selected_ids)
-        info["selected_for_memory"] = len(selected_set)
-
-        if not selected_set:
-            # Nothing to commit; still prune a bit for stability.
-            pruned = subgraph_store.prune_working(
-                self.working_subgraph, keep_ids=set(), keep_recent_unmemorized=keep_recent
-            )
-            info["pruned_unmemorized"] = int(pruned or 0)
-            w_after = subgraph_store.stats(self.working_subgraph)
-            m_after = subgraph_store.stats(self.memory_subgraph)
-            info.update(
-                {
-                    "working_nodes_after": w_after.get("n_nodes", 0),
-                    "working_memorized_after": w_after.get("n_memorized", 0),
-                    "working_unmemorized_after": w_after.get("n_unmemorized", 0),
-                    "memory_nodes_after": m_after.get("n_nodes", 0),
-                    "skipped_reason": "empty_selection",
-                }
-            )
-            return info
-
-        # Project induced subgraph W[S] into memory.
-        proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
-        subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
-        subgraph_store.add_edges(self.memory_subgraph, proj_edges)
-
-        # Mark selected nodes in working.
-        for nid in selected_set:
-            n = self.working_subgraph.get_node(nid)
-            if isinstance(n, dict):
-                n["memorized"] = True
-                n["memorized_at_step"] = int(getattr(self, "steps", 0))
-                if tag:
-                    n["tag"] = tag
-
-        # Optionally commit a note into text memory (if available).
-        if getattr(self, "memory_state", None) is not None and (tag or note):
-            try:
-                prev_latest = getattr(self.memory_state, "latest_explore", None)
-                # Create a minimal explore-like record so text_memory can store.
-                obs = {
-                    "kind": "explore",
-                    "summary": note or "",
-                    "candidates": [{"id": nid} for nid in list(selected_set)],
-                    "edges": proj_edges,
-                }
-                self.memory_state.latest_explore = obs
-                _ = text_memory.memory_commit(
-                    self.memory_state,
-                    target=act.target or "explore",
-                    tag=tag,
-                    note=note,
-                )
-                self.memory_state.latest_explore = prev_latest
-                info["text_memory_committed"] = True
-            except Exception as e:
-                info["text_memory_committed"] = False
-                info["text_memory_error"] = str(e)
-
-        # Prune working: keep memorized + a small frontier.
         pruned = subgraph_store.prune_working(
             self.working_subgraph,
-            keep_ids=selected_set,
+            keep_ids=keep_set,
             keep_recent_unmemorized=keep_recent,
         )
         info["pruned_unmemorized"] = int(pruned or 0)
@@ -1276,6 +1180,84 @@ class PlannerEnv:
             }
         )
         return info
+
+    # ---------- commit to graph memory ----------
+    if act.intent != "commit":
+        info["skipped_reason"] = f"unknown_intent:{act.intent}"
+        return info
+
+    selected_set = {nid for nid in selected_ids if isinstance(nid, str) and nid}
+    if not selected_set:
+        info["auto_selected"] = True
+        candidates = []
+        for nid in reversed(list(getattr(self.working_subgraph, "node_ids", []) or [])):
+            n = self.working_subgraph.get_node(nid)
+            if not isinstance(n, dict) or n.get("memorized"):
+                continue
+            has_snip = bool(n.get("snippet") or n.get("snippet_lines"))
+            touched = n.get("gp_last_touched_step")
+            try:
+                touched = int(touched) if touched is not None else -1
+            except Exception:
+                touched = -1
+            score = (1 if has_snip else 0, touched)
+            candidates.append((score, nid))
+        candidates.sort(reverse=True)
+        selected_set = {nid for _, nid in candidates[:top_k]}
+
+    info["selected_for_memory"] = len(selected_set)
+
+    if not selected_set:
+        pruned = subgraph_store.prune_working(
+            self.working_subgraph,
+            keep_ids=keep_set,
+            keep_recent_unmemorized=keep_recent,
+        )
+        info["pruned_unmemorized"] = int(pruned or 0)
+        w_after = subgraph_store.stats(self.working_subgraph)
+        m_after = subgraph_store.stats(self.memory_subgraph)
+        info.update(
+            {
+                "working_nodes_after": w_after.get("n_nodes", 0),
+                "working_memorized_after": w_after.get("n_memorized", 0),
+                "working_unmemorized_after": w_after.get("n_unmemorized", 0),
+                "memory_nodes_after": m_after.get("n_nodes", 0),
+                "skipped_reason": "empty_selection",
+            }
+        )
+        return info
+
+    proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
+    subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
+    subgraph_store.add_edges(self.memory_subgraph, proj_edges)
+
+    for nid in selected_set:
+        n = self.working_subgraph.get_node(nid)
+        if isinstance(n, dict):
+            n["memorized"] = True
+            n["memorized_at_step"] = int(getattr(self, "steps", 0))
+            if tag:
+                n["tag"] = tag
+
+    keep_union = set(selected_set) | set(keep_set)
+    pruned = subgraph_store.prune_working(
+        self.working_subgraph,
+        keep_ids=keep_union,
+        keep_recent_unmemorized=keep_recent,
+    )
+    info["pruned_unmemorized"] = int(pruned or 0)
+
+    w_after = subgraph_store.stats(self.working_subgraph)
+    m_after = subgraph_store.stats(self.memory_subgraph)
+    info.update(
+        {
+            "working_nodes_after": w_after.get("n_nodes", 0),
+            "working_memorized_after": w_after.get("n_memorized", 0),
+            "working_unmemorized_after": w_after.get("n_unmemorized", 0),
+            "memory_nodes_after": m_after.get("n_nodes", 0),
+        }
+    )
+    return info
 
     def _handle_repair(self, act: RepairAction) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "repair", "apply": act.apply, "plan": _plan_to_text(act.plan)}
@@ -1470,7 +1452,7 @@ class PlannerEnv:
             "subgraph_stats": working_stats,
             # 记忆图的统计信息（可选）
             "memory_stats": memory_stats,
-            "text_memory": text_memory.snapshot(self.memory_state) if self.memory_state else {},
+            "text_memory": {"notes": (self.memory_text_store.get('session', limit=12) if self.memory_text_store else []), "count": (len(self.memory_text_store.get('session')) if self.memory_text_store else 0)},
             "reset": bool(self.last_info.get("reset")),
             "observation_pack": obs_pack,
         }
@@ -1613,6 +1595,7 @@ print(json.dumps({'snippet_lines': snippet}))
             }
         except Exception:
             return None
+
     def _recall_memory(self, *, query: str, k: int = 8) -> Dict[str, Any]:
         q = (query or "").strip().lower()
         if not q:
@@ -1621,13 +1604,7 @@ print(json.dumps({'snippet_lines': snippet}))
         # --- 1) text memory notes ---
         notes: List[Dict[str, Any]] = []
         store = getattr(self, "memory_text_store", None)
-        raw_notes = None
-        if store is not None and hasattr(store, "_notes"):
-            # NoteTextStore: _notes[scope] -> List[_NoteRecord]
-            try:
-                raw_notes = getattr(store, "_notes", {}).get("session") or []
-            except Exception:
-                raw_notes = []
+        raw_notes = store.get("session") if store is not None else []
         if isinstance(raw_notes, list):
             # recent-first scan
             for rec in reversed(raw_notes):
@@ -1894,13 +1871,6 @@ print(json.dumps({'snippet_lines': snippet}))
         self.memory_subgraph.nodes = mem_nodes
         self.memory_subgraph.edges = mem_edges
         self.memory_subgraph.node_ids = set(mem_nodes.keys())
-
-        # keep WorkingGraphStore in sync (if present)
-        if getattr(self, "memory_graph_store", None) is not None:
-            try:
-                self.memory_graph_store.subgraph = self.memory_subgraph
-            except Exception:
-                pass
 
 
     # ------------------------------------------------------------
