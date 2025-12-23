@@ -5,7 +5,9 @@ import base64
 import json
 import os
 import re
+import uuid
 import time
+import shlex
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
@@ -108,6 +110,18 @@ def _extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
 
 
 
+
+def _plan_to_text(plan: Any) -> str:
+    """Coerce repair.plan (List[str] | str | None) into a single string."""
+    if plan is None:
+        return ""
+    if isinstance(plan, str):
+        return plan.strip()
+    if isinstance(plan, list):
+        parts = [str(x).strip() for x in plan if str(x).strip()]
+        return "\n".join(parts)
+    return str(plan).strip()
+
 def _safe_str(x: Any, default: str = "") -> str:
     if isinstance(x, str):
         return x
@@ -148,6 +162,16 @@ def _write_file_text(path: str, text: str, encoding: str = "utf-8") -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding=encoding) as f:
             f.write(text)
+    except Exception:
+        pass
+
+
+def _append_jsonl(path: str, obj: Mapping[str, Any]) -> None:
+    """Append a single JSON object as one line to `path` (best-effort)."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(obj), ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -305,6 +329,18 @@ class PlannerEnv:
             self._print_excerpt_chars = int(os.environ.get("GP_PRINT_EXCERPT_CHARS", "360"))
         except Exception:
             self._print_excerpt_chars = 360
+
+        # Lightweight, always-on JSONL step log (independent of telemetry backend).
+        # This is useful when telemetry_mod is configured as a no-op and you still
+        # want per-step traces on disk.
+        self._telemetry_root: str = (
+            os.environ.get("GP_TELEMETRY_DIR")
+            or os.environ.get("GRAPH_PLANNER_TELEMETRY_DIR")
+            or "logs/telemetry"
+        )
+        self._episode_id: Optional[str] = None
+        self._episode_dir: Optional[str] = None
+        self._steps_jsonl_path: Optional[str] = None
 
         self.steps: int = 0
         self.last_info: Dict[str, Any] = {}
@@ -468,6 +504,12 @@ class PlannerEnv:
         except Exception:
             pass
 
+        # Always-on JSONL step log: logs/telemetry/<run_id>/episodes/<episode_id>/steps.jsonl
+        try:
+            self._telemetry_jsonl_start_episode(backend_mode=backend_mode)
+        except Exception:
+            pass
+
         return self._obs()
 
     def close(self) -> None:
@@ -486,6 +528,12 @@ class PlannerEnv:
                 flush = getattr(tel, "flush", None) or getattr(tel, "close", None)
                 if callable(flush):
                     flush()
+            except Exception:
+                pass
+
+            # best-effort JSONL flush
+            try:
+                self._telemetry_jsonl_flush()
             except Exception:
                 pass
 
@@ -631,6 +679,19 @@ class PlannerEnv:
         if action_type == "memory":
             return MemoryAction(**payload)
         if action_type == "repair":
+            # v5 gate: repair requires non-empty memory_subgraph (high-signal evidence for CGM).
+            try:
+                mem_nodes = getattr(getattr(self, "memory_subgraph", None), "nodes", {}) or {}
+                if isinstance(mem_nodes, list):
+                    mem_n = len(mem_nodes)
+                else:
+                    mem_n = len(mem_nodes)
+                if mem_n <= 0:
+                    title = str((self.issue or {}).get("title") or "")
+                    query = title.strip() or "locate relevant code for the issue"
+                    return ExploreAction(type="explore", op="find", query=query, anchors=[], nodes=[])
+            except Exception:
+                pass
             # Guardrail: require at least one explore before repair to avoid blind patching.
             try:
                 if int(getattr(self, "steps", 0)) <= 1:
@@ -669,6 +730,25 @@ class PlannerEnv:
         """
 
         info: Dict[str, Any] = {"kind": "explore", "op": act.op}
+        # v5 hard rules: use a single query and a single anchor for explore.
+        trimmed: Dict[str, Any] = {}
+        query_value = act.query
+        if isinstance(query_value, list):
+            if len(query_value) > 1:
+                trimmed["query"] = {"from": len(query_value), "to": 1}
+            query_value = query_value[:1]
+        anchors = list(act.anchors or [])
+        if len(anchors) > 1:
+            trimmed["anchors"] = {"from": len(anchors), "to": 1}
+            anchors = anchors[:1]
+        # If model omitted anchors for expand/read, fall back to the last selected frontier anchor.
+        if act.op in ("expand", "read") and not anchors:
+            fa = getattr(self, "frontier_anchor_id", None)
+            if fa:
+                anchors = [{"id": fa}]
+                trimmed.setdefault("anchors", {"from": 0, "to": 1, "source": "frontier_anchor_id"})
+        if trimmed:
+            info["trimmed"] = trimmed
 
         if not self.repo_graph:
             info["error"] = "missing-repo-graph"
@@ -700,10 +780,10 @@ class PlannerEnv:
                         self._merge_memory_nodes_into_working(recall_ids, status="recalled")
 
             # 2) repo 图检索：anchors 存在才做
-            if act.anchors:
+            if anchors:
                 candidates = mem_candidates.build_mem_candidates(
                     subgraph=self.repo_graph,
-                    anchors=act.anchors,
+                    anchors=anchors,
                     max_nodes_per_anchor=max_per_anchor,
                     total_limit=total_limit,
                     dir_diversity_k=dir_diversity_k,
@@ -718,6 +798,34 @@ class PlannerEnv:
 
             self.last_candidates = candidates
             info["candidates"] = candidates
+            # v5: choose exactly one anchor and immediately attach it to working_subgraph
+            anchor_id: Optional[str] = None
+            # If the model provided an anchor, respect it (after trimming in the parser)
+            if anchors:
+                a0 = anchors[0]
+                if isinstance(a0, dict) and isinstance(a0.get("id"), str):
+                    anchor_id = a0.get("id")
+                elif isinstance(a0, str):
+                    anchor_id = a0
+            # Otherwise pick the top candidate as the frontier anchor
+            if not anchor_id and candidates:
+                c0 = candidates[0] if isinstance(candidates[0], dict) else {}
+                if isinstance(c0, dict) and isinstance(c0.get("id"), str):
+                    anchor_id = c0.get("id")
+
+            if anchor_id:
+                self.frontier_anchor_id = anchor_id
+                info["anchor_selected"] = anchor_id
+                # ensure anchor node is present in working for the planner to read
+                self._merge_repo_nodes_into_working([anchor_id], status="frontier")
+                # best-effort: attach snippet lines to the anchor node
+                try:
+                    n = self._resolve_node(anchor_id) or {}
+                    sn = self._read_node_snippet(n) if n else None
+                    if sn and isinstance(sn.get("snippet_lines"), list):
+                        self.working_subgraph.update_node(anchor_id, {"snippet_lines": sn.get("snippet_lines", [])})
+                except Exception:
+                    pass
             # auto-attach snippets for candidates (explore has no separate read op)
             cand_snippets = []
             for c in candidates:
@@ -743,7 +851,7 @@ class PlannerEnv:
         if act.op == "expand":
             candidates = mem_candidates.build_mem_candidates(
                 subgraph=self.repo_graph,
-                anchors=act.anchors,
+                anchors=anchors,
                 max_nodes_per_anchor=max_per_anchor,
                 total_limit=total_limit,
                 dir_diversity_k=dir_diversity_k,
@@ -806,8 +914,19 @@ class PlannerEnv:
                 return ""
 
         scored: List[Dict[str, Any]] = []
-        nodes = getattr(self.repo_graph, "nodes", {}) or {}
-        for nid, node in nodes.items():
+        nodes_store = getattr(self.repo_graph, "nodes", {}) or {}
+        items: List[Tuple[str, Dict[str, Any]]] = []
+        if isinstance(nodes_store, dict):
+            for nid, node in nodes_store.items():
+                if isinstance(nid, str) and isinstance(node, dict):
+                    items.append((nid, node))
+        else:
+            for node in (nodes_store or []):
+                if isinstance(node, dict):
+                    nid = node.get("id") or node.get("node_id") or node.get("name")
+                    if isinstance(nid, str):
+                        items.append((nid, node))
+        for nid, node in items:
             if not isinstance(node, dict):
                 continue
             nid_s = str(nid or node.get("id") or "")
@@ -902,197 +1021,267 @@ class PlannerEnv:
 
         return scored[:total_limit]
 
-    def _handle_memory(self, act: MemoryAction) -> Dict[str, Any]:
-        info: Dict[str, Any] = {"kind": "memory", "target": act.target, "intent": act.intent}
 
-        if not self.memory_state:
-            info["error"] = "memory-not-initialised"
+    def _handle_memory(self, act: MemoryAction) -> Dict[str, Any]:
+        """Handle memory action (v5 semantics).
+
+        working_subgraph (W): planner-facing, can be noisy, nodes carry `memorized` flag.
+        memory_subgraph (M): CGM-facing, high-signal; populated by projecting a small induced subgraph from W.
+
+        intent=commit:
+          1) select_ids (S) from working
+          2) project W[S] into memory (merge)
+          3) mark selected nodes in working as memorized
+          4) prune working: keep memorized + a small recent unmemorized frontier
+
+        intent=delete:
+          remove selected nodes from memory, and unmark them in working if present.
+        """
+        selector = act.selector or {}
+        if not isinstance(selector, dict):
+            selector = {}
+
+        # --- extract selected ids (best-effort) ---
+        raw_ids = (
+            selector.get("select_ids")
+            or selector.get("commit_ids")
+            or selector.get("keep_ids")
+            or selector.get("nodes")
+            or selector.get("node_ids")
+            or selector.get("ids")
+            or []
+        )
+        if isinstance(raw_ids, str):
+            selected_ids = [raw_ids]
+        else:
+            selected_ids = [str(x) for x in (raw_ids or []) if x is not None]
+
+        tag = selector.get("tag") if isinstance(selector.get("tag"), str) else None
+        note = selector.get("note") if isinstance(selector.get("note"), str) else None
+        top_k = selector.get("top_k")
+        try:
+            top_k = int(top_k) if top_k is not None else 8
+        except Exception:
+            top_k = 8
+
+        keep_recent = selector.get("keep_recent_unmemorized")
+        try:
+            keep_recent = int(keep_recent) if keep_recent is not None else 20
+        except Exception:
+            keep_recent = 20
+
+        w_before = subgraph_store.stats(self.working_subgraph)
+        m_before = subgraph_store.stats(self.memory_subgraph)
+
+        info: Dict[str, Any] = {
+            "kind": "memory",
+            "intent": act.intent,
+            "target": act.target,
+            "selected_for_memory": 0,
+            "auto_selected": False,
+            "pruned_unmemorized": 0,
+            "working_nodes_before": w_before.get("n_nodes", 0),
+            "working_memorized_before": w_before.get("n_memorized", 0),
+            "working_unmemorized_before": w_before.get("n_unmemorized", 0),
+            "memory_nodes_before": m_before.get("n_nodes", 0),
+        }
+
+        # Ensure we always have a memory_state for text memory operations.
+        if getattr(self, "memory_state", None) is None:
+            try:
+                self.memory_state = text_memory.MemoryState()
+            except Exception:
+                self.memory_state = None
+
+        # -------------- delete --------------
+        if act.intent == "delete":
+            # Delete from memory_subgraph
+            mem_nodes = getattr(self.memory_subgraph, "nodes", {}) or {}
+            mem_edges = getattr(self.memory_subgraph, "edges", []) or []
+            selected_set = set(selected_ids)
+
+            # remove nodes
+            if isinstance(mem_nodes, dict) and selected_set:
+                for nid in list(mem_nodes.keys()):
+                    if nid in selected_set:
+                        del mem_nodes[nid]
+            # remove edges incident to deleted nodes
+            if selected_set and isinstance(mem_edges, list):
+                new_edges = []
+                for e in mem_edges:
+                    if not isinstance(e, dict):
+                        continue
+                    u = str(e.get("u") or e.get("src") or e.get("from") or "")
+                    v = str(e.get("v") or e.get("dst") or e.get("to") or "")
+                    if u in selected_set or v in selected_set:
+                        continue
+                    new_edges.append(e)
+                self.memory_subgraph.edges = new_edges
+
+            # unmark in working if present
+            for nid in selected_ids:
+                wn = self.working_subgraph.get_node(nid)
+                if isinstance(wn, dict):
+                    wn["memorized"] = False
+                    wn["memorized_at_step"] = None
+
+            # prune working (do not clear)
+            pruned = subgraph_store.prune_working(
+                self.working_subgraph,
+                keep_ids=set(),
+                keep_recent_unmemorized=keep_recent,
+            )
+            info["pruned_unmemorized"] = int(pruned or 0)
+
+            w_after = subgraph_store.stats(self.working_subgraph)
+            m_after = subgraph_store.stats(self.memory_subgraph)
+            info.update(
+                {
+                    "working_nodes_after": w_after.get("n_nodes", 0),
+                    "working_memorized_after": w_after.get("n_memorized", 0),
+                    "working_unmemorized_after": w_after.get("n_unmemorized", 0),
+                    "memory_nodes_after": m_after.get("n_nodes", 0),
+                }
+            )
             return info
 
-        # 模型侧不再暴露 scope：env 内部固定 session
-        scope = "session"
+        # -------------- commit --------------
+        if act.intent != "commit":
+            # Unknown intent -> noop but return structured info.
+            w_after = subgraph_store.stats(self.working_subgraph)
+            m_after = subgraph_store.stats(self.memory_subgraph)
+            info.update(
+                {
+                    "working_nodes_after": w_after.get("n_nodes", 0),
+                    "working_memorized_after": w_after.get("n_memorized", 0),
+                    "working_unmemorized_after": w_after.get("n_unmemorized", 0),
+                    "memory_nodes_after": m_after.get("n_nodes", 0),
+                    "skipped_reason": f"unknown_intent:{act.intent}",
+                }
+            )
+            return info
 
-        selector = act.selector
-        sel_map: Dict[str, Any] = selector if isinstance(selector, Mapping) else {}
-        tag = sel_map.get("tag") if isinstance(sel_map.get("tag"), str) else (selector if isinstance(selector, str) else None)
-        note_text = sel_map.get("note") if isinstance(sel_map.get("note"), str) else None
-
-        # node_ids（可选）
-        node_ids: List[str] = []
-        sel_nodes = sel_map.get("nodes")
-        if isinstance(sel_nodes, str):
-            node_ids = [sel_nodes]
-        elif isinstance(sel_nodes, Sequence):
-            node_ids = [nid for nid in sel_nodes if isinstance(nid, str)]
-
-        caps = getattr(self.memory_state, "caps", None) or text_memory.Size(**DEFAULT_MEMORY_CAPS)
-
-        result: Dict[str, Any] = {}
-        if act.intent == "commit":
-            if act.target == "explore":
-                # 选择性 commit：如果给了 nodes，就只把这些节点（及相关边）写入记忆
-                if node_ids:
-                    candidates: List[Dict[str, Any]] = []
-                    for nid in node_ids:
-                        w_node = self.working_subgraph.get_node(nid) if hasattr(self.working_subgraph, "get_node") else (self.working_subgraph.nodes or {}).get(nid)
-                        if not isinstance(w_node, dict):
-                            continue
-                        cand = {
-                            "id": nid,
-                            "path": w_node.get("path"),
-                            "span": w_node.get("span"),
-                            "kind": w_node.get("kind"),
-                            "summary": w_node.get("summary"),
-                        }
-                        candidates.append({k: v for k, v in cand.items() if v is not None})
-
-                    mem_ids = set(getattr(self.memory_subgraph, "node_ids", set()) or set())
-                    selected = set([c.get("id") for c in candidates if isinstance(c, dict) and c.get("id")])
-                    allowed_ids = mem_ids | selected
-
-                    edges: List[Dict[str, Any]] = []
-                    for e in (getattr(self.working_subgraph, "edges", []) or []):
-                        if not isinstance(e, dict):
-                            continue
-                        src = e.get("src")
-                        dst = e.get("dst")
-                        if not isinstance(src, str) or not isinstance(dst, str):
-                            continue
-                        if src in allowed_ids and dst in allowed_ids and (src in selected or dst in selected):
-                            edges.append(dict(e))
-
-                    fake_obs: Dict[str, Any] = {
-                        "kind": "explore",
-                        "candidates": candidates,
-                        "edges": edges,
-                        "frontier": len(candidates),
-                    }
-                    if note_text:
-                        fake_obs["summary"] = note_text
-
-                    old = self.memory_state.latest_explore
-                    self.memory_state.latest_explore = fake_obs
-                    result = text_memory.memory_commit(self.memory_state, "explore", scope, tag, caps) or {}
-                    self.memory_state.latest_explore = old
-                else:
-                    # 未指定 nodes：直接 commit 最新 explore（全量候选）
-                    result = text_memory.memory_commit(self.memory_state, "explore", scope, tag, caps) or {}
-
-                # 标记 status/tags
+        # Auto-select if model didn't specify.
+        if not selected_ids:
+            info["auto_selected"] = True
+            # Prefer nodes with snippets, most recently touched.
+            candidates = []
+            node_ids = getattr(self.working_subgraph, "node_ids", [])
+            # node_ids is ordered by recency; reverse it to go newest -> oldest.
+            for nid in reversed(list(node_ids)):
+                n = self.working_subgraph.get_node(nid)
+                if not isinstance(n, dict):
+                    continue
+                if n.get("memorized"):
+                    continue
+                has_snip = bool(n.get("snippet") or n.get("snippet_lines"))
+                touched = n.get("gp_last_touched_step")
                 try:
-                    ids_to_mark = node_ids
-                    if not ids_to_mark:
-                        # 如果未指定 nodes，则标记最新候选
-                        le = self.memory_state.latest_explore or {}
-                        cands = le.get("candidates") or []
-                        ids_to_mark = [c.get("id") for c in cands if isinstance(c, dict) and isinstance(c.get("id"), str)]
-                    for nid in ids_to_mark:
-                        n = self.memory_subgraph.nodes.get(nid)
-                        if isinstance(n, dict):
-                            n["status"] = "remembered"
-                            tags = set(n.get("tags") or [])
-                            tags.add("remembered")
-                            n["tags"] = sorted(tags)
+                    touched = int(touched) if touched is not None else -1
                 except Exception:
-                    pass
+                    touched = -1
+                score = (1 if has_snip else 0, touched)
+                candidates.append((score, nid))
+            candidates.sort(reverse=True)
+            selected_ids = [nid for _, nid in candidates[:top_k]]
 
-            elif act.target == "observation":
-                old_obs = self.memory_state.latest_observation
-                if note_text:
-                    obs = dict(old_obs or {})
-                    obs.setdefault("kind", "observation")
-                    obs["summary"] = note_text
-                    self.memory_state.latest_observation = obs
-                result = text_memory.memory_commit(self.memory_state, "observation", scope, tag, caps) or {}
-                self.memory_state.latest_observation = old_obs
-            else:
-                result = {"ok": False, "error": "unknown-target", "msg": f"unknown memory target: {act.target}"}
+        selected_set = set(selected_ids)
+        info["selected_for_memory"] = len(selected_set)
 
-        elif act.intent == "delete":
-            if act.target == "explore":
-                if node_ids:
-                    # 手工删除指定节点及其 incident edges
-                    removed = set(node_ids)
-                    before_nodes = len(self.memory_subgraph.nodes or {})
-                    before_edges = len(getattr(self.memory_subgraph, "edges", []) or [])
-                    for nid in removed:
-                        self.memory_subgraph.nodes.pop(nid, None)
-                    self.memory_subgraph.node_ids = set((self.memory_subgraph.nodes or {}).keys())
-                    new_edges = []
-                    for e in (getattr(self.memory_subgraph, "edges", []) or []):
-                        if not isinstance(e, dict):
-                            continue
-                        src = e.get("src")
-                        dst = e.get("dst")
-                        if src in removed or dst in removed:
-                            continue
-                        new_edges.append(e)
-                    self.memory_subgraph.edges = new_edges
-                    after_nodes = len(self.memory_subgraph.nodes or {})
-                    after_edges = len(getattr(self.memory_subgraph, "edges", []) or [])
-                    # 更新 size（token 预算不动，仅重算 nodes/edges）
-                    try:
-                        self.memory_state.size.nodes = after_nodes
-                        self.memory_state.size.edges = after_edges
-                        self.memory_state.next_version()
-                    except Exception:
-                        pass
-                    result = {
-                        "ok": True,
-                        "deleted_nodes": sorted(list(removed)),
-                        "deleted_nodes_count": before_nodes - after_nodes,
-                        "deleted_edges_count": before_edges - after_edges,
-                    }
-                else:
-                    sel = tag or "latest"
-                    result = text_memory.memory_delete(self.memory_state, "explore", scope, sel) or {}
-            elif act.target == "observation":
-                sel = None
-                if isinstance(selector, str):
-                    sel = selector
-                elif isinstance(sel_map.get("note_id"), (str, int)):
-                    sel = str(sel_map.get("note_id"))
-                sel = (sel or "latest").strip()
-                result = text_memory.memory_delete(self.memory_state, "observation", scope, sel) or {}
-            else:
-                result = {"ok": False, "error": "unknown-target", "msg": f"unknown memory target: {act.target}"}
-        else:
-            result = {"ok": False, "error": "unknown-intent", "msg": f"unknown memory intent: {act.intent}"}
+        if not selected_set:
+            # Nothing to commit; still prune a bit for stability.
+            pruned = subgraph_store.prune_working(
+                self.working_subgraph, keep_ids=set(), keep_recent_unmemorized=keep_recent
+            )
+            info["pruned_unmemorized"] = int(pruned or 0)
+            w_after = subgraph_store.stats(self.working_subgraph)
+            m_after = subgraph_store.stats(self.memory_subgraph)
+            info.update(
+                {
+                    "working_nodes_after": w_after.get("n_nodes", 0),
+                    "working_memorized_after": w_after.get("n_memorized", 0),
+                    "working_unmemorized_after": w_after.get("n_unmemorized", 0),
+                    "memory_nodes_after": m_after.get("n_nodes", 0),
+                    "skipped_reason": "empty_selection",
+                }
+            )
+            return info
 
-        info.update(result or {})
+        # Project induced subgraph W[S] into memory.
+        proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
+        subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
+        subgraph_store.add_edges(self.memory_subgraph, proj_edges)
 
-        # 保持 graph_store 与 memory_subgraph 同步
-        if getattr(self, "memory_graph_store", None) is not None:
+        # Mark selected nodes in working.
+        for nid in selected_set:
+            n = self.working_subgraph.get_node(nid)
+            if isinstance(n, dict):
+                n["memorized"] = True
+                n["memorized_at_step"] = int(getattr(self, "steps", 0))
+                if tag:
+                    n["tag"] = tag
+
+        # Optionally commit a note into text memory (if available).
+        if getattr(self, "memory_state", None) is not None and (tag or note):
             try:
-                self.memory_graph_store.subgraph = self.memory_subgraph
-            except Exception:
-                pass
+                prev_latest = getattr(self.memory_state, "latest_explore", None)
+                # Create a minimal explore-like record so text_memory can store.
+                obs = {
+                    "kind": "explore",
+                    "summary": note or "",
+                    "candidates": [{"id": nid} for nid in list(selected_set)],
+                    "edges": proj_edges,
+                }
+                self.memory_state.latest_explore = obs
+                _ = text_memory.memory_commit(
+                    self.memory_state,
+                    target=act.target or "explore",
+                    tag=tag,
+                    note=note,
+                )
+                self.memory_state.latest_explore = prev_latest
+                info["text_memory_committed"] = True
+            except Exception as e:
+                info["text_memory_committed"] = False
+                info["text_memory_error"] = str(e)
 
-        info["subgraph_stats"] = subgraph_store.stats(self.memory_subgraph)
-        # Trajectory-only memory/working subgraphs: default is NOT to persist to disk.
-        if os.environ.get("GP_PERSIST_SUBGRAPHS") in ("1", "true", "True"):
-            subgraph_store.save(self.issue_id, self.memory_subgraph)
+        # Prune working: keep memorized + a small frontier.
+        pruned = subgraph_store.prune_working(
+            self.working_subgraph,
+            keep_ids=selected_set,
+            keep_recent_unmemorized=keep_recent,
+        )
+        info["pruned_unmemorized"] = int(pruned or 0)
 
-        # 记忆动作之后，工作图重置为记忆图
-        self._reset_working_to_memory()
+        w_after = subgraph_store.stats(self.working_subgraph)
+        m_after = subgraph_store.stats(self.memory_subgraph)
+        info.update(
+            {
+                "working_nodes_after": w_after.get("n_nodes", 0),
+                "working_memorized_after": w_after.get("n_memorized", 0),
+                "working_unmemorized_after": w_after.get("n_unmemorized", 0),
+                "memory_nodes_after": m_after.get("n_nodes", 0),
+            }
+        )
         return info
 
-    def _reset_working_to_memory(self) -> None:
-        """Memory 动作之后，把工作图重置为记忆图。"""
-        self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
-
-    # ------------------------------------------------------------------
-    # Repair / Submit
-    # ------------------------------------------------------------------
     def _handle_repair(self, act: RepairAction) -> Dict[str, Any]:
-        info: Dict[str, Any] = {"kind": "repair", "apply": act.apply, "plan": act.plan}
+        info: Dict[str, Any] = {"kind": "repair", "apply": act.apply, "plan": _plan_to_text(act.plan)}
+        mem_nodes = getattr(self.memory_subgraph, "nodes", {}) or {}
+        mem_count = len(mem_nodes) if isinstance(mem_nodes, dict) else (len(mem_nodes) if mem_nodes is not None else 0)
+        info["memory_nodes"] = mem_count
+        if mem_count == 0:
+            info["repair_allowed"] = False
+            info["skipped_reason"] = "empty_memory_subgraph"
+            return info
+        info["repair_allowed"] = True
         if not act.apply:
             return info
 
         if act.patch and isinstance(act.patch, dict) and act.patch.get("edits"):
             patch: Dict[str, Any] = dict(act.patch)
             if "summary" not in patch:
-                patch["summary"] = act.plan or ""
+                patch["summary"] = _plan_to_text(act.plan) or ""
             plan = self._build_plan(act.plan_targets or [])
             try:
                 enforce_patch_guard(patch, plan, self.config)
@@ -1112,7 +1301,8 @@ class PlannerEnv:
             info["applied"] = bool(apply_result.get("success"))
             info["priority_tests"] = prioritize_tests(
                 self._observation_pack(),
-                subgraph=self.working_subgraph,
+                # v5 semantics: prioritize tests based on the evidence set used for patch generation.
+                subgraph=getattr(self, "memory_subgraph", None) or self.working_subgraph,
             ).get("priority_tests", [])
             return info
 
@@ -1157,8 +1347,8 @@ class PlannerEnv:
         )
 
         try:
-            # ✅ 使用 working_subgraph 作为 collate 的基础图
-            chunks, meta = collate(self.working_subgraph, plan_struct, collate_cfg)
+            # ✅ 使用 memory_subgraph 作为 collate 的基础图
+            chunks, meta = collate(self.memory_subgraph, plan_struct, collate_cfg)
         except Exception as exc:
             info["applied"] = False
             info["no_repair"] = True
@@ -1173,7 +1363,7 @@ class PlannerEnv:
         try:
             patch = cgm_adapter.generate(
                 collated=request_collated,
-                plan=act.plan or "",
+                plan=_plan_to_text(act.plan) or "",
                 constraints=constraints,
                 run_id=run_id,
                 issue=self.issue,
@@ -1191,7 +1381,7 @@ class PlannerEnv:
             return info
 
         patch_dict: Dict[str, Any] = dict(patch)
-        patch_dict.setdefault("summary", act.plan or "")
+        patch_dict.setdefault("summary", _plan_to_text(act.plan) or "")
         info["patch"] = patch_dict
 
         try:
@@ -1214,7 +1404,8 @@ class PlannerEnv:
         info["tests"] = tests_report
         info["priority_tests"] = prioritize_tests(
             self._observation_pack(),
-            subgraph=self.working_subgraph,
+            # v5 semantics: prioritize tests based on the evidence set used for patch generation.
+            subgraph=getattr(self, "memory_subgraph", None) or self.working_subgraph,
         ).get("priority_tests", [])
 
         return info
@@ -1524,64 +1715,105 @@ print(json.dumps({'snippet_lines': snippet}))
 
 
     def _merge_repo_nodes_into_working(
-        self,
-        node_ids: Sequence[str],
-        *,
-        status: str = "explored",
-    ) -> None:
-        """把 repo_graph 中的若干节点及其边合并进 working_subgraph。"""
-        if not node_ids:
-            return
+            self,
+            node_ids: Sequence[str],
+            *,
+            status: str = "explored",
+        ) -> None:
+            """Merge selected repo_graph nodes (and induced edges) into the working_subgraph.
 
-        working_nodes_by_id: Dict[str, Dict[str, Any]] = {}
-        for n in getattr(self.working_subgraph, "nodes", []):
-            nid = n.get("id")
-            if isinstance(nid, str):
-                working_nodes_by_id[nid] = n
+            Notes:
+              - working_subgraph is the planner-facing cache. Nodes here must carry
+                ``memorized: bool`` (default False).
+              - This must handle WorkingSubgraph.nodes being either dict[id->node] or list[node].
+            """
+            if not node_ids:
+                return
 
-        working_edges = list(getattr(self.working_subgraph, "edges", []) or [])
-        working_ids = set(working_nodes_by_id.keys())
-
-        for nid in node_ids:
-            if not isinstance(nid, str):
-                continue
-            repo_node = self._repo_nodes_by_id.get(nid)
-            if not repo_node:
-                continue
-            existing = working_nodes_by_id.get(nid)
-            node_copy = dict(repo_node)
-            # Preserve any extra fields already stored in working_subgraph (e.g., snippet_lines/text).
-            if isinstance(existing, dict):
-                for k, v in existing.items():
-                    if k not in node_copy:
-                        node_copy[k] = v
-            # Recency metadata (used by planner prompt selection)
-            if isinstance(existing, dict) and "gp_added_step" in existing:
-                node_copy["gp_added_step"] = existing.get("gp_added_step")
+            # --- normalize working nodes store ---
+            nodes_store = getattr(self.working_subgraph, "nodes", {}) or {}
+            if isinstance(nodes_store, dict):
+                working_nodes_by_id: Dict[str, Dict[str, Any]] = dict(nodes_store)
             else:
-                node_copy["gp_added_step"] = getattr(self, "steps", 0)
-            node_copy["gp_last_touched_step"] = getattr(self, "steps", 0)
-            node_copy["status"] = status
-            tags = set(node_copy.get("tags") or [])
-            tags.add(status)
-            node_copy["tags"] = sorted(tags)
-            working_nodes_by_id[nid] = node_copy
-            working_ids.add(nid)
+                working_nodes_by_id = {}
+                for n in (nodes_store or []):
+                    if isinstance(n, dict) and isinstance(n.get("id"), str):
+                        working_nodes_by_id[n["id"]] = n
 
-        for e in self._repo_edges:
-            src_id = e.get("src")
-            dst_id = e.get("dst")
-            if not isinstance(src_id, str) or not isinstance(dst_id, str):
-                continue
-            if src_id in working_ids and dst_id in working_ids:
-                working_edges.append(dict(e))
+            working_edges: List[Dict[str, Any]] = list(getattr(self.working_subgraph, "edges", []) or [])
+            working_ids = set(working_nodes_by_id.keys())
 
-        self.working_subgraph = subgraph_store.wrap(
-            {
-                "nodes": list(working_nodes_by_id.values()),
-                "edges": working_edges,
-            }
-        )
+            step_now = int(getattr(self, "steps", 0) or 0)
+
+            # --- add/merge nodes ---
+            for nid in node_ids:
+                if not isinstance(nid, str) or not nid:
+                    continue
+                repo_node = self._repo_nodes_by_id.get(nid)
+                if not isinstance(repo_node, dict):
+                    continue
+
+                existing = working_nodes_by_id.get(nid) or {}
+                node_copy = dict(repo_node)
+
+                # Preserve extra fields already stored in working (e.g., snippet_lines, memorized flags).
+                if isinstance(existing, dict):
+                    for k, v in existing.items():
+                        if k not in node_copy:
+                            node_copy[k] = v
+
+                # v5: memorized state lives on working nodes
+                node_copy["memorized"] = bool(node_copy.get("memorized", False))
+                if node_copy.get("memorized_at_step") is None and node_copy["memorized"]:
+                    node_copy["memorized_at_step"] = existing.get("memorized_at_step") if isinstance(existing, dict) else None
+
+                # Recency metadata (used by planner prompt selection)
+                node_copy.setdefault("gp_added_step", existing.get("gp_added_step", step_now) if isinstance(existing, dict) else step_now)
+                node_copy["gp_last_touched_step"] = step_now
+
+                # Status/tags for debugging
+                node_copy["status"] = status
+                tags = set(node_copy.get("tags") or [])
+                tags.add(status)
+                node_copy["tags"] = sorted(tags)
+
+                working_nodes_by_id[nid] = node_copy
+                working_ids.add(nid)
+
+            # --- induced edges among kept node ids ---
+            # De-dup edges by (src,dst,type)
+            try:
+                existing_edges = {
+                    (e.get("src"), e.get("dst"), e.get("etype") or e.get("type"))
+                    for e in working_edges
+                    if isinstance(e, dict)
+                }
+            except Exception:
+                existing_edges = set()
+
+            for e in (self._repo_edges or []):
+                if not isinstance(e, dict):
+                    continue
+                src_id = e.get("src")
+                dst_id = e.get("dst")
+                if not isinstance(src_id, str) or not isinstance(dst_id, str):
+                    continue
+                if src_id in working_ids and dst_id in working_ids:
+                    key = (src_id, dst_id, e.get("etype") or e.get("type"))
+                    if key in existing_edges:
+                        continue
+                    existing_edges.add(key)
+                    working_edges.append(dict(e))
+
+            # Write back
+            try:
+                self.working_subgraph.nodes = working_nodes_by_id
+                self.working_subgraph.edges = working_edges
+                self.working_subgraph.node_ids = set(working_nodes_by_id.keys())
+            except Exception:
+                # Fallback: wrap to ensure schema
+                self.working_subgraph = subgraph_store.wrap({"nodes": list(working_nodes_by_id.values()), "edges": working_edges})
+
 
     def _merge_working_nodes_into_memory(
         self,
@@ -1662,6 +1894,110 @@ print(json.dumps({'snippet_lines': snippet}))
     # ------------------------------------------------------------
     # Telemetry helpers (step-level trajectory + terminal excerpts)
     # ------------------------------------------------------------
+
+    def _telemetry_jsonl_start_episode(self) -> None:
+        """Create a per-episode JSONL step log directory.
+
+        This is independent of telemetry_mod; it makes debugging/replays possible even
+        when telemetry_mod is configured as a no-op.
+        """
+        try:
+            root = str(getattr(self, "_telemetry_root", "") or "").strip()
+            if not root:
+                return
+            run_id = (self.run_id or self.issue.get("run_id") or self.issue_id or "__default__").strip()
+            ep = f"{self.issue_id}.{uuid.uuid4().hex[:8]}"
+            self._episode_id = ep
+            self._episode_dir = os.path.join(root, run_id, "episodes", ep)
+            _ensure_dir(self._episode_dir)
+            self._steps_jsonl_path = os.path.join(self._episode_dir, "steps.jsonl")
+
+            # Write a small meta marker (optional, best-effort).
+            meta_path = os.path.join(self._episode_dir, "episode_meta.json")
+            _write_file_text(
+                meta_path,
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "episode_id": ep,
+                        "issue_id": self.issue_id,
+                        "backend_mode": getattr(self.box, "_mode", None),
+                        "created_at": int(time.time()),
+                    },
+                    indent=2,
+                ),
+            )
+
+            _append_jsonl(
+                self._steps_jsonl_path,
+                {
+                    "event": "episode.start",
+                    "step": 0,
+                    "issue_id": self.issue_id,
+                    "run_id": run_id,
+                    "created_at": int(time.time()),
+                },
+            )
+        except Exception:
+            return
+
+    def _telemetry_jsonl_append_step(
+        self,
+        *,
+        action: Mapping[str, Any],
+        info: Mapping[str, Any],
+        reward: float,
+        done: bool,
+        dt_ms: Optional[float],
+        preview: str,
+    ) -> None:
+        """Append a compact per-step record to the JSONL log."""
+        path = getattr(self, "_steps_jsonl_path", None)
+        if not isinstance(path, str) or not path:
+            return
+
+        # Key signals for debugging.
+        kind = (info.get("kind") if isinstance(info, Mapping) else None) or (action.get("type") if isinstance(action, Mapping) else None)
+        op = (info.get("op") if isinstance(info, Mapping) else None) or (action.get("op") if isinstance(action, Mapping) else None)
+
+        # Pull out query/anchors in a resilient way.
+        query_used = info.get("query_used") or action.get("query") or ""
+        if not query_used and isinstance(info.get("query_terms"), list):
+            try:
+                query_used = " ".join(str(x) for x in info.get("query_terms") if x)
+            except Exception:
+                query_used = ""
+        anchor_selected = info.get("anchor_selected") or info.get("anchor_expanded")
+        skipped_reason = info.get("skipped_reason")
+
+        w_stats = {}
+        m_stats = {}
+        try:
+            w_stats = subgraph_store.stats(getattr(self, "working_subgraph", None))
+            m_stats = subgraph_store.stats(getattr(self, "memory_subgraph", None))
+        except Exception:
+            pass
+
+        record: Dict[str, Any] = {
+            "step": int(getattr(self, "steps", 0)),
+            "kind": kind,
+            "op": op,
+            "query_used": query_used,
+            "anchor": anchor_selected,
+            "reward": float(reward),
+            "done": bool(done),
+            "dt_ms": dt_ms,
+            "working_nodes_total": int(w_stats.get("n_nodes") or 0),
+            "working_memorized_count": int(w_stats.get("memorized") or 0),
+            "working_unmemorized_count": int(w_stats.get("unmemorized") or 0),
+            "memory_nodes_total": int(m_stats.get("n_nodes") or 0),
+            "selected_for_memory": info.get("selected_for_memory"),
+            "pruned_unmemorized": info.get("pruned_unmemorized"),
+            "skipped_reason": skipped_reason,
+            "preview": preview,
+        }
+
+        _append_jsonl(path, record)
 
     def _telemetry_obs_summary(self) -> Dict[str, Any]:
         """A lightweight summary of the observation/state for debugging.
@@ -1780,6 +2116,19 @@ print(json.dumps({'snippet_lines': snippet}))
         except Exception:
             pass
 
+        # Always-on JSONL step logging (stable, easy to parse).
+        try:
+            self._telemetry_jsonl_append_step(
+                action=action,
+                info=info,
+                reward=reward,
+                done=done,
+                dt_ms=dt_ms,
+                preview=preview,
+            )
+        except Exception:
+            pass
+
         # Terminal trace (truncated)
         if getattr(self, "_print_ops", False):
             try:
@@ -1789,7 +2138,18 @@ print(json.dumps({'snippet_lines': snippet}))
                     excerpt = excerpt[:maxc] + "..."
                 kind = (info.get("kind") if isinstance(info, Mapping) else None) or (action.get("type") if isinstance(action, Mapping) else None)
                 op = (info.get("op") if isinstance(info, Mapping) else None) or (action.get("op") if isinstance(action, Mapping) else None)
-                line = f"[gp-trace] step={payload['step']} kind={kind} op={op} reward={payload['reward']} done={payload['done']}"
+                w = payload.get("obs_summary", {}).get("working", {}) if isinstance(payload.get("obs_summary"), dict) else {}
+                m = payload.get("obs_summary", {}).get("memory", {}) if isinstance(payload.get("obs_summary"), dict) else {}
+                w_n = w.get("n_nodes") if isinstance(w, dict) else None
+                w_mem = w.get("n_memorized") if isinstance(w, dict) else None
+                w_un = w.get("n_unmemorized") if isinstance(w, dict) else None
+                m_n = m.get("n_nodes") if isinstance(m, dict) else None
+                sel = (info.get("selected_for_memory") if isinstance(info, Mapping) else None)
+                prune = (info.get("pruned_unmemorized") if isinstance(info, Mapping) else None)
+                extra = f" W={w_n}(mem={w_mem},un={w_un}) M={m_n}" if w_n is not None or m_n is not None else ""
+                if sel is not None or prune is not None:
+                    extra += f" sel={sel or 0} prune={prune or 0}"
+                line = f"[gp-env] step={payload['step']} kind={kind} op={op} reward={payload['reward']} done={payload['done']}" + extra
                 print(line)
                 if excerpt:
                     print(excerpt)
