@@ -55,14 +55,14 @@ from ..core.actions import (
     SubmitAction,
 )
 
+# Shared protocol/contract error type used by the agent parser.
 from ..agents.common.contracts import ProtocolError
 from ..infra.config import Config, load as load_config
 from ..infra import telemetry as telemetry_mod
-
 from ..integrations.codefuse_cgm.formatting import GraphLinearizer, SnippetFormatter
 
 from ..memory import graph_adapter, mem_candidates, subgraph_store, text_memory
-from ..memory.subgraph_store import WorkingSubgraph
+from ..memory.subgraph_store import WorkingSubgraph, MemorySubgraph, Subgraph
 from ..runtime.sandbox import SandboxConfig, SandboxRuntime
 from .action_utils import normalize_explore_query_and_anchors
 
@@ -73,7 +73,6 @@ from actor.collater import collate
 from actor import cgm_adapter
 
 from ..infra.test_prioritizer import prioritize_tests
-
 
 
 DEFAULT_MEMORY_CAPS = {
@@ -167,9 +166,12 @@ class PlannerEnv:
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
 
         # 三图结构
-        self.repo_graph: Optional[WorkingSubgraph] = None   # 完整仓库图（只读）
-        self.memory_subgraph: WorkingSubgraph = subgraph_store.new()   # 长期记忆图
-        self.working_subgraph: WorkingSubgraph = subgraph_store.new()  # 当前工作图
+        # - repo_graph: read-only truth graph
+        # - working_subgraph: planner-facing cache (may be noisy)
+        # - memory_subgraph: CGM-facing evidence graph (high-signal)
+        self.repo_graph: Optional[Subgraph] = None
+        self.working_subgraph: WorkingSubgraph = subgraph_store.new_working()
+        self.memory_subgraph: MemorySubgraph = subgraph_store.new_memory()
 
         # Repo 图索引
         self._repo_nodes_by_id: Dict[str, Dict[str, Any]] = {}
@@ -280,12 +282,12 @@ class PlannerEnv:
                             self._repo_nodes_by_id[n] = node
             self._repo_edges = list(getattr(self.repo_graph, "edges", []) or [])
 
-        # === 2) 初始化 memory_subgraph（现在：每次 reset 都清空） ===
-        # 直接 new 一张空的长期记忆图，不再从磁盘加载历史记忆。
-        self.memory_subgraph = subgraph_store.new()
+        # === 2) 初始化 memory_subgraph（每次 reset 都清空） ===
+        # MemorySubgraph is CGM-facing and starts empty each episode.
+        self.memory_subgraph = subgraph_store.new_memory()
 
-        # === 3) 工作图 = 记忆图的拷贝（此时也是空图） ===
-        self.working_subgraph = subgraph_store.wrap(self.memory_subgraph.to_json_obj())
+        # === 3) 初始化 working_subgraph（独立对象，不拷贝 memory） ===
+        self.working_subgraph = subgraph_store.new_working()
 
         # === 4) 初始化 text memory（planner-only） ===
         # Text memory is a simple list of human-readable notes for the planner.
