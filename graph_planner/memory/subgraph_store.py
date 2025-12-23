@@ -1,20 +1,26 @@
-"""Subgraph store utilities (v5 semantics).
+"""Subgraph store utilities (protocol-aligned).
 
-We maintain two subgraphs during an episode/trajectory:
+We maintain three graphs during an episode/trajectory:
 
 - repo_graph (G): read-only full repo code graph (external truth).
-- working_subgraph (W): planner-facing, may be noisy, nodes carry `memorized` flag.
-- memory_subgraph (M): CGM-facing, high-signal; populated by projecting a small induced subgraph from W.
+- working_subgraph (W): planner-facing cache, may be noisy; nodes carry `memorized` flag.
+- memory_subgraph (M): CGM-facing evidence graph, high-signal; populated by projecting an induced subgraph from W.
 
 This module provides a lightweight in-memory representation plus helpers:
 - project_to_memory: copy induced subgraph from working to memory
 - prune_working: keep memorized nodes + a small recent unmemorized frontier
+
+Protocol notes:
+- WorkingSubgraph and MemorySubgraph are *distinct* types (to prevent semantic drift),
+  though they share the same underlying container structure.
+- WorkingSubgraph and MemorySubgraph objects must be independent (no shared dict references).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
 import copy
 import json
 import os
@@ -30,6 +36,7 @@ def _node_id(n: Mapping[str, Any]) -> str:
 
 
 def _edge_uv(e: Mapping[str, Any]) -> Tuple[str, str]:
+    # tolerate multiple key conventions
     u = e.get("u") or e.get("src") or e.get("from")
     v = e.get("v") or e.get("dst") or e.get("to")
     return (str(u) if u is not None else "", str(v) if v is not None else "")
@@ -37,16 +44,25 @@ def _edge_uv(e: Mapping[str, Any]) -> Tuple[str, str]:
 
 @dataclass
 class Subgraph:
-    """Generic subgraph structure (nodes as dict keyed by id, edges as list)."""
+    """Generic subgraph structure (nodes keyed by id, edges as list).
+
+    - nodes: dict[id -> node-dict]
+    - edges: list[edge-dict]
+    - node_ids: recency/order cache (mainly for W pruning & prompt ordering)
+    """
 
     nodes: Dict[str, Node] = field(default_factory=dict)
     edges: List[Edge] = field(default_factory=list)
-
-    # For working graphs, keep a recency-ordered list of node ids.
     node_ids: List[str] = field(default_factory=list)
 
     def to_json_obj(self) -> Dict[str, Any]:
-        return {"nodes": list(self.nodes.values()), "edges": list(self.edges)}
+        # Backward-compatible shape: "nodes" remains a list of node dicts.
+        # We also include "node_ids" for consumers that care about recency.
+        return {
+            "nodes": list(self.nodes.values()),
+            "edges": list(self.edges),
+            "node_ids": list(self.node_ids),
+        }
 
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(str(node_id))
@@ -86,17 +102,35 @@ class Subgraph:
             self.nodes[nid]["gp_last_touched_step"] = int(step)
 
 
+@dataclass
+class WorkingSubgraph(Subgraph):
+    """Planner-facing working subgraph (W)."""
+
+
+@dataclass
+class MemorySubgraph(Subgraph):
+    """CGM-facing evidence subgraph (M)."""
+
+
 def wrap(obj: Any) -> Subgraph:
-    """Wrap a dict/list/Subgraph into our Subgraph class."""
+    """Wrap a dict/list/Subgraph into our Subgraph class.
+
+    Tolerates:
+    - {"nodes": list[dict] | dict[id->dict], "edges": list[dict], "node_ids": list[str]}
+    - list[dict] (treated as node list)
+    """
     if isinstance(obj, Subgraph):
         return obj
     sg = Subgraph()
     if obj is None:
         return sg
 
+    node_ids_in: Optional[List[str]] = None
+
     if isinstance(obj, Mapping):
         nodes = obj.get("nodes") or obj.get("Nodes") or []
         edges = obj.get("edges") or obj.get("Edges") or []
+        node_ids_in = obj.get("node_ids") or obj.get("nodeIds") or obj.get("NodeIds")
     else:
         # If list passed, treat as node list
         nodes = obj if isinstance(obj, list) else []
@@ -117,11 +151,53 @@ def wrap(obj: Any) -> Subgraph:
             if isinstance(e, Mapping):
                 sg.add_edge(dict(e))
 
+    # Restore node_ids if provided (filter to existing ids, preserve order).
+    if isinstance(node_ids_in, list):
+        restored = []
+        seen = set()
+        for x in node_ids_in:
+            nid = str(x) if x is not None else ""
+            if nid and nid in sg.nodes and nid not in seen:
+                restored.append(nid)
+                seen.add(nid)
+        # Append any missing ids (to keep internal invariant that all nodes appear in node_ids).
+        for nid in sg.nodes.keys():
+            if nid not in seen:
+                restored.append(nid)
+        sg.node_ids = restored
+
     return sg
+
+
+def wrap_working(obj: Any) -> WorkingSubgraph:
+    base = wrap(obj)
+    # Deep copy to ensure independence from other references.
+    return WorkingSubgraph(
+        nodes=copy.deepcopy(base.nodes),
+        edges=copy.deepcopy(base.edges),
+        node_ids=list(base.node_ids),
+    )
+
+
+def wrap_memory(obj: Any) -> MemorySubgraph:
+    base = wrap(obj)
+    return MemorySubgraph(
+        nodes=copy.deepcopy(base.nodes),
+        edges=copy.deepcopy(base.edges),
+        node_ids=list(base.node_ids),
+    )
 
 
 def new() -> Subgraph:
     return Subgraph()
+
+
+def new_working() -> WorkingSubgraph:
+    return WorkingSubgraph()
+
+
+def new_memory() -> MemorySubgraph:
+    return MemorySubgraph()
 
 
 def add_nodes(sg: Subgraph, nodes: Sequence[Node]) -> None:
@@ -144,7 +220,9 @@ def add_edges(sg: Subgraph, edges: Sequence[Edge]) -> None:
             sg.add_edge(e)
 
 
-def stats(sg: Subgraph) -> Dict[str, int]:
+def stats(sg: Optional[Subgraph]) -> Dict[str, int]:
+    if sg is None:
+        return {"n_nodes": 0, "n_edges": 0, "n_memorized": 0, "n_unmemorized": 0}
     nodes = getattr(sg, "nodes", {}) or {}
     n_nodes = len(nodes) if isinstance(nodes, dict) else (len(nodes) if nodes is not None else 0)
     n_edges = len(getattr(sg, "edges", []) or [])
