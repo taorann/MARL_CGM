@@ -417,6 +417,76 @@ class SandboxRuntime:
     def run(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         return self._exec(cmd, timeout)
 
+    def read_file_lines(self, path: str, start: int = 1, end: int = 1, timeout: int = 60) -> Tuple[List[str], int]:
+        """Read a range of lines from a file inside the sandbox.
+
+        Args:
+          path: absolute path or path relative to current working directory in the sandbox
+          start/end: 1-based inclusive line numbers (best-effort; clamped to file bounds)
+
+        Returns (lines, rc). rc!=0 indicates a failure to read/parse.
+        """
+        try:
+            s_i = int(start)
+        except Exception:
+            s_i = 1
+        try:
+            e_i = int(end)
+        except Exception:
+            e_i = s_i
+        if s_i <= 0:
+            s_i = 1
+        if e_i < s_i:
+            e_i = s_i
+
+        req = {"path": str(path), "start": s_i, "end": e_i}
+        try:
+            payload = json.dumps(req, ensure_ascii=False)
+        except Exception:
+            payload = '{"path":%r,"start":%d,"end":%d}' % (str(path), s_i, e_i)
+        b64 = base64.b64encode(payload.encode('utf-8')).decode('ascii')
+
+        py = r'''
+import base64, json, os, sys
+req = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+path = req.get('path')
+start = int(req.get('start', 1))
+end = int(req.get('end', start))
+if not isinstance(path, str) or not path:
+    print(json.dumps({'lines': []}))
+    raise SystemExit(2)
+try:
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = f.read().replace('\r\n','\n').replace('\r','\n').split('\n')
+except Exception:
+    print(json.dumps({'lines': []}))
+    raise SystemExit(3)
+n = len(lines)
+s = max(1, min(start, n + 1))
+e = max(s, min(end, n))
+out = lines[s-1:e] if n > 0 else []
+print(json.dumps({'lines': out}, ensure_ascii=False))
+'''
+
+        py_bin = 'python'
+        try:
+            if getattr(self, '_mode', None) == 'remote_swe':
+                py_bin = getattr(self.cfg, 'remote_python', None) or 'python'
+        except Exception:
+            pass
+        cmd = f"{py_bin} -c {shlex.quote(py)} {shlex.quote(b64)}"
+        out, rc = self._exec(cmd, timeout=int(timeout or 60))
+        if rc != 0:
+            return [], int(rc)
+        try:
+            data = json.loads(out.strip().splitlines()[-1])
+            lines = data.get('lines') if isinstance(data, dict) else []
+            if not isinstance(lines, list):
+                lines = []
+            return [str(x) for x in lines], 0
+        except Exception:
+            return [], 4
+
     def apply_patch_edits(self, edits: List[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Apply structured edits in-place within the sandbox.
 
