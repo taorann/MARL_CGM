@@ -115,35 +115,34 @@ class CGMPatch:
 
 PLANNER_SYSTEM_PROMPT = """You are GraphPlanner, a model-driven planning agent for code repair.
 
-Output EXACTLY ONE JSON object inside a fenced ```json block. No extra text.
+Primary output mode: **call EXACTLY ONE tool** from the provided tool list.
+If tool calling is unavailable, output EXACTLY ONE JSON object inside a fenced ```json block (no extra text).
 
 Concepts:
-- repo_graph: full repository graph (read-only).
-- working_subgraph (W): planner-facing, for exploration/reading/reasoning; may be noisy.
-- memory_subgraph (M): patch-facing (for CGM); must be small and high-signal.
+- repo_graph (G): full repository graph (read-only).
+- working_subgraph (W): planner-facing cache for exploration/reading/reasoning; may be noisy.
+- memory_subgraph (M): CGM-facing evidence graph; must be small and high-signal.
+- text_memory (T): planner-facing notes; CGM does NOT read it.
 
-Actions:
-1) explore/find
-   - HARD RULE: provide at most ONE query term and at most ONE anchor.
-   - Purpose: retrieve candidate code locations + snippets into working_subgraph.
-
-2) explore/expand
-   - Expand around ONE anchor to bring more code into working_subgraph.
-
-3) memory (intent: commit | delete)
-   - Select a small set of node_ids from working_subgraph and project them into memory_subgraph.
-   - Prefer selector.nodes = [node_id, ...].
-   - Do NOT describe this as "merge then clear working"; keep working readable by pruning unmemorized noise.
-
-4) repair
+Tools (preferred):
+1) explore_find(query, anchor?)
+   - HARD RULE: provide at most ONE query string, and at most ONE anchor.
+2) explore_expand(anchor?)
+   - HARD RULE: at most ONE anchor (if omitted, env uses current frontier anchor).
+3) memory_commit(select_ids, keep_ids?, keep_recent_unmemorized?, note?, tag?)
+   - Writes ONLY select_ids into M (as an induced subgraph projection from W).
+   - keep_* only affects pruning/retention in W (does NOT write into M).
+   - note/tag are optional; note writes into T (planner-only).
+4) memory_delete(delete_ids, note?, tag?)
+   - Deletes nodes from M; if nodes also exist in W, unmark memorized.
+5) memory_commit_note(note, tag?)
+   - Writes into T only; W and M unchanged.
+6) repair(plan?)
    - HARD RULE: only call repair if memory_subgraph is NON-EMPTY.
-   - Provide plan as a LIST of short steps (plan: ["...", "..."]).
-   - Use memory_subgraph as the main context for patch generation.
+7) submit()
+8) noop(reason?)
 
-5) submit
-   - Run tests to validate the patch.
-
-Always obey the hard rules above.
+Always obey HARD RULES.
 """
 
 
@@ -205,6 +204,7 @@ _BLOCK_RE = re.compile(r"<function\s*=\s*([a-zA-Z0-9_.-]+)\s*>", re.IGNORECASE)
 _END_RE = re.compile(r"</function>", re.IGNORECASE)
 _PARAM_RE = re.compile(r"<param\s+name=\"([^\"]+)\">(.*?)</param>", re.DOTALL | re.IGNORECASE)
 _CDATA_START = "<![CDATA["
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
 
 def _looks_like_json(text: str) -> bool:
@@ -259,7 +259,12 @@ def parse_action_block(text: str) -> Dict[str, Any]:
 
     stripped = text.strip()
 
-    # 0) Bare JSON fallback
+    # 0) Fenced JSON fallback (```json ... ```)
+    m_fenced = _FENCED_JSON_RE.search(stripped)
+    if m_fenced:
+        stripped = (m_fenced.group(1) or "").strip()
+
+    # 1) Bare JSON fallback
     if stripped.startswith("{"):
         try:
             obj = json.loads(stripped)
