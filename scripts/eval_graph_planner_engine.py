@@ -50,7 +50,13 @@ def _ensure_rllm_components():
     )
     from graph_planner.integrations.rllm.dataset import load_task_entries
 
-    from rllm.engine.agent_execution_engine import AgentExecutionEngine
+    # Prefer our tool-call engine adapter (keeps vendored rLLM untouched).
+    try:
+        from graph_planner.integrations.rllm import GraphPlannerToolExecutionEngine as AgentExecutionEngine
+        if AgentExecutionEngine is None:  # type: ignore[truthy-bool]
+            raise ImportError("GraphPlannerToolExecutionEngine unavailable")
+    except Exception:
+        from rllm.engine.agent_execution_engine import AgentExecutionEngine
     from rllm.utils import compute_pass_at_k
 
     return (
