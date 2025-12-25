@@ -771,12 +771,14 @@ class PlannerEnv:
             top_k = int(top_k) if top_k is not None else 8
         except Exception:
             top_k = 8
-
-        keep_recent = selector.get("keep_recent_unmemorized")
+        # Keep the unmemorized working cache bounded by a fixed value (not model-controlled).
+        keep_recent = os.environ.get("GP_KEEP_RECENT_UNMEMORIZED", "20")
         try:
-            keep_recent = int(keep_recent) if keep_recent is not None else 20
+            keep_recent = int(keep_recent)
         except Exception:
             keep_recent = 20
+        if keep_recent < 0:
+            keep_recent = 0
 
         w_before = subgraph_store.stats(self.working_subgraph)
         m_before = subgraph_store.stats(self.memory_subgraph)
