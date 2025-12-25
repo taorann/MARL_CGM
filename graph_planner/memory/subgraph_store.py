@@ -67,6 +67,32 @@ class Subgraph:
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(str(node_id))
 
+    # ----------------------------
+    # Protocol compatibility
+    # ----------------------------
+    # The memory layer defines a minimal read protocol (SubgraphLike) used by
+    # candidate generation and other components:
+    #   - iter_node_ids()
+    #   - contains(node_id)
+    #   - get_node(node_id)
+    #
+    # Some refactors introduced this Subgraph container but missed the two
+    # protocol methods, causing runtime failures like:
+    #   AttributeError: 'Subgraph' object has no attribute 'iter_node_ids'
+    #
+    # Keep these methods small and backwards compatible.
+    def iter_node_ids(self) -> Iterable[str]:
+        """Iterate node ids in a stable (recency/insertion) order."""
+        if self.node_ids:
+            # node_ids records insertion/recency order.
+            yield from list(self.node_ids)
+            return
+        # Fallback: deterministic order from dict keys.
+        yield from list(self.nodes.keys())
+
+    def contains(self, node_id: str) -> bool:
+        return str(node_id) in self.nodes
+
     def add_node(self, node: Node) -> None:
         nid = _node_id(node)
         if not nid:
