@@ -540,22 +540,51 @@ class PlannerEnv:
             info["error"] = "missing-repo-graph"
             return info
 
-        # 数量预算：兼容旧字段 limit，同时支持 total_limit/max_per_anchor/dir_diversity_k
-        total_limit = _safe_int(getattr(act, "total_limit", None) or act.limit or 32, 32)
+        # 数量预算：兼容旧字段 limit，同时支持 total_limit/max_per_anchor/dir_diversity_k。
+        # 允许用环境变量覆盖默认值，避免一次 find 拉太多候选导致 prompt 爆长。
+        env_default_limit = _safe_int(
+            os.environ.get("GP_DEFAULT_EXPLORE_TOTAL_LIMIT")
+            or os.environ.get("GP_DEFAULT_EXPLORE_LIMIT")
+            or None,
+            0,
+        )
+        total_limit = _safe_int(
+            getattr(act, "total_limit", None)
+            or (env_default_limit if env_default_limit > 0 else None)
+            or act.limit
+            or 32,
+            32,
+        )
         max_per_anchor = _safe_int(getattr(act, "max_per_anchor", None) or total_limit, total_limit)
         dir_diversity_k = _safe_int(getattr(act, "dir_diversity_k", None) or 4, 4)
-        query_terms = mem_candidates.extract_query_terms(query_value)
-        query = " ".join(query_terms).strip()
+
+        # Preserve the raw query string for fidelity. Downstream components do their own
+        # query processing (strong/weak terms). We keep one raw string for the tool-call.
+        raw_query = (query_value or "").strip() if isinstance(query_value, str) else " ".join(query_value or []).strip()
+
+        qp = mem_candidates.process_query(raw_query) if raw_query else {"query_raw": raw_query, "strong_terms": [], "weak_terms": []}
+        query_for_recall = (qp.get("query_raw") or raw_query or "").strip()
+
+        if query_for_recall:
+            info["query_raw"] = query_for_recall
+        if qp.get("strong_terms"):
+            info["query_strong_terms"] = list(qp.get("strong_terms") or [])
+        if qp.get("weak_terms"):
+            info["query_weak_terms"] = list(qp.get("weak_terms") or [])
+
+        # For backward-compat / debugging
+        query_terms = list(qp.get("strong_terms") or []) + list(qp.get("weak_terms") or [])
         if query_terms:
-            info["query_terms"] = list(query_terms)
-        raw_query = (query_value or "").strip() if isinstance(query_value, str) else query
+            info["query_terms"] = query_terms
 
 
         # -------- op = find --------
         if act.op == "find":
-            # 1) 记忆召回：query 命中则返回 top-k note + node，并可选 merge 到 working
-            if query:
-                recall = self._recall_memory(query=query, k=min(total_limit, 20))
+            # 1) 记忆召回：query 命中则返回 top-k note + node；是否 merge 到 working 由环境变量控制
+            enable_recall = str(os.environ.get("GP_ENABLE_MEMORY_RECALL", "0")).strip().lower() in {"1", "true", "yes", "y"}
+            merge_recall = str(os.environ.get("GP_MERGE_RECALL_TO_WORKING", "0")).strip().lower() in {"1", "true", "yes", "y"}
+            if enable_recall and query_for_recall:
+                recall = self._recall_memory(query=query_for_recall, k=min(total_limit, 20))
                 if recall.get("memory_notes"):
                     info["memory_notes"] = recall["memory_notes"]
                 if recall.get("memory_nodes"):
@@ -563,7 +592,13 @@ class PlannerEnv:
                     # 将召回的记忆节点并入 working（只增量，不清空）
                     recall_ids = [n.get("id") for n in recall["memory_nodes"] if isinstance(n, dict)]
                     recall_ids = [nid for nid in recall_ids if isinstance(nid, str)]
-                    if recall_ids:
+
+                    max_recall_nodes = _safe_int(os.environ.get("GP_MAX_MEMORY_RECALL_NODES") or os.environ.get("GP_MAX_RECALL_NODES") or 8, 8)
+                    if max_recall_nodes > 0 and len(recall_ids) > max_recall_nodes:
+                        info["recall_truncated"] = {"total": len(recall_ids), "kept": max_recall_nodes}
+                        recall_ids = recall_ids[:max_recall_nodes]
+
+                    if merge_recall and recall_ids:
                         self._merge_memory_nodes_into_working(recall_ids, status="recalled")
 
             # 2) repo 图检索：anchors 存在才做
@@ -576,15 +611,27 @@ class PlannerEnv:
                     dir_diversity_k=dir_diversity_k,
                 )
             else:
-                if query:
+                if query_for_recall:
                     candidates = mem_candidates.search_repo_candidates_by_query(
                         repo_graph=self.repo_graph,
-                        query=raw_query,
+                        query=query_for_recall,
                         total_limit=total_limit,
                         dir_diversity_k=dir_diversity_k,
                     )
                 else:
                     candidates = []
+
+
+            candidates_total = len(candidates)
+            info["candidates_total"] = candidates_total
+            max_working_candidates = _safe_int(os.environ.get("GP_MAX_WORKING_CANDIDATES") or 12, 12)
+            if max_working_candidates >= 0 and candidates_total > max_working_candidates:
+                candidates = candidates[:max_working_candidates]
+                info["candidates_truncated"] = {
+                    "max": max_working_candidates,
+                    "total": candidates_total,
+                    "kept": len(candidates),
+                }
 
             self.last_candidates = candidates
             info["candidates"] = candidates
@@ -617,11 +664,22 @@ class PlannerEnv:
                 except Exception:
                     pass
             # auto-attach snippets for candidates (explore has no separate read op)
+            # But: pulling snippets for *all* candidates is expensive (lots of remote exec)
+            # and can easily blow up prompt length. Cap with env var.
+            max_cand_snippets = _safe_int(os.environ.get("GP_MAX_CANDIDATE_SNIPPETS") or max_working_candidates, max_working_candidates)
             cand_snippets = []
-            for c in candidates:
+            cand_iter = candidates
+            truncated = False
+            if max_cand_snippets >= 0 and len(candidates) > max_cand_snippets:
+                cand_iter = candidates[:max_cand_snippets]
+                truncated = True
+            for c in cand_iter:
                 try:
                     nid = c.get("id")
                     if isinstance(nid, str):
+                        # anchor snippet already attached above
+                        if anchor_id and nid == anchor_id:
+                            continue
                         n = self._resolve_node(nid) or {}
                         sn = self._read_node_snippet(n) if n else None
                         if sn:
@@ -634,6 +692,14 @@ class PlannerEnv:
                 except Exception:
                     continue
             info["candidate_snippets"] = cand_snippets
+            if truncated:
+                info["candidate_snippets_truncated"] = {
+                    "max": max_cand_snippets,
+                    "total": len(candidates),
+                }
+            pruned_budget = self._prune_working_for_budget(protect_ids={anchor_id} if anchor_id else None)
+            if pruned_budget and pruned_budget.get("removed"):
+                info["working_budget_prune"] = pruned_budget
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -656,6 +722,27 @@ class PlannerEnv:
                     node_ids.append(nid)
 
             self._merge_repo_nodes_into_working(node_ids, status="explored")
+
+            # Attach code snippets for merged nodes so W is self-contained for the planner.
+            max_expand_snips = _safe_int(os.environ.get("GP_MAX_EXPAND_SNIPPETS") or len(node_ids), len(node_ids))
+            expanded_snippets = []
+            for nid in node_ids[: max(0, max_expand_snips)]:
+                try:
+                    n = self._resolve_node(nid) or {}
+                    sn = self._read_node_snippet(n) if n else None
+                    if sn and isinstance(sn.get("snippet_lines"), list):
+                        self.working_subgraph.update_node(nid, {"snippet_lines": sn.get("snippet_lines", [])})
+                        expanded_snippets.append(sn)
+                except Exception:
+                    continue
+            if expanded_snippets:
+                info["expanded_snippets"] = expanded_snippets
+
+            # Prune W by prompt budget while never dropping memorized nodes (M subset invariant).
+            prune_info = self._prune_working_for_budget()
+            if prune_info.get("removed"):
+                info["working_pruned_for_budget"] = prune_info
+
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -909,6 +996,38 @@ class PlannerEnv:
             )
             return info
 
+        # Ensure commit ids exist in W and have snippets before projecting W[S] -> M.
+        # This keeps the invariant: node_ids(M) ⊆ node_ids(W), and both carry code snippets.
+        missing = [nid for nid in selected_set if not isinstance(self.working_subgraph.get_node(nid), dict)]
+        if missing:
+            self._merge_repo_nodes_into_working(missing, status="committing")
+
+        max_commit_snippets = _safe_int(os.environ.get("GP_MAX_COMMIT_SNIPPETS") or 0, 0)
+        # max_commit_snippets=0 means: always attach snippets for all selected nodes (selection is small by design).
+        sel_iter = list(selected_set)
+        if max_commit_snippets > 0 and len(sel_iter) > max_commit_snippets:
+            sel_iter = sel_iter[:max_commit_snippets]
+            info["commit_snippets_truncated"] = {"total": len(selected_set), "kept": len(sel_iter)}
+
+        for nid in sel_iter:
+            wn = self.working_subgraph.get_node(nid)
+            if not isinstance(wn, dict):
+                continue
+            if not (wn.get("snippet_lines") or wn.get("snippet")):
+                try:
+                    n = self._resolve_node(nid) or {}
+                    sn = self._read_node_snippet(n) if n else None
+                    if sn and isinstance(sn.get("snippet_lines"), list):
+                        self.working_subgraph.update_node(nid, {"snippet_lines": sn.get("snippet_lines", [])})
+                except Exception:
+                    pass
+
+        # Ensure edges among selected nodes exist in W so M edges are also a subset of W edges.
+        try:
+            subgraph_store.add_repo_edges_between_ids(self.working_subgraph, self.repo_graph, list(selected_set))
+        except Exception:
+            pass
+
         proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
         if tag:
             for _n in proj_nodes:
@@ -916,6 +1035,13 @@ class PlannerEnv:
                     _n["tag"] = tag
         subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
         subgraph_store.add_edges(self.memory_subgraph, proj_edges)
+
+        # Keep M reasonably small (CGM-facing, high signal). Never drop newly selected nodes.
+        max_memory_nodes = _safe_int(os.environ.get("GP_MAX_MEMORY_NODES") or 40, 40)
+        if max_memory_nodes > 0:
+            removed_mem = subgraph_store.prune_memory(self.memory_subgraph, max_memory_nodes, keep_ids=selected_set)
+            if removed_mem:
+                info["memory_pruned"] = {"removed": int(removed_mem), "max": max_memory_nodes}
 
         for nid in selected_set:
             n = self.working_subgraph.get_node(nid)
@@ -932,6 +1058,10 @@ class PlannerEnv:
             keep_recent_unmemorized=keep_recent,
         )
         info["pruned_unmemorized"] = int(pruned or 0)
+
+        budget_pruned = self._prune_working_for_budget(protect_ids=selected_set)
+        if budget_pruned and budget_pruned.get("removed"):
+            info["working_budget_prune"] = budget_pruned
 
         w_after = subgraph_store.stats(self.working_subgraph)
         m_after = subgraph_store.stats(self.memory_subgraph)
@@ -1230,6 +1360,14 @@ class PlannerEnv:
             start_line = int(node.get("start_line") or span_start or 1)
             end_line = int(node.get("end_line") or span_end or start_line)
 
+            # Hard cap snippet length to avoid prompt blow-ups
+            max_snippet_lines = _safe_int(os.environ.get("GP_MAX_SNIPPET_LINES") or 120, 120)
+            if max_snippet_lines > 0 and (end_line - start_line + 1) > max_snippet_lines:
+                end_line = start_line + max_snippet_lines - 1
+            if end_line < start_line:
+                end_line = start_line
+
+
 
             # remote_swe: read inside container (repo root fixed at /repo)
             if getattr(self.box, "_mode", None) == "remote_swe":
@@ -1390,6 +1528,36 @@ class PlannerEnv:
                 continue
             existing.add(key)
             self.working_subgraph.edges.append(dict(e))
+
+
+    def _prune_working_for_budget(self, *, protect_ids: Optional[set[str]] = None) -> Dict[str, int]:
+        """Prune working_subgraph to fit prompt budget while keeping memorized nodes.
+
+        Invariant: we never remove memorized nodes, ensuring node_ids(M) ⊆ node_ids(W).
+        """
+        max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_TOTAL_CHARS") or 60000, 60000)
+        max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_TOTAL_SNIPPET_LINES") or 1500, 1500)
+        if max_chars <= 0 and max_lines <= 0:
+            return {"removed": 0, "total_snippet_lines": 0, "total_snippet_chars": 0}
+
+        keep_recent = _safe_int(os.environ.get("GP_KEEP_RECENT_UNMEMORIZED") or 20, 20)
+
+        keep_ids: set[str] = set()
+        # Protect M node ids even if a bug forgets to mark them memorized.
+        try:
+            keep_ids |= set(getattr(self.memory_subgraph, "node_ids", []) or [])
+        except Exception:
+            pass
+        if protect_ids:
+            keep_ids |= {x for x in protect_ids if isinstance(x, str) and x}
+
+        return subgraph_store.prune_working_by_budget(
+            self.working_subgraph,
+            max_total_snippet_lines=max_lines,
+            max_total_snippet_chars=max_chars,
+            keep_ids=keep_ids,
+            keep_recent_unmemorized=keep_recent,
+        )
 
 
     def _merge_repo_nodes_into_working(
