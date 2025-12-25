@@ -1,32 +1,87 @@
 #!/usr/bin/env bash
 
-if [ -z "${BASH_VERSION:-}" ]; then
-  echo "This script must be run with bash (try 'bash $0')." >&2
+if [[ -z "${BASH_VERSION:-}" ]]; then
+  echo "run_eval_graph_planner.sh must be executed with bash. Try 'bash $0' instead." >&2
   exit 1
 fi
 
 set -euo pipefail
 
-# Build the local RepoEnv-compatible sample image used by the rule-based agent
-# smoke tests. The resulting image tag is referenced from
-# datasets/graphplanner_repoenv_sample.json.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_CONFIG="${ROOT_DIR}/configs/eval/graph_planner_eval_defaults.yaml"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONTEXT_DIR="${REPO_ROOT}/docker/repoenv_sample"
-IMAGE_TAG="graph-planner/repoenv-sample:latest"
+# ======== remote_swe backend configuration ========
+SSH_TARGET="chongbin_cls@login24"
+REMOTE_REPO="/appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM"
+# ==================================================
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required to build the RepoEnv sample image" >&2
-  exit 1
+CONFIG_FLAG_PRESENT=0
+for arg in "$@"; do
+  if [[ "$arg" == --config || "$arg" == --config=* ]]; then
+    CONFIG_FLAG_PRESENT=1
+    break
+  fi
+  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+    CONFIG_FLAG_PRESENT=1
+    break
+  fi
+done
+
+if [[ $CONFIG_FLAG_PRESENT -eq 0 ]]; then
+  set -- --config "${GRAPH_PLANNER_EVAL_CONFIG:-$DEFAULT_CONFIG}" "$@"
 fi
 
-# Ensure the git metadata copied into the container is in a clean state.
-rm -f "${CONTEXT_DIR}/sample_repo/.pytest_cache" >/dev/null 2>&1 || true
-rm -rf "${CONTEXT_DIR}/sample_repo/__pycache__" >/dev/null 2>&1 || true
+# If using remote_swe backend and required fields are missing, inject defaults.
+NEED_REMOTE_SWE=0
+HAS_SSH_TARGET=0
+HAS_REMOTE_REPO=0
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  arg="${args[$i]}"
+  next_arg="${args[$((i + 1))]:-}"
 
-DOCKER_BUILDKIT=1 docker build \
-  --tag "${IMAGE_TAG}" \
-  "${CONTEXT_DIR}"
+  case "$arg" in
+    --sandbox-backend=*)
+      backend_value="${arg#--sandbox-backend=}"
+      [[ "$backend_value" == "remote_swe" ]] && NEED_REMOTE_SWE=1
+      ;;
+    --sandbox-backend)
+      [[ "$next_arg" == "remote_swe" ]] && NEED_REMOTE_SWE=1
+      ;;
+  esac
 
-echo "Built ${IMAGE_TAG}. Update your RepoEnv dataset descriptor to use this tag."
+  case "$arg" in
+    --sandbox-ssh-target|--sandbox-ssh-target=*)
+      HAS_SSH_TARGET=1
+      ;;
+    --sandbox-remote-repo|--sandbox-remote-repo=*)
+      HAS_REMOTE_REPO=1
+      ;;
+  esac
+done
+
+if [[ $NEED_REMOTE_SWE -eq 1 ]]; then
+  if [[ $HAS_SSH_TARGET -eq 0 ]]; then
+    set -- --sandbox-ssh-target "${GP_SANDBOX_SSH_TARGET:-$SSH_TARGET}" "$@"
+  fi
+  if [[ $HAS_REMOTE_REPO -eq 0 ]]; then
+    set -- --sandbox-remote-repo "${GP_SANDBOX_REMOTE_REPO:-$REMOTE_REPO}" "$@"
+  fi
+fi
+
+# Ensure max_prompt_tokens is large enough to hold the initial system prompt.
+HAS_MAX_PROMPT=0
+for arg in "$@"; do
+  if [[ "$arg" == --max-prompt-tokens || "$arg" == --max-prompt-tokens=* ]]; then
+    HAS_MAX_PROMPT=1
+    break
+  fi
+done
+if [[ $HAS_MAX_PROMPT -eq 0 ]]; then
+  set -- --max-prompt-tokens "${GP_MAX_PROMPT_TOKENS:-8192}" "$@"
+fi
+
+PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
+TOKENIZERS_PARALLELISM="false" \
+python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" \
+  "$@"
