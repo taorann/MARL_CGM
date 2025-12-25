@@ -1,11 +1,15 @@
-"""Shared helpers for model-driven planner agents."""
+"""Shared helpers for model-driven planner agents.
+
+This module also provides a lightweight ``ChatMessage`` typing alias used by
+the rLLM/OpenAI integration layer.
+"""
 
 from __future__ import annotations
 
 import json
 from .text_compact import compact_issue_text
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, TypedDict
 
 from ...core.actions import (
     ActionUnion,
@@ -21,6 +25,20 @@ SYSTEM_PROMPT = PLANNER_SYSTEM_PROMPT
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})```", re.DOTALL)
 FALLBACK_REASON_KEY = "fallback_reason"
+
+class ChatMessage(TypedDict, total=False):
+    """A permissive chat message type (OpenAI-style).
+
+    Only ``role`` and ``content`` are commonly used; other keys are optional.
+    """
+
+    role: str
+    content: str
+    name: str
+    tool_call_id: str
+    tool_calls: Any
+    function_call: Any
+
 
 
 def _normalize_memory_intent(value: Any) -> str:
