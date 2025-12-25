@@ -714,6 +714,9 @@ class PlannerEnv:
                     info["skipped_reason"] = "empty_note_text"
                     return info
 
+                if tag:
+                    note_text = f"[{tag}] {note_text}"
+
                 note_id = self.memory_text_store.append("session", note_text)
                 info["note_id"] = note_id
                 info["notes_total"] = len(self.memory_text_store.get("session"))
@@ -795,6 +798,23 @@ class PlannerEnv:
             "working_unmemorized_before": w_before.get("n_unmemorized", 0),
             "memory_nodes_before": m_before.get("n_nodes", 0),
         }
+
+        # Optional: append a short summary note to text memory (planner-only).
+        note_text = (
+            selector.get("note_text")
+            or selector.get("note")
+            or selector.get("text")
+            or selector.get("content")
+        )
+        note_text = _safe_str(note_text, "").strip()
+        if note_text:
+            if self.memory_text_store is None:
+                self.memory_text_store = text_memory.NoteTextStore()
+            if tag:
+                note_text = f"[{tag}] {note_text}"
+            note_id = self.memory_text_store.append("session", note_text)
+            info["note_id"] = note_id
+            info["notes_total"] = len(self.memory_text_store.get("session"))
 
         # ---------- delete from graph memory ----------
         if act.intent == "delete":
@@ -890,6 +910,10 @@ class PlannerEnv:
             return info
 
         proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
+        if tag:
+            for _n in proj_nodes:
+                if isinstance(_n, dict):
+                    _n["tag"] = tag
         subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
         subgraph_store.add_edges(self.memory_subgraph, proj_edges)
 
