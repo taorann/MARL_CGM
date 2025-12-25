@@ -13,9 +13,9 @@ Why the engine subclass?
 
 Protocol mapping
   We expose fine-grained tools to the planner model:
-    - explore_find(query, anchor?)
+    - explore_find(query)
     - explore_expand(anchor?)
-    - memory_commit(select_ids, keep_ids, keep_recent_unmemorized, note, tag)
+    - memory_commit(select_ids, keep_ids?, note?, tag?)
     - memory_delete(delete_ids, note, tag)
     - memory_commit_note(note, tag)
     - repair(plan)
@@ -46,9 +46,12 @@ from ...infra import telemetry as telemetry_mod
 
 # rLLM types (vendored) are optional for tooling contexts.
 try:  # pragma: no cover
-    from rllm.agents.base_agent import BaseAgent
+    from rllm.agents.agent import BaseAgent, Action as RLLMAction, Step as RLLMStep, Trajectory as RLLMTrajectory
 except Exception:  # pragma: no cover
     BaseAgent = object  # type: ignore
+    RLLMAction = object  # type: ignore
+    RLLMStep = object  # type: ignore
+    RLLMTrajectory = object  # type: ignore
 
 
 # -----------------------------------------------------------------------------
@@ -71,11 +74,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query; must be a single string."},
-                    "anchor": {
-                        "type": "string",
-                        "description": "Optional anchor id hint. Usually empty for find.",
-                    },
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -94,7 +92,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                         "type": "string",
                         "description": "Anchor id to expand. If empty, env uses frontier_anchor_id.",
                     },
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -109,25 +106,10 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "select_ids": {
-                        **_NODE_ID_LIST,
-                        "description": "Ids from working_subgraph to write into memory_subgraph.",
-                    },
-                    "keep_ids": {
-                        **_NODE_ID_LIST,
-                        "description": "Ids to keep in working_subgraph during pruning (NOT written into memory).",
-                    },
-                    "keep_recent_unmemorized": {
-                        "type": "integer",
-                        "description": "Keep up to K recent unmemorized nodes in working_subgraph.",
-                        "minimum": 0,
-                    },
-                    "note": {
-                        "type": "string",
-                        "description": "Optional planner-only text memory note to append.",
-                    },
+                    "select_ids": {**_NODE_ID_LIST, "description": "Ids from working_subgraph to write into memory_subgraph."},
+                    "keep_ids": {**_NODE_ID_LIST, "description": "Ids to keep in working_subgraph during pruning (NOT written into memory)."},
+                    "note": {"type": "string", "description": "Optional text memory note to append (a short summary, not reasoning)."},
                     "tag": {"type": "string", "description": "Optional tag for this commit."},
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -143,9 +125,8 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "delete_ids": {**_NODE_ID_LIST, "description": "Ids to delete from memory_subgraph."},
-                    "note": {"type": "string", "description": "Optional planner-only note to append."},
+                    "note": {"type": "string", "description": "Optional text memory note to append (a short summary, not reasoning)."},
                     "tag": {"type": "string", "description": "Optional tag."},
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["delete_ids"],
                 "additionalProperties": False,
@@ -156,13 +137,12 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "memory_commit_note",
-            "description": "Append a planner-only text memory note (does not touch graphs).",
+            "description": "Append a text memory note (does not touch graphs).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note": {"type": "string", "description": "The note to append."},
+                    "note": {"type": "string", "description": "The note to append (a short summary, not reasoning)."},
                     "tag": {"type": "string", "description": "Optional tag."},
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["note"],
                 "additionalProperties": False,
@@ -182,7 +162,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                         "items": {"type": "string"},
                         "description": "Short step plan; do NOT include code patches.",
                     },
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["plan"],
                 "additionalProperties": False,
@@ -194,12 +173,7 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "submit",
             "description": "Finalize the task (run tests / submit patch).",
-            "parameters": {
-                "type": "object",
-                "properties": {"thought": {"type": "string", "description": "Model reasoning."}},
-                "required": [],
-                "additionalProperties": False,
-            },
+            "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         },
     },
     {
@@ -207,18 +181,11 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "noop",
             "description": "Do nothing this step.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Why noop."},
-                    "thought": {"type": "string", "description": "Model reasoning."},
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
+            "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         },
     },
 ]
+
 
 
 def _safe_json(obj: Any) -> str:
@@ -248,85 +215,114 @@ def _parse_json_maybe(raw: Any) -> Any:
 
 
 def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-    """Translate external tool name -> internal planner action schema."""
+    """Translate external tool name -> internal planner action schema.
 
-    def _pop_thought(args: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        d = dict(args or {})
-        thought = d.pop("thought", "")
-        return (str(thought) if thought is not None else "", d)
+    Notes
+    - Tool schemas intentionally do NOT include `thought`/CoT fields.
+    - `select_ids`/`keep_ids`/`delete_ids` are normalised to `List[str]`.
+    - `repair` always sets `apply=True` (the model does not decide apply-vs-preview).
+    """
 
-    tool = str(name or "")
-    thought, args = _pop_thought(arguments)
+    def _norm_str_list(x: Any) -> List[str]:
+        if x is None:
+            return []
+        if isinstance(x, str):
+            s = x.strip()
+            return [s] if s else []
+        if isinstance(x, (list, tuple)):
+            out: List[str] = []
+            for v in x:
+                if v is None:
+                    continue
+                if isinstance(v, str):
+                    s = v.strip()
+                else:
+                    try:
+                        s = str(v).strip()
+                    except Exception:
+                        continue
+                if s:
+                    out.append(s)
+            return out
+        return []
+
+    tool = str(name or "").strip()
+    args = dict(arguments or {})
 
     # explore
     if tool == "explore_find":
         query = args.get("query")
-        anchor = args.get("anchor")
-        anchors: List[str] = []
-        if isinstance(anchor, str) and anchor:
-            anchors = [anchor]
-        params: Dict[str, Any] = {"thought": thought, "op": "find", "query": query, "anchors": anchors}
+        params: Dict[str, Any] = {"op": "find", "query": query, "anchors": []}
         return {"name": "explore", "params": params}
 
     if tool == "explore_expand":
         anchor = args.get("anchor")
-        anchors = [anchor] if isinstance(anchor, str) and anchor else []
-        params = {"thought": thought, "op": "expand", "anchors": anchors}
+        anchors: List[Dict[str, Any]] = []
+        if isinstance(anchor, str) and anchor.strip():
+            anchors = [{"id": anchor.strip()}]
+        params = {"op": "expand", "anchors": anchors}
         return {"name": "explore", "params": params}
 
     # memory
     if tool == "memory_commit":
-        selector: Dict[str, Any] = {
-            "select_ids": list(args.get("select_ids") or []),
-        }
-        keep_ids = args.get("keep_ids")
-        if keep_ids is not None:
-            selector["keep_ids"] = list(keep_ids or [])
-        kru = args.get("keep_recent_unmemorized")
-        if kru is not None:
-            selector["keep_recent_unmemorized"] = kru
+        selector: Dict[str, Any] = {"select_ids": _norm_str_list(args.get("select_ids"))}
+        keep_ids = _norm_str_list(args.get("keep_ids"))
+        if keep_ids:
+            selector["keep_ids"] = keep_ids
         note = args.get("note")
         if isinstance(note, str) and note.strip():
-            selector["note"] = note
+            selector["note"] = note.strip()
         tag = args.get("tag")
         if isinstance(tag, str) and tag.strip():
-            selector["tag"] = tag
-        return {"name": "memory", "params": {"thought": thought, "intent": "commit", "selector": selector}}
+            selector["tag"] = tag.strip()
+        return {"name": "memory", "params": {"intent": "commit", "selector": selector}}
 
     if tool == "memory_delete":
-        selector: Dict[str, Any] = {"delete_ids": list(args.get("delete_ids") or [])}
+        selector: Dict[str, Any] = {"delete_ids": _norm_str_list(args.get("delete_ids"))}
         note = args.get("note")
         if isinstance(note, str) and note.strip():
-            selector["note"] = note
+            selector["note"] = note.strip()
         tag = args.get("tag")
         if isinstance(tag, str) and tag.strip():
-            selector["tag"] = tag
-        return {"name": "memory", "params": {"thought": thought, "intent": "delete", "selector": selector}}
+            selector["tag"] = tag.strip()
+        return {"name": "memory", "params": {"intent": "delete", "selector": selector}}
 
     if tool == "memory_commit_note":
         selector: Dict[str, Any] = {"note": str(args.get("note") or "").strip()}
         tag = args.get("tag")
         if isinstance(tag, str) and tag.strip():
-            selector["tag"] = tag
-        return {
-            "name": "memory",
-            "params": {"thought": thought, "intent": "commit", "target": "note", "selector": selector},
-        }
+            selector["tag"] = tag.strip()
+        return {"name": "memory", "params": {"intent": "commit", "target": "observation", "selector": selector}}
 
-    # direct tools that match internal action names
-    if tool in {"repair", "submit", "noop"}:
-        params = {"thought": thought, **args}
-        return {"name": tool, "params": params}
+    # repair / submit / noop
+    if tool == "repair":
+        plan = args.get("plan")
+        if isinstance(plan, str):
+            plan = [plan]
+        if not isinstance(plan, list):
+            plan = []
+        plan = [str(x).strip() for x in plan if str(x).strip()]
+        return {"name": "repair", "params": {"apply": True, "plan": plan}}
+
+    if tool == "submit":
+        return {"name": "submit", "params": {}}
+
+    if tool == "noop":
+        return {"name": "noop", "params": {}}
 
     # Unknown tool: fall back to noop.
-    return {"name": "noop", "params": {"thought": thought, "reason": f"unknown_tool:{tool}"}}
+    return {"name": "noop", "params": {}}
 
 
-def _maybe_parse_openai_tool_wrapper(model_response: str) -> Optional[Dict[str, Any]]:
+
+def _maybe_parse_openai_tool_wrapper(model_response: str) -> Optional[Tuple[Dict[str, Any], str]]:
     """Parse wrapper JSON produced by GraphPlannerToolExecutionEngine.
 
     Wrapper format (string):
       {"content": "...", "tool_calls": [{"name": "explore_find", "arguments": {...}}, ...]}
+
+    Returns:
+      (internal_action_dict, assistant_content)
     """
     if not isinstance(model_response, str):
         return None
@@ -349,7 +345,10 @@ def _maybe_parse_openai_tool_wrapper(model_response: str) -> Optional[Dict[str, 
     args = _parse_json_maybe(first.get("arguments") or {})
     if not isinstance(args, dict):
         args = {}
-    return _tool_call_to_internal_action(str(name or ""), args)
+    content = obj.get("content")
+    content_str = content if isinstance(content, str) else ""
+    return _tool_call_to_internal_action(str(name or ""), args), content_str
+
 
 
 @dataclass
@@ -382,16 +381,46 @@ class GraphPlannerRLLMAgent(BaseAgent):
         self.openai_tool_choice: Any = os.environ.get("GP_TOOL_CHOICE", "required")
 
         self._steps: List[_StepState] = []
+        self._chat_completions: List[ChatMessage] = []
         self.reset()
 
     # ----- rLLM API -----
     def reset(self) -> None:
         self._steps = []
-        self.chat_completions = [
+        self._chat_completions = [
             {"role": "system", "content": self.system_prompt},
         ]
 
-    def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any]) -> None:
+    @property
+    def chat_completions(self) -> List[ChatMessage]:
+        return self._chat_completions
+
+    @chat_completions.setter
+    def chat_completions(self, value: List[ChatMessage]) -> None:
+        self._chat_completions = value
+
+    @property
+    def trajectory(self) -> Any:
+        """Convert internal state to rLLM Trajectory."""
+        try:
+            steps = []
+            for st in self._steps:
+                steps.append(
+                    RLLMStep(
+                        chat_completions=list(self._chat_completions),
+                        action=st.action,
+                        observation=st.observation,
+                        model_response=st.model_response or "",
+                        info=st.info,
+                        reward=float(st.reward),
+                        done=bool(st.done),
+                    )
+                )
+            return RLLMTrajectory(task=None, steps=steps, reward=0.0)
+        except Exception:
+            return {"steps": [st.__dict__ for st in self._steps], "reward": 0.0}
+
+    def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any], **kwargs: Any) -> None:
         self._steps.append(_StepState(observation=observation, reward=float(reward), done=bool(done), info=dict(info or {})))
 
         # The planner sees the observation (already preformatted by env).
@@ -402,43 +431,73 @@ class GraphPlannerRLLMAgent(BaseAgent):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
 
-    def update_from_model(self, model_response: str) -> ActionUnion:
+    def update_from_model(self, model_response: str, **kwargs: Any) -> "RLLMAction":
         # Record model response.
         if self._steps:
             self._steps[-1].model_response = model_response
 
-        # Append assistant message (text) for legacy logs.
-        # NOTE: when tool-calling is used, model_response may be wrapper JSON.
-        self.chat_completions.append({"role": "assistant", "content": model_response or ""})
+        assistant_content = model_response or ""
 
-        action: Dict[str, Any]
+        action_obj: Any
         try:
             # 1) Preferred: tool wrapper JSON (produced by our engine).
             parsed = _maybe_parse_openai_tool_wrapper(model_response)
             if parsed is not None:
-                action = validate_planner_action(parsed)
+                internal_action, content = parsed
+                # Keep history clean: only store the (optional) one-sentence preamble.
+                assistant_content = (content or "").strip()
+
+                # Fill required repair.issue from the latest observation, not from the model.
+                if internal_action.get("name") == "repair":
+                    try:
+                        obs = self._steps[-1].observation if self._steps else None
+                        issue = (obs or {}).get("issue") if isinstance(obs, dict) else None
+                        if isinstance(issue, dict):
+                            internal_action.setdefault("params", {}).setdefault("issue", issue)
+                        else:
+                            internal_action.setdefault("params", {}).setdefault("issue", {})
+                    except Exception:
+                        internal_action.setdefault("params", {}).setdefault("issue", {})
+
+                action_obj = validate_planner_action(internal_action)
             else:
                 # 2) Legacy text protocol (<function=...> blocks or bare JSON).
                 parsed_block = parse_action_block(model_response)
-                action = validate_planner_action(parsed_block)
+                action_obj = validate_planner_action(parsed_block)
         except ProtocolError as exc:
             # Optional rule-fallback (very conservative).
             if self.use_rule_fallback:
-                fallback = {"name": "noop", "params": {"thought": "", "reason": f"protocol_error:{exc.code}"}}
-                action = validate_planner_action(fallback)
+                fallback = {"name": "noop", "params": {}}
+                action_obj = validate_planner_action(fallback)
             else:
                 raise
 
+        # Append assistant message to history. For tool-calls, this is only the short preamble.
+        if assistant_content:
+            self.chat_completions.append({"role": "assistant", "content": assistant_content})
+
         if self._steps:
-            self._steps[-1].action = action
+            self._steps[-1].action = getattr(action_obj, "model_dump", lambda **_: action_obj)()  # debug-friendly
+
+        # Always compute a safe, serialisable representation for logging/telemetry.
+        try:
+            dumped = action_obj.model_dump() if hasattr(action_obj, "model_dump") else action_obj
+        except Exception:
+            dumped = action_obj
 
         if bool(os.environ.get("DEBUG_FULL_MODEL_OUTPUT")):
             print("[gp-agent] raw_model=", _truncate(model_response, 1200))
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
-            print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
+            print("[gp-agent] parsed_action=", _truncate(_safe_json(dumped), 1200))
 
-        telemetry_mod.emit_event("planner_action", {"action": action})
-        return ActionUnion(action=action)
+        try:
+            telemetry_mod.emit_event("planner_action", {"action": dumped})
+        except Exception:
+            pass
+
+        # rLLM engine expects an Action dataclass with an `.action` attribute.
+        return RLLMAction(action=action_obj)
+
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
