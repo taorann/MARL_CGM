@@ -67,32 +67,6 @@ class Subgraph:
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(str(node_id))
 
-    # ----------------------------
-    # Protocol compatibility
-    # ----------------------------
-    # The memory layer defines a minimal read protocol (SubgraphLike) used by
-    # candidate generation and other components:
-    #   - iter_node_ids()
-    #   - contains(node_id)
-    #   - get_node(node_id)
-    #
-    # Some refactors introduced this Subgraph container but missed the two
-    # protocol methods, causing runtime failures like:
-    #   AttributeError: 'Subgraph' object has no attribute 'iter_node_ids'
-    #
-    # Keep these methods small and backwards compatible.
-    def iter_node_ids(self) -> Iterable[str]:
-        """Iterate node ids in a stable (recency/insertion) order."""
-        if self.node_ids:
-            # node_ids records insertion/recency order.
-            yield from list(self.node_ids)
-            return
-        # Fallback: deterministic order from dict keys.
-        yield from list(self.nodes.keys())
-
-    def contains(self, node_id: str) -> bool:
-        return str(node_id) in self.nodes
-
     def add_node(self, node: Node) -> None:
         nid = _node_id(node)
         if not nid:
@@ -344,6 +318,223 @@ def prune_working(
 
     # Refresh node_ids to only remaining ids, keeping order
     working.node_ids = [nid for nid in getattr(working, "node_ids", []) or [] if nid in remaining]
+
+    return int(removed)
+
+
+def working_budget(working: Subgraph) -> Dict[str, int]:
+    """Compute a cheap size proxy of working subgraph for prompt budgeting.
+
+    We approximate prompt size by aggregating snippet content stored on nodes.
+    Returns:
+      - total_snippet_lines
+      - total_snippet_chars
+      - n_nodes_with_snippet
+    """
+    nodes = getattr(working, "nodes", {}) or {}
+    if not isinstance(nodes, dict):
+        return {"total_snippet_lines": 0, "total_snippet_chars": 0, "n_nodes_with_snippet": 0}
+
+    total_lines = 0
+    total_chars = 0
+    with_snip = 0
+
+    for n in nodes.values():
+        if not isinstance(n, dict):
+            continue
+        sn_lines = n.get("snippet_lines")
+        sn_text = n.get("snippet")
+        if isinstance(sn_lines, list):
+            with_snip += 1
+            total_lines += len(sn_lines)
+            total_chars += sum(len(str(x)) for x in sn_lines)
+        elif isinstance(sn_text, str) and sn_text.strip():
+            with_snip += 1
+            total_chars += len(sn_text)
+            total_lines += sn_text.count("\n") + 1
+
+    return {
+        "total_snippet_lines": int(total_lines),
+        "total_snippet_chars": int(total_chars),
+        "n_nodes_with_snippet": int(with_snip),
+    }
+
+
+def prune_working_by_budget(
+    working: Subgraph,
+    *,
+    keep_ids: Optional[Iterable[str]] = None,
+    max_total_snippet_lines: Optional[int] = None,
+    max_total_snippet_chars: Optional[int] = None,
+    keep_recent_unmemorized: int = 0,
+) -> Dict[str, int]:
+    """Prune working graph to satisfy a size budget while preserving invariants.
+
+    Invariants:
+      - Never delete memorized nodes.
+      - Never delete nodes in keep_ids.
+      - Optionally keep some recent unmemorized nodes.
+
+    Budget:
+      - max_total_snippet_lines / max_total_snippet_chars are *soft* targets.
+        We remove oldest unmemorized nodes until under both budgets.
+
+    Returns a dict with removed counts and post-prune budget.
+    """
+    keep_set = {str(x) for x in (keep_ids or []) if x is not None}
+
+    nodes = getattr(working, "nodes", {}) or {}
+    if not isinstance(nodes, dict):
+        return {"removed": 0, **working_budget(working)}
+
+    # Always keep memorized nodes.
+    memorized_ids = {nid for nid, n in nodes.items() if isinstance(n, dict) and n.get("memorized")}
+    keep_set |= memorized_ids
+
+    # Also keep a small recency frontier (unmemorized) if requested.
+    frontier: List[str] = []
+    if keep_recent_unmemorized and keep_recent_unmemorized > 0:
+        for nid in reversed(list(getattr(working, "node_ids", []) or [])):
+            if nid in keep_set:
+                continue
+            n = nodes.get(nid)
+            if isinstance(n, dict) and not n.get("memorized"):
+                frontier.append(nid)
+            if len(frontier) >= int(keep_recent_unmemorized):
+                break
+        keep_set |= set(frontier)
+
+    def over_budget(b: Dict[str, int]) -> bool:
+        if max_total_snippet_lines is not None and b.get("total_snippet_lines", 0) > int(max_total_snippet_lines):
+            return True
+        if max_total_snippet_chars is not None and b.get("total_snippet_chars", 0) > int(max_total_snippet_chars):
+            return True
+        return False
+
+    removed = 0
+    b = working_budget(working)
+    if not over_budget(b):
+        return {"removed": 0, **b}
+
+    # Remove oldest unmemorized nodes first (stable order via node_ids).
+    order = list(getattr(working, "node_ids", []) or [])
+    for nid in order:
+        if nid in keep_set:
+            continue
+        n = nodes.get(nid)
+        if isinstance(n, dict) and n.get("memorized"):
+            continue
+        # delete
+        if nid in nodes:
+            del nodes[nid]
+            removed += 1
+        b = working_budget(working)
+        if not over_budget(b):
+            break
+
+    # Filter edges to those fully within remaining nodes
+    remaining = set(nodes.keys())
+    new_edges: List[Edge] = []
+    for e in getattr(working, "edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        u, v = _edge_uv(e)
+        if u in remaining and v in remaining:
+            new_edges.append(e)
+    working.edges = new_edges
+
+    # Refresh node_ids
+    working.node_ids = [nid for nid in getattr(working, "node_ids", []) or [] if nid in remaining]
+
+    b = working_budget(working)
+    return {"removed": int(removed), **b}
+
+
+
+
+def add_repo_edges_between_ids(working: Subgraph, repo_graph: Optional[Subgraph], ids: Sequence[str]) -> int:
+    """Ensure edges among `ids` exist in working subgraph by pulling from repo_graph.
+
+    This helps maintain the invariant that memory edges are also present in working
+    (M ⊆ W on edges) when memory is projected from working.
+    """
+    if repo_graph is None or not ids:
+        return 0
+    id_set = {str(x) for x in ids if x is not None}
+    if not id_set:
+        return 0
+
+    existing = set()
+    for e in getattr(working, "edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        u, v = _edge_uv(e)
+        if u and v:
+            existing.add((u, v))
+
+    added = 0
+    for e in getattr(repo_graph, "edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        u, v = _edge_uv(e)
+        if not u or not v:
+            continue
+        if u in id_set and v in id_set and (u, v) not in existing:
+            working.add_edge(copy.deepcopy(e))
+            existing.add((u, v))
+            added += 1
+    return int(added)
+
+
+def prune_memory(memory: Subgraph, max_nodes: int, *, keep_ids: Optional[Iterable[str]] = None) -> int:
+    """Prune *graph memory* to at most `max_nodes`.
+
+    Graph memory is supposed to stay high-signal and compact for CGM.
+    We prune the *oldest* nodes first (based on node_ids order), never pruning ids in keep_ids.
+    Returns number of removed nodes.
+    """
+    try:
+        max_nodes = int(max_nodes)
+    except Exception:
+        return 0
+    if max_nodes <= 0:
+        return 0
+
+    nodes = getattr(memory, "nodes", {}) or {}
+    if not isinstance(nodes, dict):
+        return 0
+    n = len(nodes)
+    if n <= max_nodes:
+        return 0
+
+    keep_set = {str(x) for x in (keep_ids or []) if x is not None}
+
+    # Oldest-first order from node_ids; fall back to dict order if missing
+    order = list(getattr(memory, "node_ids", []) or [])
+    if not order:
+        order = list(nodes.keys())
+
+    removed = 0
+    for nid in order:
+        if len(nodes) <= max_nodes:
+            break
+        if nid in keep_set:
+            continue
+        if nid in nodes:
+            del nodes[nid]
+            removed += 1
+
+    remaining = set(nodes.keys())
+    # Filter edges
+    new_edges: List[Edge] = []
+    for e in getattr(memory, "edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        u, v = _edge_uv(e)
+        if u in remaining and v in remaining:
+            new_edges.append(e)
+    memory.edges = new_edges
+    memory.node_ids = [nid for nid in (getattr(memory, "node_ids", []) or []) if nid in remaining]
 
     return int(removed)
 
