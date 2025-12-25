@@ -125,22 +125,25 @@ Concepts:
 - text_memory (T): planner-facing notes; CGM does NOT read it.
 
 Tools (preferred):
-1) explore_find(query, anchor?)
-   - HARD RULE: provide at most ONE query string, and at most ONE anchor.
+1) explore_find(query)
+   - HARD RULE: provide at most ONE query string.
 2) explore_expand(anchor?)
    - HARD RULE: at most ONE anchor (if omitted, env uses current frontier anchor).
-3) memory_commit(select_ids, keep_ids?, keep_recent_unmemorized?, note?, tag?)
+3) memory_commit(select_ids, keep_ids?, note?, tag?)
    - Writes ONLY select_ids into M (as an induced subgraph projection from W).
-   - keep_* only affects pruning/retention in W (does NOT write into M).
+   - keep_ids only affects pruning/retention in W (does NOT write into M).
    - note/tag are optional; note writes into T (planner-only).
 4) memory_delete(delete_ids, note?, tag?)
    - Deletes nodes from M; if nodes also exist in W, unmark memorized.
 5) memory_commit_note(note, tag?)
    - Writes into T only; W and M unchanged.
-6) repair(plan?)
+6) repair(plan)
    - HARD RULE: only call repair if memory_subgraph is NON-EMPTY.
 7) submit()
-8) noop(reason?)
+8) noop()
+
+When calling a tool, you MAY include a single-sentence preamble in assistant content.
+Do NOT put JSON or large dumps in assistant content.
 
 Always obey HARD RULES.
 """
@@ -639,17 +642,23 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         return _attach_meta(MemoryAction(target=target, intent=intent, selector=selector), meta)
 
     if action_name == "repair":
-        apply_flag = bool(payload.get("apply", False))
-        plan_raw = payload.get("plan", [])
+        # For tool-call path we may receive apply/issue fields; for legacy text mode we keep this permissive.
+        payload = dict(params or {})
+        apply_flag = bool(payload.get("apply", True))
+        issue = payload.get("issue", {})
+        if not isinstance(issue, Mapping):
+            issue = {}
+        plan_raw = payload.get("plan", None)
         subplan_raw = payload.get("subplan", None)
-        def _to_steps(x):
+
+        def _to_steps(x: Any) -> List[str]:
             if x is None:
                 return []
             if isinstance(x, str):
                 s = x.strip()
                 return [s] if s else []
-            if isinstance(x, list):
-                out = []
+            if isinstance(x, (list, tuple)):
+                out: List[str] = []
                 for v in x:
                     if isinstance(v, str):
                         s = v.strip()
@@ -657,20 +666,23 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
                             out.append(s)
                 return out
             return []
+
         plan_steps = _to_steps(plan_raw)
         for s in _to_steps(subplan_raw):
             if s not in plan_steps:
                 plan_steps.append(s)
         if (not plan_steps) and apply_flag:
             meta.setdefault("warnings", []).append("missing-plan")
+
         plan_targets = payload.get("plan_targets", [])
         if not isinstance(plan_targets, list):
             plan_targets = []
         patch = payload.get("patch", None)
-        if patch is not None and not isinstance(patch, dict):
+        if patch is not None and not isinstance(patch, Mapping):
             patch = None
+
         return _attach_meta(
-            RepairAction(apply=apply_flag, issue=issue, plan=plan_steps, plan_targets=plan_targets, patch=patch),
+            RepairAction(apply=apply_flag, issue=dict(issue), plan=plan_steps, plan_targets=plan_targets, patch=patch),
             meta,
         )
 
