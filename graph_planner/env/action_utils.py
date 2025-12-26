@@ -38,9 +38,20 @@ def normalize_explore_query_and_anchors(
     # Normalize query to a single string (or None)
     q = query
     if isinstance(q, list):
-        if len(q) > 1:
-            trimmed["query"] = {"from": len(q), "to": 1}
-        q = q[0] if q else None
+        # The model may send a list of keywords; join them into a single query string.
+        parts: List[str] = []
+        for x in q:
+            if x is None:
+                continue
+            try:
+                t = x.strip() if isinstance(x, str) else str(x).strip()
+            except Exception:
+                t = ""
+            if t:
+                parts.append(t)
+        if len(parts) > 1:
+            trimmed["query"] = {"from": len(parts), "to": 1, "mode": "join"}
+        q = " ".join(parts) if parts else None
     if q is None:
         query_str: Optional[str] = None
     elif isinstance(q, str):
