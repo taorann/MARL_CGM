@@ -36,6 +36,15 @@ _QUERY_STOPWORDS = {
     "bug","missing","expected","suddenly","again","output","inputs","outputs","model","models",
 }
 
+# Terms that are often too generic on their own. We keep them, but down-weight them in scoring
+# to avoid 'information explosion' for queries like 'matrix'.
+_WEAK_TERMS = {
+    'matrix','matrices','array','arrays','vector','vectors','function','functions','method','methods',
+    'class','classes','module','modules','file','files','object','objects','property','properties',
+    'parameter','parameters','value','values','data','dataset','datasets','result','results',
+}
+
+
 
 def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
     """Normalize an explore query to a small list of keyword-ish terms.
@@ -101,115 +110,6 @@ def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
 
 
 
-
-
-# ----------------------------
-# Query processing (strong/weak)
-# ----------------------------
-_GENERIC_WEAK_TERMS: set[str] = {
-    # very common programming / repo words that tend to explode recall
-    "matrix","vector","array","tensor","list","dict","set","map",
-    "class","method","function","func","module","file","path","line","code",
-    "test","tests","testing","unit","example","examples","doc","docs","documentation",
-    "fix","bug","issue","error","fail","failed","failing","failure",
-    "check","checks","verify","validation","validate",
-    "build","run","runs","running","start","stop",
-    "add","remove","delete","update","change",
-    "read","write","open","close","load","save",
-    "use","using","used",
-    "python","py","pip","conda",
-}
-
-
-def process_query(
-    query_raw: str,
-    *,
-    max_strong: int = 8,
-    max_weak: int = 8,
-) -> Dict[str, Any]:
-    """Best-effort query normalization that avoids recall explosions.
-
-    - Keep a single *raw* query string for logging / model context.
-    - Derive **strong_terms** for stage-1 recall (code-like / specific).
-    - Derive **weak_terms** for stage-2 rerank/boost (generic).
-
-    Notes:
-      * This function is intentionally heuristic and conservative.
-      * All outputs are bounded to keep downstream prompts small.
-    """
-    q = (query_raw or "").strip()
-    if not q:
-        return {"query_raw": "", "strong_terms": [], "weak_terms": []}
-
-    # Prefer explicitly quoted / backticked segments as strong hints.
-    quoted_terms: List[str] = []
-    for g1, g2, g3 in re.findall(r"`([^`]+)`|\"([^\"]+)\"|'([^']+)'", q):
-        seg = (g1 or g2 or g3 or "").strip()
-        if seg:
-            quoted_terms.append(seg)
-
-    # Extract terms from the full query and quoted segments.
-    terms: List[str] = []
-    terms.extend(extract_query_terms(q))
-    for seg in quoted_terms:
-        terms.extend(extract_query_terms(seg))
-        if seg not in terms:
-            terms.append(seg)
-
-    # De-dup while preserving order.
-    seen: set[str] = set()
-    deduped: List[str] = []
-    for t in terms:
-        t = (t or "").strip()
-        if not t:
-            continue
-        tl = t.lower()
-        if tl in seen:
-            continue
-        seen.add(tl)
-        deduped.append(t)
-
-    strong: List[str] = []
-    weak: List[str] = []
-
-    def _is_code_like(tok: str) -> bool:
-        if any(s in tok for s in ("/", "\\", ".", "_", "::", ":", "#")):
-            return True
-        if re.search(r"\d", tok):
-            return True
-        if re.match(r"[A-Za-z]+[A-Z][A-Za-z0-9]*", tok):
-            return True
-        return False
-
-    for t in deduped:
-        tl = t.lower()
-        if tl in _QUERY_STOPWORDS:
-            continue
-        if _is_code_like(t) or len(t) >= 12:
-            strong.append(t)
-            continue
-        if tl in _GENERIC_WEAK_TERMS:
-            weak.append(t)
-            continue
-        weak.append(t)
-
-    # Also consider a few unquoted word tokens (weak-only) but keep them bounded.
-    for w in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", q.lower()):
-        if w in _QUERY_STOPWORDS or w in _GENERIC_WEAK_TERMS:
-            continue
-        if w not in {s.lower() for s in strong} and w not in {x.lower() for x in weak}:
-            weak.append(w)
-
-    strong = strong[: max(0, int(max_strong or 0))]
-    weak = weak[: max(0, int(max_weak or 0))]
-
-    return {
-        "query_raw": q,
-        "strong_terms": strong,
-        "weak_terms": [w for w in weak if w.lower() not in {s.lower() for s in strong}],
-    }
-
-
 def search_repo_candidates_by_query(
     repo_graph: SubgraphLike,
     *,
@@ -219,10 +119,11 @@ def search_repo_candidates_by_query(
 ) -> List[Candidate]:
     """Search repo_graph nodes when explore.find is called without anchors.
 
-    Compared to a naive bag-of-words, we:
-      - derive strong/weak terms
-      - stage-1 recall uses strong terms (or weak fallback)
-      - weak terms only boost candidates that already matched stage-1
+    We do a lightweight lexical match against node id/name/path.
+
+    Query conventions (best-effort, optional):
+      - "path:<substr>"    prioritize path matches
+      - "symbol:<name>"   prioritize symbol/id/name matches
     """
     q = (query or "").strip()
     if not q or not repo_graph:
@@ -236,18 +137,10 @@ def search_repo_candidates_by_query(
     elif q_lower.startswith("symbol:"):
         mode, payload = "symbol", q[7:].strip()
 
-    qp = process_query(payload, max_strong=8, max_weak=8)
-    payload_norm = (qp.get("query_raw") or payload).strip()
-    payload_lower = payload_norm.lower()
-
-    strong_terms: List[str] = list(qp.get("strong_terms") or [])
-    weak_terms: List[str] = list(qp.get("weak_terms") or [])
-
-    # Stage-1 recall terms: strong preferred, otherwise a small weak fallback.
-    recall_terms: List[str] = strong_terms if strong_terms else weak_terms[:4]
-    recall_terms_l = [t.lower() for t in recall_terms if t]
-    strong_l = {t.lower() for t in strong_terms if t}
-    weak_l = {t.lower() for t in weak_terms if t}
+    payload_lower = payload.lower()
+    toks = re.findall(r"[A-Za-z0-9_./:-]+", payload_lower)
+    toks = [t for t in toks if t and len(t) >= 2 and t not in _QUERY_STOPWORDS]
+    strong_terms = [t for t in toks if t not in _WEAK_TERMS]
 
     def norm_dir(p: str) -> str:
         try:
@@ -276,61 +169,44 @@ def search_repo_candidates_by_query(
         path = str(node.get("path") or "")
         kind = str(node.get("kind") or "").lower()
 
-        hay_all = (nid_s + " " + name + " " + path).lower()
-        if not hay_all:
+        hay = (nid_s + " " + name + " " + path).lower()
+        if not hay:
             continue
-
-        hay = hay_all
-        if mode == "path":
-            hay = (path or "").lower()
-        elif mode == "symbol":
-            hay = (nid_s + " " + name).lower()
 
         score = 0.0
         reasons: List[str] = []
-        match_strong = 0
-        match_weak = 0
 
         # Strong substring match on the whole payload
         if payload_lower and payload_lower in hay:
-            score += 4.0
+            score += 3.0
             reasons.append("payload")
 
-        # Stage-1 recall matches (must hit at least one)
-        recall_hit = False
-        for t in recall_terms_l:
-            if t and t in hay:
-                recall_hit = True
-                if t in strong_l:
-                    score += 3.0
-                    match_strong += 1
-                else:
-                    score += 1.2
-                    match_weak += 1
-                reasons.append(t)
+        # Token matches (down-weight generic terms)
+        strong_matched = False
+        for t in toks:
+            if t in hay:
+                w = 0.25 if t in _WEAK_TERMS else 1.0
+                score += w
+                reasons.append(f"weak:{t}" if w < 1.0 else t)
+                if t not in _WEAK_TERMS:
+                    strong_matched = True
 
-        if not recall_hit:
+        # If we have at least one non-generic term, require a strong match to avoid
+        # returning huge candidate sets for queries like "matrix".
+        if strong_terms and not strong_matched and not (payload_lower and payload_lower in hay):
             continue
 
-        # Stage-2 weak boosts (only after recall hit)
-        for t in weak_l:
-            if t and t not in reasons and t in hay_all:
-                score += 0.35
-                match_weak += 1
-                if len(reasons) < 8:
-                    reasons.append(t)
-
         # Mode-specific boosts
-        if mode == "path" and payload_lower and payload_lower in (path or "").lower():
-            score += 2.0
+        if mode == "path" and payload_lower and payload_lower in path.lower():
+            score += 3.0
             reasons.append("path")
         if mode == "symbol" and payload_lower:
             pl = payload_lower
             if pl == nid_s.lower() or pl == name.lower():
-                score += 3.0
+                score += 4.0
                 reasons.append("symbol_exact")
             elif pl in nid_s.lower() or pl in name.lower():
-                score += 1.5
+                score += 2.0
                 reasons.append("symbol")
 
         if score <= 0:
@@ -347,8 +223,6 @@ def search_repo_candidates_by_query(
                 "score": float(score),
                 "reasons": list(dict.fromkeys(reasons))[:8],
                 "name": (name or None),
-                "match_strong": int(match_strong),
-                "match_weak": int(match_weak),
             }
         )
 
