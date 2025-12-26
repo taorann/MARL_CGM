@@ -1,6 +1,5 @@
 # graph_planner/runtime/sandbox.py
 import os, json, random, string, time, shutil, tempfile, base64, shlex, re
-import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,7 +92,6 @@ class SandboxRuntime:
         # every time and could race with SSH timeout.)
         self._remote_started: bool = False
         self._remote_start_lock = threading.Lock()
-        self._last_read_file_error: Optional[dict] = None  # debug: last read_file_lines error payload
 
         if self._mode == "repoenv":
             try:
@@ -342,34 +340,112 @@ class SandboxRuntime:
         with self._remote_start_lock:
             if self._remote_started:
                 return
-            t0 = time.perf_counter()
-            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
-            dt = time.perf_counter() - t0
-            ok = bool(resp.get("ok", False))
-            rc = resp.get("returncode", None)
-            err = resp.get("error", None)
-            stderr = resp.get("stderr", "") or ""
-            _dbg(
-                f"remote_swe started: run_id={self.run_id} dt={dt:.2f}s "
-                f"ok={ok!r} rc={rc!r} error={err!r} stderr_bytes={len(stderr)}"
-            )
-            if not ok:
-                # allow attaching to an already-running instance on this runner (runner-side rebind/reuse)
+            # When the runner is busy, attaching to the existing run_id can be dangerous
+            # (it may be a different container image / issue). We therefore:
+            #   1) adopt only when the image matches;
+            #   2) otherwise retry for a short period;
+            #   3) optionally stop an old gp-* run (likely a crashed previous run) and retry.
+            busy_retries = _safe_int(os.environ.get("GP_REMOTE_SWE_BUSY_RETRIES"), 10)
+            busy_sleep = float(os.environ.get("GP_REMOTE_SWE_BUSY_SLEEP") or 3.0)
+            auto_stop_busy = str(os.environ.get("GP_REMOTE_SWE_AUTO_STOP_BUSY", "1")).strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+
+            desired_run_id = str(self.run_id)
+            desired_image = str(getattr(self.cfg, "docker_image", "") or "")
+            last_err: Optional[str] = None
+
+            for attempt in range(max(1, busy_retries + 1)):
+                t0 = time.perf_counter()
+                resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
+                dt = time.perf_counter() - t0
+                ok = bool(resp.get("ok", False))
+                rc = resp.get("returncode", None)
+                err = resp.get("error", None)
+                stderr = resp.get("stderr", "") or ""
+                _dbg(
+                    f"remote_swe started: run_id={desired_run_id} dt={dt:.2f}s "
+                    f"ok={ok!r} rc={rc!r} error={err!r} stderr_bytes={len(stderr)}"
+                )
+                if ok:
+                    self._remote_started = True
+                    return
+
+                # Busy runner case
                 msg = str(err or stderr or "")
-                m = re.search(r"current_run_id=([A-Za-z0-9_\-]+)", msg)
-                if m:
+                last_err = msg
+                if "runner busy" in msg or "current_run_id" in msg:
+                    # Extract busy context best-effort.
+                    cur_run = None
+                    cur_img = None
+                    cur_task = None
+                    new_img = None
+                    new_task = None
                     try:
-                        cur = m.group(1)
-                        _dbg(f"remote_swe start got busy; adopting current_run_id={cur}")
-                        self._remote.run_id = cur
-                        self._remote_started = True
-                        return
+                        m = re.search(r"current_run_id=([A-Za-z0-9_\-]+)", msg)
+                        if m:
+                            cur_run = m.group(1)
+                        m = re.search(r"current_image=([^,\s]+)", msg)
+                        if m:
+                            cur_img = m.group(1)
+                        m = re.search(r"current_task_id=([^,\s]+)", msg)
+                        if m:
+                            cur_task = m.group(1)
+                        m = re.search(r"new_image=([^,\s]+)", msg)
+                        if m:
+                            new_img = m.group(1)
+                        m = re.search(r"new_task_id=([^,\s]+)", msg)
+                        if m:
+                            new_task = m.group(1)
                     except Exception:
                         pass
+
+                    # Only adopt if the image matches; otherwise it is very likely
+                    # we will send commands to the wrong container.
+                    if cur_run and cur_img and new_img and cur_img == new_img:
+                        try:
+                            _dbg(
+                                f"remote_swe start got busy but image matches; adopting current_run_id={cur_run}"
+                            )
+                            self._remote.run_id = cur_run
+                            self._remote_started = True
+                            return
+                        except Exception:
+                            pass
+
+                    # If it's a likely stale gp-* run, stop it and retry.
+                    if auto_stop_busy and cur_run and str(cur_run).startswith("gp-"):
+                        same_task = bool(cur_task and new_task and cur_task == new_task)
+                        if same_task:
+                            try:
+                                _dbg(
+                                    f"remote_swe runner busy with a gp-* run; stopping stale run_id={cur_run} then retry"
+                                )
+                                old = self._remote.run_id
+                                try:
+                                    self._remote.run_id = cur_run
+                                    self._remote.stop(timeout=600.0)
+                                finally:
+                                    self._remote.run_id = old
+                            except Exception as e:
+                                _dbg(f"failed to stop busy run_id={cur_run}: {e!r}")
+
+                    # Retry budget
+                    if attempt <= busy_retries:
+                        time.sleep(max(0.5, busy_sleep))
+                        continue
+
+                # Non-busy hard failure
                 raise RuntimeError(
                     f"remote_swe start failed: rc={rc!r} error={err!r} stderr={stderr[:2000]!r}"
                 )
-            self._remote_started = True
+
+            raise RuntimeError(
+                f"remote_swe start failed after retries. last_error={str(last_err or '')[:2000]!r}"
+            )
 
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         if self._mode == "remote_swe":
@@ -382,8 +458,34 @@ class SandboxRuntime:
                 env=self.cfg.env,
                 cwd=self.workdir,
             )
-            out = (resp.get("stdout") or "") + (resp.get("stderr") or "")
-            rc = int(resp.get("returncode", resp.get("rc", resp.get("code", 0)) or 0) or 0)
+
+            # Proxy response keys vary across backends; normalize best-effort.
+            stdout = resp.get("stdout") or ""
+            stderr = resp.get("stderr") or ""
+            if not stdout and isinstance(resp.get("lines"), list):
+                try:
+                    stdout = "\n".join([str(x) for x in (resp.get("lines") or [])])
+                except Exception:
+                    stdout = ""
+
+            rc_val = resp.get("returncode", None)
+            if rc_val is None:
+                rc_val = resp.get("rc", None)
+            if rc_val is None:
+                rc_val = resp.get("code", None)
+            try:
+                rc = int(rc_val or 0)
+            except Exception:
+                rc = 0
+            if resp.get("ok") is False and rc == 0:
+                rc = 1
+
+            # IMPORTANT: keep stdout intact for callers that parse JSON from stdout.
+            # Only append stderr on failures.
+            out = stdout if rc == 0 else (stdout + ("\n" + stderr if stderr else ""))
+
+            if os.environ.get("GP_PRINT_REMOTE_STDIO") and stderr and rc == 0:
+                _dbg(f"[remote_swe][stderr] {stderr[:800]}")
             return out, rc
         if self._mode == "apptainer_queue":
             q = "'" + cmd.replace("'", "'\"'\"'") + "'"
@@ -455,13 +557,13 @@ path = req.get('path')
 start = int(req.get('start', 1))
 end = int(req.get('end', start))
 if not isinstance(path, str) or not path:
-    print(json.dumps({'lines': [], 'error': 'invalid_path', 'path': path}, ensure_ascii=False))
+    print(json.dumps({'lines': []}))
     raise SystemExit(2)
 try:
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
         lines = f.read().replace('\r\n','\n').replace('\r','\n').split('\n')
-except Exception as e:
-    print(json.dumps({'lines': [], 'error': 'open_failed', 'path': path, 'exc': repr(e)}, ensure_ascii=False))
+except Exception:
+    print(json.dumps({'lines': []}))
     raise SystemExit(3)
 n = len(lines)
 s = max(1, min(start, n + 1))
@@ -478,45 +580,16 @@ print(json.dumps({'lines': out}, ensure_ascii=False))
             pass
         cmd = f"{py_bin} -c {shlex.quote(py)} {shlex.quote(b64)}"
         out, rc = self._exec(cmd, timeout=int(timeout or 60))
-        # Parse JSON payload from stdout even when the command fails.
-        data = None
-        last_err = None
+        if rc != 0:
+            return [], int(rc)
         try:
-            for ln in reversed((out or "").splitlines()):
-                ln_s = (ln or "").strip()
-                if not ln_s:
-                    continue
-                try:
-                    obj = json.loads(ln_s)
-                except Exception:
-                    continue
-                if isinstance(obj, dict) and ("lines" in obj or "error" in obj):
-                    data = obj
-                    break
-            if isinstance(data, dict) and data.get("error"):
-                last_err = data
+            data = json.loads(out.strip().splitlines()[-1])
+            lines = data.get('lines') if isinstance(data, dict) else []
+            if not isinstance(lines, list):
+                lines = []
+            return [str(x) for x in lines], 0
         except Exception:
-            data = None
-            last_err = None
-
-        try:
-            self._last_read_file_error = last_err
-        except Exception:
-            pass
-
-        if not isinstance(data, dict):
-            return [], int(rc) if rc != 0 else 4
-
-        lines = data.get("lines") if isinstance(data.get("lines"), list) else []
-        lines = [str(x) for x in lines]
-
-        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and os.environ.get("GP_DEBUG_READ_FILE") == "1":
-            try:
-                print(f"[sandbox] read_file_lines path={path!r} start={s_i} end={e_i} rc={rc!r} error={data.get('error')!r}", file=sys.stderr)
-            except Exception:
-                pass
-
-        return lines, (int(rc) if int(rc) != 0 else 0)
+            return [], 4
 
     def apply_patch_edits(self, edits: List[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Apply structured edits in-place within the sandbox.
@@ -809,12 +882,6 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "").strip()
         if not rid:
             rid = "repo"
-
-        # Allow env-based forcing without changing call sites.
-        # Useful when repo_graph schema changes (e.g., embedding snippets) and you
-        # want to regenerate the cached JSONL.
-        if not force:
-            force = str(os.environ.get("GP_FORCE_REPO_GRAPH", "")).strip().lower() in {"1", "true", "yes", "y"}
 
         cache_path = self._repo_graph_cache_path(rid)
         if cache_path.exists() and not force:
