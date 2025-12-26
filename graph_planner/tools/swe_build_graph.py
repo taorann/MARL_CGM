@@ -76,9 +76,14 @@ def _safe_parse(src: str, filename: str) -> Optional[ast.AST]:
 
 
 class GraphBuilder(ast.NodeVisitor):
-    def __init__(self, file_rel: str, file_node_id: str) -> None:
+    def __init__(self, file_rel: str, file_node_id: str, *, source_lines: Optional[List[str]] = None) -> None:
         self.file_rel = file_rel
         self.file_node_id = file_node_id
+        # Optional source lines for embedding snippets directly into nodes.
+        # This enables fully local explore/find/expand on the host, after the
+        # repo graph JSONL is built inside the SWE container and cached host-side.
+        self._source_lines: List[str] = list(source_lines or [])
+        self._max_snippet_lines: int = int(os.environ.get("GP_GRAPH_NODE_SNIPPET_LINES", "60") or 60)
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: List[Dict[str, Any]] = []
         # stack of container node ids (file/class/function)
@@ -100,6 +105,31 @@ class GraphBuilder(ast.NodeVisitor):
         if not self.scope_names:
             return name
         return ".".join(self.scope_names + [name])
+
+    def _snippet_payload(self, start: int, end: int) -> Dict[str, Any]:
+        """Return a compact snippet payload for a span.
+
+        We intentionally cap snippet length at build time to avoid huge repo_graph
+        payloads and to keep host-side local explore responsive.
+        """
+        if not self._source_lines:
+            return {}
+        # Defensive bounds
+        s = max(1, int(start or 1))
+        e = max(s, int(end or s))
+        e = min(e, len(self._source_lines) if self._source_lines else e)
+        # Cap lines
+        k = int(self._max_snippet_lines or 0)
+        if k > 0 and (e - s + 1) > k:
+            e = s + k - 1
+        if e < s:
+            e = s
+        lines = self._source_lines[s - 1 : e]
+        return {
+            "snippet_start": s,
+            "snippet_end": e,
+            "snippet_lines": lines,
+        }
 
     # ---- imports (edge: imports) ----
     def visit_Import(self, node: ast.Import) -> Any:
@@ -143,16 +173,15 @@ class GraphBuilder(ast.NodeVisitor):
         qn = self._qualname(node.name)
         start, end = _node_span(node)
         nid = f"class:{self.file_rel}:{qn}:{start}"
-        self._add_node(
-            nid,
-            {
-                "id": nid,
-                "kind": "class",
-                "name": qn,
-                "path": self.file_rel,
-                "span": {"start": start, "end": end},
-            },
-        )
+        payload = {
+            "id": nid,
+            "kind": "class",
+            "name": qn,
+            "path": self.file_rel,
+            "span": {"start": start, "end": end},
+        }
+        payload.update(self._snippet_payload(start, end))
+        self._add_node(nid, payload)
         self._add_edge(self._current_container(), nid, "contains")
 
         self.container_stack.append(nid)
@@ -168,17 +197,16 @@ class GraphBuilder(ast.NodeVisitor):
         qn = self._qualname(name)
         start, end = _node_span(node)
         nid = f"func:{self.file_rel}:{qn}:{start}"
-        self._add_node(
-            nid,
-            {
-                "id": nid,
-                "kind": "function",
-                "name": qn,
-                "path": self.file_rel,
-                "span": {"start": start, "end": end},
-                "async": bool(is_async),
-            },
-        )
+        payload = {
+            "id": nid,
+            "kind": "function",
+            "name": qn,
+            "path": self.file_rel,
+            "span": {"start": start, "end": end},
+            "async": bool(is_async),
+        }
+        payload.update(self._snippet_payload(start, end))
+        self._add_node(nid, payload)
         self._add_edge(self._current_container(), nid, "contains")
 
         self.container_stack.append(nid)
@@ -224,7 +252,7 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
         if tree is None:
             continue
 
-        gb = GraphBuilder(file_rel=rel, file_node_id=file_id)
+        gb = GraphBuilder(file_rel=rel, file_node_id=file_id, source_lines=src.splitlines())
         gb.visit(tree)
 
         # merge
