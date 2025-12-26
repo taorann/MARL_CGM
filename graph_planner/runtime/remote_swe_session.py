@@ -15,24 +15,6 @@ def _dbg(msg: str) -> None:
         print(f"[remote_swe_session] {msg}", file=sys.stderr)
 
 
-def _should_print_stdio() -> bool:
-    if os.environ.get("GP_PRINT_REMOTE_STDIO"):
-        return str(os.environ.get("GP_PRINT_REMOTE_STDIO")).strip().lower() not in {"0","false","no"}
-    return bool(os.environ.get("DEBUG") or os.environ.get("EBUG"))
-
-
-def _preview_text(x: Any, limit: int) -> str:
-    try:
-        s = x if isinstance(x, str) else str(x)
-    except Exception:
-        s = ""
-    if limit <= 0:
-        return s
-    if len(s) <= limit:
-        return s
-    return s[:limit] + f"...(+{len(s)-limit} chars)"
-
-
 
 
 @dataclass
@@ -62,35 +44,9 @@ class RemoteSweSession:
         repo = shlex.quote(self.remote_repo)
     
         cd_cmd = f"cd {repo}"
-        # Pass through a small set of useful debug/runtime envs into the remote ssh session.
-        # NOTE: ssh non-interactive sessions do NOT inherit local env by default.
-        passthrough = []
-        for k in [
-            "DEBUG",
-            "EBUG",
-            "DEBUG_FULL_MODEL_OUTPUT",
-            "DEBUG_ACTION_RESULT",
-            "DEBUG_PRINT_TRAJECTORY_DIR",
-            "GP_WAIT_FOR_RUNNERS_SEC",
-            "GP_RUNNER_HEARTBEAT_TTL_SEC",
-            "QUEUE_ROOT",
-            "GP_SIF_DIR",
-            "SIF_DIR",
-        ]:
-            v = os.environ.get(k)
-            if v is None:
-                continue
-            s = str(v).strip()
-            if not s:
-                continue
-            passthrough.append(f"{k}={shlex.quote(s)}")
-
-        env_prefix = " ".join(
-            passthrough
-            + [
-                f"GP_NUM_RUNNERS={int(self.num_runners)}",
-                f"PYTHONPATH=$PYTHONPATH:{repo}",
-            ]
+        env_prefix = (
+            f"GP_NUM_RUNNERS={int(self.num_runners)} "
+            f"PYTHONPATH=$PYTHONPATH:{repo}"
         )
     
         py = shlex.quote(self.remote_python or "python")
@@ -136,37 +92,58 @@ class RemoteSweSession:
             f"rc={proc.returncode} dt={dt:.2f}s stdout_bytes={len(proc.stdout)} stderr_bytes={len(proc.stderr)}"
         )
         if proc.returncode != 0:
-            stderr_preview = proc.stderr.decode("utf-8", errors="ignore")[:4000]
-            stdout_preview = proc.stdout.decode("utf-8", errors="ignore")[:4000]
             raise RuntimeError(
                 f"Remote swe_proxy failed (rc={proc.returncode}). "
-                f"stderr={stderr_preview!r} stdout={stdout_preview!r}. "
-                "Note: swe_proxy prints structured JSON errors to stdout."
+                f"stderr={proc.stderr.decode('utf-8', errors='ignore')}"
             )
         # Forward remote stderr to local log when DEBUG is on (runner/proxy writes progress there).
         if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and proc.stderr:
             stderr_preview = proc.stderr.decode("utf-8", errors="ignore")
             print("[remote_swe_session][remote_stderr]" + stderr_preview, file=sys.stderr)
+        raw = proc.stdout.decode("utf-8", errors="replace")
         try:
-            resp = json.loads(proc.stdout.decode("utf-8"))
+            resp = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
                 f"Failed to decode swe_proxy JSON response. stdout={proc.stdout!r}"
             ) from exc
 
-        if _should_print_stdio():
-            lim = int(os.environ.get("GP_REMOTE_STDIO_PREVIEW_CHARS") or 4000)
-            op = payload.get("op")
-            ok = resp.get("ok")
-            rc = resp.get("returncode", resp.get("rc"))
-            if ok is not None or rc is not None:
-                _dbg(f"resp op={op!r} ok={ok!r} rc={rc!r}")
-            stdout_s = resp.get("stdout")
-            stderr_s = resp.get("stderr")
-            if isinstance(stdout_s, str) and stdout_s.strip():
-                print("[remote_swe_session][stdout] " + _preview_text(stdout_s, lim), file=sys.stderr)
-            if isinstance(stderr_s, str) and stderr_s.strip():
-                print("[remote_swe_session][stderr] " + _preview_text(stderr_s, lim), file=sys.stderr)
+        # Normalize keys across proxy versions.
+        if isinstance(resp, dict):
+            if "returncode" not in resp:
+                if "rc" in resp:
+                    resp["returncode"] = resp.get("rc")
+                elif "code" in resp:
+                    resp["returncode"] = resp.get("code")
+            if "stdout" not in resp and "out" in resp:
+                resp["stdout"] = resp.get("out")
+            if "stderr" not in resp and "err" in resp:
+                resp["stderr"] = resp.get("err")
+
+            ok = resp.get("ok", True)
+            try:
+                rc = int(resp.get("returncode") or 0)
+            except Exception:
+                rc = 0
+            if ok is False and rc == 0:
+                rc = 1
+                resp["returncode"] = rc
+
+            # Print a short preview on failures (or when explicitly enabled).
+            if os.environ.get("GP_PRINT_REMOTE_STDIO") or (ok is False or rc != 0):
+                try:
+                    stdout_preview = (resp.get("stdout") or "")
+                    stderr_preview = (resp.get("stderr") or "")
+                    if isinstance(stdout_preview, list):
+                        stdout_preview = "\n".join([str(x) for x in stdout_preview[:60]])
+                    if isinstance(stderr_preview, list):
+                        stderr_preview = "\n".join([str(x) for x in stderr_preview[:60]])
+                    if stdout_preview:
+                        print("[remote_swe_session][proxy_stdout]\n" + str(stdout_preview)[:2000], file=sys.stderr)
+                    if stderr_preview:
+                        print("[remote_swe_session][proxy_stderr]\n" + str(stderr_preview)[:2000], file=sys.stderr)
+                except Exception:
+                    pass
 
         return resp
 
@@ -178,28 +155,9 @@ class RemoteSweSession:
         cd_cmd = f"cd {repo}"
         py = shlex.quote(self.remote_python or "python")
         manager = shlex.quote(self.runner_manager_path or "hpc/ensure_runners.py")
-        passthrough = []
-        for k in [
-            "DEBUG",
-            "EBUG",
-            "QUEUE_ROOT",
-            "RUNNER_PARTITION",
-            "RUNNER_QOS",
-        ]:
-            v = os.environ.get(k)
-            if v is None:
-                continue
-            s = str(v).strip()
-            if not s:
-                continue
-            passthrough.append(f"{k}={shlex.quote(s)}")
-
-        env_prefix = " ".join(
-            passthrough
-            + [
-                f"GP_NUM_RUNNERS={int(self.num_runners)}",
-                f"PYTHONPATH=$PYTHONPATH:{repo}",
-            ]
+        env_prefix = (
+            f"GP_NUM_RUNNERS={int(self.num_runners)} "
+            f"PYTHONPATH=$PYTHONPATH:{repo}"
         )
         remote_cmd = f"{cd_cmd} && {env_prefix} {py} {manager} --target {int(self.num_runners)}"
 
