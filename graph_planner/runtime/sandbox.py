@@ -1,5 +1,6 @@
 # graph_planner/runtime/sandbox.py
 import os, json, random, string, time, shutil, tempfile, base64, shlex, re
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,7 @@ class SandboxRuntime:
         # every time and could race with SSH timeout.)
         self._remote_started: bool = False
         self._remote_start_lock = threading.Lock()
+        self._last_read_file_error: Optional[dict] = None  # debug: last read_file_lines error payload
 
         if self._mode == "repoenv":
             try:
@@ -380,34 +382,8 @@ class SandboxRuntime:
                 env=self.cfg.env,
                 cwd=self.workdir,
             )
-
-            # Proxy response keys vary across backends; normalize best-effort.
-            stdout = resp.get("stdout") or ""
-            stderr = resp.get("stderr") or ""
-            if not stdout and isinstance(resp.get("lines"), list):
-                try:
-                    stdout = "\n".join([str(x) for x in (resp.get("lines") or [])])
-                except Exception:
-                    stdout = ""
-
-            rc_val = resp.get("returncode", None)
-            if rc_val is None:
-                rc_val = resp.get("rc", None)
-            if rc_val is None:
-                rc_val = resp.get("code", None)
-            try:
-                rc = int(rc_val or 0)
-            except Exception:
-                rc = 0
-            if resp.get("ok") is False and rc == 0:
-                rc = 1
-
-            # IMPORTANT: keep stdout intact for callers that parse JSON from stdout.
-            # Only append stderr on failures.
-            out = stdout if rc == 0 else (stdout + ("\n" + stderr if stderr else ""))
-
-            if os.environ.get("GP_PRINT_REMOTE_STDIO") and stderr and rc == 0:
-                _dbg(f"[remote_swe][stderr] {stderr[:800]}")
+            out = (resp.get("stdout") or "") + (resp.get("stderr") or "")
+            rc = int(resp.get("returncode", resp.get("rc", resp.get("code", 0)) or 0) or 0)
             return out, rc
         if self._mode == "apptainer_queue":
             q = "'" + cmd.replace("'", "'\"'\"'") + "'"
@@ -479,13 +455,13 @@ path = req.get('path')
 start = int(req.get('start', 1))
 end = int(req.get('end', start))
 if not isinstance(path, str) or not path:
-    print(json.dumps({'lines': []}))
+    print(json.dumps({'lines': [], 'error': 'invalid_path', 'path': path}, ensure_ascii=False))
     raise SystemExit(2)
 try:
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
         lines = f.read().replace('\r\n','\n').replace('\r','\n').split('\n')
-except Exception:
-    print(json.dumps({'lines': []}))
+except Exception as e:
+    print(json.dumps({'lines': [], 'error': 'open_failed', 'path': path, 'exc': repr(e)}, ensure_ascii=False))
     raise SystemExit(3)
 n = len(lines)
 s = max(1, min(start, n + 1))
@@ -502,16 +478,45 @@ print(json.dumps({'lines': out}, ensure_ascii=False))
             pass
         cmd = f"{py_bin} -c {shlex.quote(py)} {shlex.quote(b64)}"
         out, rc = self._exec(cmd, timeout=int(timeout or 60))
-        if rc != 0:
-            return [], int(rc)
+        # Parse JSON payload from stdout even when the command fails.
+        data = None
+        last_err = None
         try:
-            data = json.loads(out.strip().splitlines()[-1])
-            lines = data.get('lines') if isinstance(data, dict) else []
-            if not isinstance(lines, list):
-                lines = []
-            return [str(x) for x in lines], 0
+            for ln in reversed((out or "").splitlines()):
+                ln_s = (ln or "").strip()
+                if not ln_s:
+                    continue
+                try:
+                    obj = json.loads(ln_s)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and ("lines" in obj or "error" in obj):
+                    data = obj
+                    break
+            if isinstance(data, dict) and data.get("error"):
+                last_err = data
         except Exception:
-            return [], 4
+            data = None
+            last_err = None
+
+        try:
+            self._last_read_file_error = last_err
+        except Exception:
+            pass
+
+        if not isinstance(data, dict):
+            return [], int(rc) if rc != 0 else 4
+
+        lines = data.get("lines") if isinstance(data.get("lines"), list) else []
+        lines = [str(x) for x in lines]
+
+        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and os.environ.get("GP_DEBUG_READ_FILE") == "1":
+            try:
+                print(f"[sandbox] read_file_lines path={path!r} start={s_i} end={e_i} rc={rc!r} error={data.get('error')!r}", file=sys.stderr)
+            except Exception:
+                pass
+
+        return lines, (int(rc) if int(rc) != 0 else 0)
 
     def apply_patch_edits(self, edits: List[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Apply structured edits in-place within the sandbox.
@@ -804,6 +809,12 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "").strip()
         if not rid:
             rid = "repo"
+
+        # Allow env-based forcing without changing call sites.
+        # Useful when repo_graph schema changes (e.g., embedding snippets) and you
+        # want to regenerate the cached JSONL.
+        if not force:
+            force = str(os.environ.get("GP_FORCE_REPO_GRAPH", "")).strip().lower() in {"1", "true", "yes", "y"}
 
         cache_path = self._repo_graph_cache_path(rid)
         if cache_path.exists() and not force:
