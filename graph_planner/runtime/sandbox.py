@@ -380,8 +380,34 @@ class SandboxRuntime:
                 env=self.cfg.env,
                 cwd=self.workdir,
             )
-            out = (resp.get("stdout") or "") + (resp.get("stderr") or "")
-            rc = int(resp.get("returncode", 0))
+
+            # Proxy response keys vary across backends; normalize best-effort.
+            stdout = resp.get("stdout") or ""
+            stderr = resp.get("stderr") or ""
+            if not stdout and isinstance(resp.get("lines"), list):
+                try:
+                    stdout = "\n".join([str(x) for x in (resp.get("lines") or [])])
+                except Exception:
+                    stdout = ""
+
+            rc_val = resp.get("returncode", None)
+            if rc_val is None:
+                rc_val = resp.get("rc", None)
+            if rc_val is None:
+                rc_val = resp.get("code", None)
+            try:
+                rc = int(rc_val or 0)
+            except Exception:
+                rc = 0
+            if resp.get("ok") is False and rc == 0:
+                rc = 1
+
+            # IMPORTANT: keep stdout intact for callers that parse JSON from stdout.
+            # Only append stderr on failures.
+            out = stdout if rc == 0 else (stdout + ("\n" + stderr if stderr else ""))
+
+            if os.environ.get("GP_PRINT_REMOTE_STDIO") and stderr and rc == 0:
+                _dbg(f"[remote_swe][stderr] {stderr[:800]}")
             return out, rc
         if self._mode == "apptainer_queue":
             q = "'" + cmd.replace("'", "'\"'\"'") + "'"
