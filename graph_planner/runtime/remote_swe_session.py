@@ -15,6 +15,25 @@ def _dbg(msg: str) -> None:
         print(f"[remote_swe_session] {msg}", file=sys.stderr)
 
 
+def _summarize_stdout(op: str, stdout: str, *, max_chars: int = 2000) -> str:
+    """Safe preview for remote stdout.
+
+    Some ops (notably build_repo_graph) intentionally return a large base64+gzip
+    payload in stdout for host-side caching. Printing the raw payload looks like
+    garbled text and can flood the console.
+    """
+    s = (stdout or "")
+    if not s:
+        return ""
+    # Heuristic: build_repo_graph payload is base64 gzip and often starts with 'H4sI'.
+    if op == "build_repo_graph" or (len(s) > 5000 and s.lstrip().startswith("H4sI")):
+        head = s.lstrip()[:80].replace("\n", "")
+        return f"<omitted base64+gzip payload len={len(s)} head={head!r}>"
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"...<truncated {len(s) - max_chars} chars>"
+
+
 
 
 @dataclass
@@ -132,6 +151,7 @@ class RemoteSweSession:
             # Print a short preview on failures (or when explicitly enabled).
             if os.environ.get("GP_PRINT_REMOTE_STDIO") or (ok is False or rc != 0):
                 try:
+                    op = str(payload.get("op") or "")
                     stdout_preview = (resp.get("stdout") or "")
                     stderr_preview = (resp.get("stderr") or "")
                     if isinstance(stdout_preview, list):
@@ -139,7 +159,10 @@ class RemoteSweSession:
                     if isinstance(stderr_preview, list):
                         stderr_preview = "\n".join([str(x) for x in stderr_preview[:60]])
                     if stdout_preview:
-                        print("[remote_swe_session][proxy_stdout]\n" + str(stdout_preview)[:2000], file=sys.stderr)
+                        print(
+                            "[remote_swe_session][proxy_stdout]\n" + _summarize_stdout(op, str(stdout_preview), max_chars=2000),
+                            file=sys.stderr,
+                        )
                     if stderr_preview:
                         print("[remote_swe_session][proxy_stderr]\n" + str(stderr_preview)[:2000], file=sys.stderr)
                 except Exception:
