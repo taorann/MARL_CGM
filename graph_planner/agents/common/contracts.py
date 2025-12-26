@@ -125,25 +125,22 @@ Concepts:
 - text_memory (T): planner-facing notes; CGM does NOT read it.
 
 Tools (preferred):
-1) explore_find(query)
-   - HARD RULE: provide at most ONE query string.
+1) explore_find(query, anchor?)
+   - HARD RULE: provide at most ONE query string, and at most ONE anchor.
 2) explore_expand(anchor?)
    - HARD RULE: at most ONE anchor (if omitted, env uses current frontier anchor).
-3) memory_commit(select_ids, keep_ids?, note?, tag?)
+3) memory_commit(select_ids, keep_ids?, keep_recent_unmemorized?, note?, tag?)
    - Writes ONLY select_ids into M (as an induced subgraph projection from W).
-   - keep_ids only affects pruning/retention in W (does NOT write into M).
+   - keep_* only affects pruning/retention in W (does NOT write into M).
    - note/tag are optional; note writes into T (planner-only).
 4) memory_delete(delete_ids, note?, tag?)
    - Deletes nodes from M; if nodes also exist in W, unmark memorized.
 5) memory_commit_note(note, tag?)
    - Writes into T only; W and M unchanged.
-6) repair(plan)
+6) repair(plan?)
    - HARD RULE: only call repair if memory_subgraph is NON-EMPTY.
 7) submit()
-8) noop()
-
-When calling a tool, you MAY include a single-sentence preamble in assistant content.
-Do NOT put JSON or large dumps in assistant content.
+8) noop(reason?)
 
 Always obey HARD RULES.
 """
@@ -477,35 +474,23 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         anchors = _ensure_dict_list(params.get("anchors"))
         nodes = _ensure_str_list(params.get("nodes"))
         query_raw = params.get("query")
+        # Keep a single query string (may contain multiple keywords).
         query: Any = query_raw
         trimmed: Dict[str, Any] = {}
-        if isinstance(query, list) and len(query) > 1:
-            trimmed["query"] = {"from": len(query), "to": 1}
-            query = query[:1]
+        if isinstance(query_raw, list) and len(query_raw) > 1:
+            trimmed["query"] = {"from": len(query_raw), "to": 1, "mode": "join"}
         if isinstance(anchors, list) and len(anchors) > 1:
             trimmed["anchors"] = {"from": len(anchors), "to": 1}
             anchors = anchors[:1]
         if trimmed:
             meta["trimmed"] = trimmed
+
         if isinstance(query_raw, list):
-
-            # Prefer keyword-list form for deterministic parsing.
-
-            q_terms = [str(v).strip() for v in query_raw if isinstance(v, (str, int, float)) and str(v).strip()]
-
-            query = q_terms or None
-
+            parts = [str(v).strip() for v in query_raw if isinstance(v, (str, int, float)) and str(v).strip()]
+            query = " ".join(parts) if parts else None
         elif isinstance(query_raw, str):
-
-            q_terms = _extract_query_terms(query_raw.strip())
-
-            # Fallback: keep the original string as a single term if extraction fails.
-
-            if not q_terms and query_raw.strip():
-
-                q_terms = [query_raw.strip()]
-
-            query = q_terms or None
+            q = query_raw.strip()
+            query = q or None
 
         else:
 
@@ -642,23 +627,17 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         return _attach_meta(MemoryAction(target=target, intent=intent, selector=selector), meta)
 
     if action_name == "repair":
-        # For tool-call path we may receive apply/issue fields; for legacy text mode we keep this permissive.
-        payload = dict(params or {})
-        apply_flag = bool(payload.get("apply", True))
-        issue = payload.get("issue", {})
-        if not isinstance(issue, Mapping):
-            issue = {}
-        plan_raw = payload.get("plan", None)
+        apply_flag = bool(payload.get("apply", False))
+        plan_raw = payload.get("plan", [])
         subplan_raw = payload.get("subplan", None)
-
-        def _to_steps(x: Any) -> List[str]:
+        def _to_steps(x):
             if x is None:
                 return []
             if isinstance(x, str):
                 s = x.strip()
                 return [s] if s else []
-            if isinstance(x, (list, tuple)):
-                out: List[str] = []
+            if isinstance(x, list):
+                out = []
                 for v in x:
                     if isinstance(v, str):
                         s = v.strip()
@@ -666,23 +645,20 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
                             out.append(s)
                 return out
             return []
-
         plan_steps = _to_steps(plan_raw)
         for s in _to_steps(subplan_raw):
             if s not in plan_steps:
                 plan_steps.append(s)
         if (not plan_steps) and apply_flag:
             meta.setdefault("warnings", []).append("missing-plan")
-
         plan_targets = payload.get("plan_targets", [])
         if not isinstance(plan_targets, list):
             plan_targets = []
         patch = payload.get("patch", None)
-        if patch is not None and not isinstance(patch, Mapping):
+        if patch is not None and not isinstance(patch, dict):
             patch = None
-
         return _attach_meta(
-            RepairAction(apply=apply_flag, issue=dict(issue), plan=plan_steps, plan_targets=plan_targets, patch=patch),
+            RepairAction(apply=apply_flag, issue=issue, plan=plan_steps, plan_targets=plan_targets, patch=patch),
             meta,
         )
 
