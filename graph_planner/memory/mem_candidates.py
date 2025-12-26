@@ -108,6 +108,35 @@ def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
     return terms[:max_terms]
 
 
+def process_query(query: Any, max_terms: int = 16) -> Dict[str, Any]:
+    """Normalize query into strong/weak term groups.
+
+    This is a small robustness helper for tool-call parameters. Models may return
+    either a free-form string or a list-like query. We normalize into a list of
+    terms and split them into:
+      - strong_terms: domain-specific tokens (identifiers, paths, dotted names, ...)
+      - weak_terms: generic words that tend to explode recall (e.g., 'matrix')
+
+    Return shape is intentionally stable so planner/env code can consume it.
+    """
+    raw = "" if query is None else (query if isinstance(query, str) else str(query))
+    terms = extract_query_terms(query, max_terms=max_terms)
+    strong_terms: List[str] = []
+    weak_terms: List[str] = []
+    for t in terms:
+        if (t or "").strip().lower() in _WEAK_TERMS:
+            weak_terms.append(t)
+        else:
+            strong_terms.append(t)
+
+    return {
+        "query_raw": raw,
+        "terms": terms,
+        "strong_terms": strong_terms,
+        "weak_terms": weak_terms,
+    }
+
+
 
 
 def search_repo_candidates_by_query(
