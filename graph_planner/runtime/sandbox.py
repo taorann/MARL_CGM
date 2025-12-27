@@ -35,6 +35,13 @@ def _dbg(msg: str):
     if os.environ.get("DEBUG") or os.environ.get("EBUG"):
         print(f"[sandbox] {msg}")
 
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
 @dataclass
 class SandboxConfig:
     docker_image: str
@@ -340,112 +347,57 @@ class SandboxRuntime:
         with self._remote_start_lock:
             if self._remote_started:
                 return
-            # When the runner is busy, attaching to the existing run_id can be dangerous
-            # (it may be a different container image / issue). We therefore:
-            #   1) adopt only when the image matches;
-            #   2) otherwise retry for a short period;
-            #   3) optionally stop an old gp-* run (likely a crashed previous run) and retry.
-            busy_retries = _safe_int(os.environ.get("GP_REMOTE_SWE_BUSY_RETRIES"), 10)
-            busy_sleep = float(os.environ.get("GP_REMOTE_SWE_BUSY_SLEEP") or 3.0)
-            auto_stop_busy = str(os.environ.get("GP_REMOTE_SWE_AUTO_STOP_BUSY", "1")).strip().lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
-            }
-
-            desired_run_id = str(self.run_id)
-            desired_image = str(getattr(self.cfg, "docker_image", "") or "")
-            last_err: Optional[str] = None
-
-            for attempt in range(max(1, busy_retries + 1)):
-                t0 = time.perf_counter()
-                resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
-                dt = time.perf_counter() - t0
-                ok = bool(resp.get("ok", False))
-                rc = resp.get("returncode", None)
-                err = resp.get("error", None)
-                stderr = resp.get("stderr", "") or ""
-                _dbg(
-                    f"remote_swe started: run_id={desired_run_id} dt={dt:.2f}s "
-                    f"ok={ok!r} rc={rc!r} error={err!r} stderr_bytes={len(stderr)}"
-                )
-                if ok:
+            t0 = time.perf_counter()
+            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
+            dt = time.perf_counter() - t0
+            ok = bool(resp.get("ok", False))
+            rc = resp.get("returncode", None)
+            err = resp.get("error", None)
+            stderr = resp.get("stderr", "") or ""
+            _dbg(
+                f"remote_swe started: run_id={self.run_id} dt={dt:.2f}s "
+                f"ok={ok!r} rc={rc!r} error={err!r} stderr_bytes={len(stderr)}"
+            )
+            if not ok:
+                # Busy runner guard: do NOT silently attach to an existing run by default.
+                # Attaching to the wrong instance can mix repos/images and cause "empty stdout" / wrong paths.
+                msg = str(err or stderr or "")
+                m = re.search(r"current_run_id=([A-Za-z0-9_\-]+)", msg)
+                if m:
+                    cur = m.group(1)
+                    adopt = str(os.environ.get("GP_REMOTE_SWE_ADOPT_BUSY", "0")).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "y",
+                    }
+                    if not adopt:
+                        raise RuntimeError(
+                            "remote_swe runner is busy (instance already running). "
+                            f"Refusing to auto-adopt current_run_id={cur}. "
+                            "Stop the existing instance or set GP_REMOTE_SWE_ADOPT_BUSY=1 if you are sure it's safe. "
+                            f"Raw message: {msg[:800]!r}"
+                        )
+                    # If user explicitly allows adopting, try to verify image match when available.
+                    mimg = re.search(r"current_image=([^\s]+)", msg)
+                    if mimg:
+                        cur_img = mimg.group(1)
+                        req_img = str(self.cfg.docker_image or "")
+                        if req_img and cur_img and cur_img != req_img:
+                            raise RuntimeError(
+                                "remote_swe busy instance image mismatch: "
+                                f"current_image={cur_img!r} requested_image={req_img!r}. "
+                                "Refusing to adopt. "
+                                f"Raw message: {msg[:800]!r}"
+                            )
+                    _dbg(f"remote_swe start got busy; adopting current_run_id={cur}")
+                    self._remote.run_id = cur
                     self._remote_started = True
                     return
-
-                # Busy runner case
-                msg = str(err or stderr or "")
-                last_err = msg
-                if "runner busy" in msg or "current_run_id" in msg:
-                    # Extract busy context best-effort.
-                    cur_run = None
-                    cur_img = None
-                    cur_task = None
-                    new_img = None
-                    new_task = None
-                    try:
-                        m = re.search(r"current_run_id=([A-Za-z0-9_\-]+)", msg)
-                        if m:
-                            cur_run = m.group(1)
-                        m = re.search(r"current_image=([^,\s]+)", msg)
-                        if m:
-                            cur_img = m.group(1)
-                        m = re.search(r"current_task_id=([^,\s]+)", msg)
-                        if m:
-                            cur_task = m.group(1)
-                        m = re.search(r"new_image=([^,\s]+)", msg)
-                        if m:
-                            new_img = m.group(1)
-                        m = re.search(r"new_task_id=([^,\s]+)", msg)
-                        if m:
-                            new_task = m.group(1)
-                    except Exception:
-                        pass
-
-                    # Only adopt if the image matches; otherwise it is very likely
-                    # we will send commands to the wrong container.
-                    if cur_run and cur_img and new_img and cur_img == new_img:
-                        try:
-                            _dbg(
-                                f"remote_swe start got busy but image matches; adopting current_run_id={cur_run}"
-                            )
-                            self._remote.run_id = cur_run
-                            self._remote_started = True
-                            return
-                        except Exception:
-                            pass
-
-                    # If it's a likely stale gp-* run, stop it and retry.
-                    if auto_stop_busy and cur_run and str(cur_run).startswith("gp-"):
-                        same_task = bool(cur_task and new_task and cur_task == new_task)
-                        if same_task:
-                            try:
-                                _dbg(
-                                    f"remote_swe runner busy with a gp-* run; stopping stale run_id={cur_run} then retry"
-                                )
-                                old = self._remote.run_id
-                                try:
-                                    self._remote.run_id = cur_run
-                                    self._remote.stop(timeout=600.0)
-                                finally:
-                                    self._remote.run_id = old
-                            except Exception as e:
-                                _dbg(f"failed to stop busy run_id={cur_run}: {e!r}")
-
-                    # Retry budget
-                    if attempt <= busy_retries:
-                        time.sleep(max(0.5, busy_sleep))
-                        continue
-
-                # Non-busy hard failure
                 raise RuntimeError(
                     f"remote_swe start failed: rc={rc!r} error={err!r} stderr={stderr[:2000]!r}"
                 )
-
-            raise RuntimeError(
-                f"remote_swe start failed after retries. last_error={str(last_err or '')[:2000]!r}"
-            )
+            self._remote_started = True
 
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         if self._mode == "remote_swe":
@@ -458,35 +410,16 @@ class SandboxRuntime:
                 env=self.cfg.env,
                 cwd=self.workdir,
             )
-
-            # Proxy response keys vary across backends; normalize best-effort.
             stdout = resp.get("stdout") or ""
             stderr = resp.get("stderr") or ""
-            if not stdout and isinstance(resp.get("lines"), list):
-                try:
-                    stdout = "\n".join([str(x) for x in (resp.get("lines") or [])])
-                except Exception:
-                    stdout = ""
-
-            rc_val = resp.get("returncode", None)
-            if rc_val is None:
-                rc_val = resp.get("rc", None)
-            if rc_val is None:
-                rc_val = resp.get("code", None)
-            try:
-                rc = int(rc_val or 0)
-            except Exception:
-                rc = 0
-            if resp.get("ok") is False and rc == 0:
-                rc = 1
-
-            # IMPORTANT: keep stdout intact for callers that parse JSON from stdout.
-            # Only append stderr on failures.
-            out = stdout if rc == 0 else (stdout + ("\n" + stderr if stderr else ""))
-
-            if os.environ.get("GP_PRINT_REMOTE_STDIO") and stderr and rc == 0:
-                _dbg(f"[remote_swe][stderr] {stderr[:800]}")
-            return out, rc
+            rc = _safe_int(resp.get("returncode", 0), 0)
+            # Critical: do NOT merge stderr into stdout on success.
+            # Some helpers (e.g. read_file_lines) expect stdout to be JSON.
+            if rc == 0:
+                if stderr and os.environ.get("DEBUG_ACTION_RESULT"):
+                    _dbg(f"remote exec produced stderr_bytes={len(stderr)} (suppressed from stdout)")
+                return stdout, 0
+            return stdout + stderr, rc
         if self._mode == "apptainer_queue":
             q = "'" + cmd.replace("'", "'\"'\"'") + "'"
             exec_cmd = ["bash", "-lc", q]
@@ -1023,11 +956,16 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                 self._env = None
             self._rt = None
         elif self._mode == "remote_swe":
+            # Stop can be slow/hang when the SSH tunnel is unhealthy.
+            # Do not block teardown for many minutes.
             try:
-                if self._remote:
-                    self._remote.stop()
-            except Exception:
-                pass
+                if self._remote and self._remote_started:
+                    stop_timeout = _safe_int(os.environ.get("GP_REMOTE_STOP_TIMEOUT", 120), 120)
+                    self._remote.stop(timeout=float(stop_timeout))
+            except Exception as e:
+                _dbg(f"remote_swe stop failed (ignored): {e!r}")
+            finally:
+                self._remote_started = False
             self._remote = None
         elif self._mode == "apptainer_queue":
             self._aq = None
