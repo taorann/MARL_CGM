@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
+
+
+DEBUG = bool(os.environ.get("DEBUG"))
+
+
+def _dbg(msg: str) -> None:
+    if DEBUG:
+        print(f"[planner_env] {msg}")
 
 def _safe_int(x: Any, default: int = 0) -> int:
     try:
@@ -160,7 +167,8 @@ class PlannerEnv:
         self.steps: int = 0
         self.last_info: Dict[str, Any] = {}
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
-        self._container_repo_root_detected: bool = False
+        if getattr(self.box, "_mode", None) == "remote_swe":
+            self.repo_root_in_container = "/repo"
         # Optional host repo root for per-env graph scanning.
         self.repo_root_host: Optional[str] = getattr(sandbox_cfg, "repo_root_host", None)
         self.run_id: str = os.environ.get("GRAPH_PLANNER_RUN_ID", "") or self.issue.get("run_id", "")
@@ -209,14 +217,32 @@ class PlannerEnv:
         backend_mode = getattr(self.box, "_mode", None)
 
         # === 1) 构建完整仓库图 repo_graph ===
-        if backend_mode == "remote_swe" and hasattr(self.box, "build_issue_subgraph"):
-            # remote_swe 模式：build_issue_subgraph 被视为完整仓库图
+        if backend_mode == "remote_swe":
+            # remote_swe：先在远端容器里构图，再落盘/回传到 host 缓存，最后本地加载。
+            # 注意：如果这里失败，后续 explore/find/expand 基本不可用，应 fail-fast。
+            allow_empty = os.environ.get("GP_ALLOW_EMPTY_REPO_GRAPH", "0").strip().lower() in {"1", "true", "yes"}
             try:
-                repo_json = self.box.build_issue_subgraph(self.issue_id)
+                if hasattr(self.box, "load_repo_graph"):
+                    repo_json = self.box.load_repo_graph(repo_id=str(getattr(self, "repo_id", "") or ""))
+                elif hasattr(self.box, "build_issue_subgraph"):
+                    # 兼容旧接口：将 build_issue_subgraph 视为 repo-level graph
+                    repo_json = self.box.build_issue_subgraph(self.issue_id)
+                else:
+                    raise RuntimeError("remote_swe backend missing load_repo_graph/build_issue_subgraph")
                 self.repo_graph = subgraph_store.wrap(repo_json)
-
-            except Exception:
+            except Exception as e:
+                _dbg(f"repo_graph build/load failed: {e!r}")
+                if not allow_empty:
+                    raise
                 self.repo_graph = subgraph_store.new()
+
+            # 强约束：remote_swe 默认必须有 repo_graph
+            try:
+                n_nodes = len(getattr(self.repo_graph, "nodes", {}) or {})
+            except Exception:
+                n_nodes = 0
+            if (not allow_empty) and n_nodes <= 0:
+                raise RuntimeError("remote_swe repo_graph is empty; set GP_ALLOW_EMPTY_REPO_GRAPH=1 to bypass")
         else:
             # 本地 backend：从 ACI 子图缓存加载（如有需要可触发扫描构图）
             if hasattr(graph_adapter, "set_repo_root") and self.repo_root_host:
@@ -242,7 +268,11 @@ class PlannerEnv:
 
         # Keep graph_adapter aligned with repo_graph (mem_candidates / expand).
         try:
-            root = "/repo" if getattr(self.box, "_mode", None) == "remote_swe" else (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
+            # graph_adapter 的 root 用于路径拼接/显示；remote_swe 用真实容器 repo root
+            if getattr(self.box, "_mode", None) == "remote_swe":
+                root = getattr(self.box, "workdir", None) or os.environ.get("GP_REMOTE_REPO_ROOT", "/testbed")
+            else:
+                root = (getattr(self, "repo_root_host", None) or self.repo_root_in_container)
             if hasattr(graph_adapter, "set_repo_root"):
                 graph_adapter.set_repo_root(root)
             if hasattr(graph_adapter, "connect_from_subgraph"):
@@ -540,51 +570,24 @@ class PlannerEnv:
             info["error"] = "missing-repo-graph"
             return info
 
-        # 数量预算：兼容旧字段 limit，同时支持 total_limit/max_per_anchor/dir_diversity_k。
-        # 允许用环境变量覆盖默认值，避免一次 find 拉太多候选导致 prompt 爆长。
-        env_default_limit = _safe_int(
-            os.environ.get("GP_DEFAULT_EXPLORE_TOTAL_LIMIT")
-            or os.environ.get("GP_DEFAULT_EXPLORE_LIMIT")
-            or None,
-            0,
-        )
-        total_limit = _safe_int(
-            getattr(act, "total_limit", None)
-            or (env_default_limit if env_default_limit > 0 else None)
-            or act.limit
-            or 32,
-            32,
-        )
+        # 数量预算：兼容旧字段 limit，同时支持 total_limit/max_per_anchor/dir_diversity_k
+        total_limit = _safe_int(getattr(act, "total_limit", None) or act.limit or 32, 32)
         max_per_anchor = _safe_int(getattr(act, "max_per_anchor", None) or total_limit, total_limit)
         dir_diversity_k = _safe_int(getattr(act, "dir_diversity_k", None) or 4, 4)
-
-        # Preserve the raw query string for fidelity. Downstream components do their own
-        # query processing (strong/weak terms). We keep one raw string for the tool-call.
-        raw_query = (query_value or "").strip() if isinstance(query_value, str) else " ".join(query_value or []).strip()
-
-        qp = mem_candidates.process_query(raw_query) if raw_query else {"query_raw": raw_query, "strong_terms": [], "weak_terms": []}
-        query_for_recall = (qp.get("query_raw") or raw_query or "").strip()
-
-        if query_for_recall:
-            info["query_raw"] = query_for_recall
-        if qp.get("strong_terms"):
-            info["query_strong_terms"] = list(qp.get("strong_terms") or [])
-        if qp.get("weak_terms"):
-            info["query_weak_terms"] = list(qp.get("weak_terms") or [])
-
-        # For backward-compat / debugging
-        query_terms = list(qp.get("strong_terms") or []) + list(qp.get("weak_terms") or [])
+        # Keep the raw query string intact for the query DSL (symbol:/path:/+/-/quotes).
+        # We still compute tokenized terms only for debugging/telemetry.
+        query_terms = mem_candidates.extract_query_terms(query_value)
         if query_terms:
-            info["query_terms"] = query_terms
+            info["query_terms"] = list(query_terms)
+        raw_query = (query_value or "").strip() if isinstance(query_value, str) else " ".join(query_terms).strip()
+        query = raw_query
 
 
         # -------- op = find --------
         if act.op == "find":
-            # 1) 记忆召回：query 命中则返回 top-k note + node；是否 merge 到 working 由环境变量控制
-            enable_recall = str(os.environ.get("GP_ENABLE_MEMORY_RECALL", "0")).strip().lower() in {"1", "true", "yes", "y"}
-            merge_recall = str(os.environ.get("GP_MERGE_RECALL_TO_WORKING", "0")).strip().lower() in {"1", "true", "yes", "y"}
-            if enable_recall and query_for_recall:
-                recall = self._recall_memory(query=query_for_recall, k=min(total_limit, 20))
+            # 1) 记忆召回：query 命中则返回 top-k note + node，并可选 merge 到 working
+            if query:
+                recall = self._recall_memory(query=query, k=min(total_limit, 20))
                 if recall.get("memory_notes"):
                     info["memory_notes"] = recall["memory_notes"]
                 if recall.get("memory_nodes"):
@@ -592,13 +595,7 @@ class PlannerEnv:
                     # 将召回的记忆节点并入 working（只增量，不清空）
                     recall_ids = [n.get("id") for n in recall["memory_nodes"] if isinstance(n, dict)]
                     recall_ids = [nid for nid in recall_ids if isinstance(nid, str)]
-
-                    max_recall_nodes = _safe_int(os.environ.get("GP_MAX_MEMORY_RECALL_NODES") or os.environ.get("GP_MAX_RECALL_NODES") or 8, 8)
-                    if max_recall_nodes > 0 and len(recall_ids) > max_recall_nodes:
-                        info["recall_truncated"] = {"total": len(recall_ids), "kept": max_recall_nodes}
-                        recall_ids = recall_ids[:max_recall_nodes]
-
-                    if merge_recall and recall_ids:
+                    if recall_ids:
                         self._merge_memory_nodes_into_working(recall_ids, status="recalled")
 
             # 2) repo 图检索：anchors 存在才做
@@ -611,27 +608,15 @@ class PlannerEnv:
                     dir_diversity_k=dir_diversity_k,
                 )
             else:
-                if query_for_recall:
+                if query:
                     candidates = mem_candidates.search_repo_candidates_by_query(
                         repo_graph=self.repo_graph,
-                        query=query_for_recall,
+                        query=query,
                         total_limit=total_limit,
                         dir_diversity_k=dir_diversity_k,
                     )
                 else:
                     candidates = []
-
-
-            candidates_total = len(candidates)
-            info["candidates_total"] = candidates_total
-            max_working_candidates = _safe_int(os.environ.get("GP_MAX_WORKING_CANDIDATES") or 12, 12)
-            if max_working_candidates >= 0 and candidates_total > max_working_candidates:
-                candidates = candidates[:max_working_candidates]
-                info["candidates_truncated"] = {
-                    "max": max_working_candidates,
-                    "total": candidates_total,
-                    "kept": len(candidates),
-                }
 
             self.last_candidates = candidates
             info["candidates"] = candidates
@@ -664,29 +649,13 @@ class PlannerEnv:
                 except Exception:
                     pass
             # auto-attach snippets for candidates (explore has no separate read op)
-            # But: pulling snippets for *all* candidates is expensive (lots of remote exec)
-            # and can easily blow up prompt length. Cap with env var.
-            max_cand_snippets = _safe_int(os.environ.get("GP_MAX_CANDIDATE_SNIPPETS") or max_working_candidates, max_working_candidates)
             cand_snippets = []
-            cand_iter = candidates
-            truncated = False
-            if max_cand_snippets >= 0 and len(candidates) > max_cand_snippets:
-                cand_iter = candidates[:max_cand_snippets]
-                truncated = True
-            for c in cand_iter:
+            for c in candidates:
                 try:
                     nid = c.get("id")
                     if isinstance(nid, str):
-                        # anchor snippet already attached above
-                        if anchor_id and nid == anchor_id:
-                            continue
                         n = self._resolve_node(nid) or {}
                         sn = self._read_node_snippet(n) if n else None
-                        if sn is None:
-                            err_payload = getattr(self.box, '_last_read_file_error', None)
-                            if isinstance(err_payload, dict) and err_payload.get('error') == 'open_failed':
-                                # likely wrong repo_root_in_container; don't spam remote exec for every candidate
-                                break
                         if sn:
                             c["snippet_lines"] = sn.get("snippet_lines", [])
                             cand_snippets.append(sn)
@@ -697,14 +666,6 @@ class PlannerEnv:
                 except Exception:
                     continue
             info["candidate_snippets"] = cand_snippets
-            if truncated:
-                info["candidate_snippets_truncated"] = {
-                    "max": max_cand_snippets,
-                    "total": len(candidates),
-                }
-            pruned_budget = self._prune_working_for_budget(protect_ids={anchor_id} if anchor_id else None)
-            if pruned_budget and pruned_budget.get("removed"):
-                info["working_budget_prune"] = pruned_budget
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -727,27 +688,6 @@ class PlannerEnv:
                     node_ids.append(nid)
 
             self._merge_repo_nodes_into_working(node_ids, status="explored")
-
-            # Attach code snippets for merged nodes so W is self-contained for the planner.
-            max_expand_snips = _safe_int(os.environ.get("GP_MAX_EXPAND_SNIPPETS") or len(node_ids), len(node_ids))
-            expanded_snippets = []
-            for nid in node_ids[: max(0, max_expand_snips)]:
-                try:
-                    n = self._resolve_node(nid) or {}
-                    sn = self._read_node_snippet(n) if n else None
-                    if sn and isinstance(sn.get("snippet_lines"), list):
-                        self.working_subgraph.update_node(nid, {"snippet_lines": sn.get("snippet_lines", [])})
-                        expanded_snippets.append(sn)
-                except Exception:
-                    continue
-            if expanded_snippets:
-                info["expanded_snippets"] = expanded_snippets
-
-            # Prune W by prompt budget while never dropping memorized nodes (M subset invariant).
-            prune_info = self._prune_working_for_budget()
-            if prune_info.get("removed"):
-                info["working_pruned_for_budget"] = prune_info
-
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -806,9 +746,6 @@ class PlannerEnv:
                     info["skipped_reason"] = "empty_note_text"
                     return info
 
-                if tag:
-                    note_text = f"[{tag}] {note_text}"
-
                 note_id = self.memory_text_store.append("session", note_text)
                 info["note_id"] = note_id
                 info["notes_total"] = len(self.memory_text_store.get("session"))
@@ -866,14 +803,12 @@ class PlannerEnv:
             top_k = int(top_k) if top_k is not None else 8
         except Exception:
             top_k = 8
-        # Keep the unmemorized working cache bounded by a fixed value (not model-controlled).
-        keep_recent = os.environ.get("GP_KEEP_RECENT_UNMEMORIZED", "20")
+
+        keep_recent = selector.get("keep_recent_unmemorized")
         try:
-            keep_recent = int(keep_recent)
+            keep_recent = int(keep_recent) if keep_recent is not None else 20
         except Exception:
             keep_recent = 20
-        if keep_recent < 0:
-            keep_recent = 0
 
         w_before = subgraph_store.stats(self.working_subgraph)
         m_before = subgraph_store.stats(self.memory_subgraph)
@@ -890,23 +825,6 @@ class PlannerEnv:
             "working_unmemorized_before": w_before.get("n_unmemorized", 0),
             "memory_nodes_before": m_before.get("n_nodes", 0),
         }
-
-        # Optional: append a short summary note to text memory (planner-only).
-        note_text = (
-            selector.get("note_text")
-            or selector.get("note")
-            or selector.get("text")
-            or selector.get("content")
-        )
-        note_text = _safe_str(note_text, "").strip()
-        if note_text:
-            if self.memory_text_store is None:
-                self.memory_text_store = text_memory.NoteTextStore()
-            if tag:
-                note_text = f"[{tag}] {note_text}"
-            note_id = self.memory_text_store.append("session", note_text)
-            info["note_id"] = note_id
-            info["notes_total"] = len(self.memory_text_store.get("session"))
 
         # ---------- delete from graph memory ----------
         if act.intent == "delete":
@@ -1001,52 +919,9 @@ class PlannerEnv:
             )
             return info
 
-        # Ensure commit ids exist in W and have snippets before projecting W[S] -> M.
-        # This keeps the invariant: node_ids(M) ⊆ node_ids(W), and both carry code snippets.
-        missing = [nid for nid in selected_set if not isinstance(self.working_subgraph.get_node(nid), dict)]
-        if missing:
-            self._merge_repo_nodes_into_working(missing, status="committing")
-
-        max_commit_snippets = _safe_int(os.environ.get("GP_MAX_COMMIT_SNIPPETS") or 0, 0)
-        # max_commit_snippets=0 means: always attach snippets for all selected nodes (selection is small by design).
-        sel_iter = list(selected_set)
-        if max_commit_snippets > 0 and len(sel_iter) > max_commit_snippets:
-            sel_iter = sel_iter[:max_commit_snippets]
-            info["commit_snippets_truncated"] = {"total": len(selected_set), "kept": len(sel_iter)}
-
-        for nid in sel_iter:
-            wn = self.working_subgraph.get_node(nid)
-            if not isinstance(wn, dict):
-                continue
-            if not (wn.get("snippet_lines") or wn.get("snippet")):
-                try:
-                    n = self._resolve_node(nid) or {}
-                    sn = self._read_node_snippet(n) if n else None
-                    if sn and isinstance(sn.get("snippet_lines"), list):
-                        self.working_subgraph.update_node(nid, {"snippet_lines": sn.get("snippet_lines", [])})
-                except Exception:
-                    pass
-
-        # Ensure edges among selected nodes exist in W so M edges are also a subset of W edges.
-        try:
-            subgraph_store.add_repo_edges_between_ids(self.working_subgraph, self.repo_graph, list(selected_set))
-        except Exception:
-            pass
-
         proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
-        if tag:
-            for _n in proj_nodes:
-                if isinstance(_n, dict):
-                    _n["tag"] = tag
         subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
         subgraph_store.add_edges(self.memory_subgraph, proj_edges)
-
-        # Keep M reasonably small (CGM-facing, high signal). Never drop newly selected nodes.
-        max_memory_nodes = _safe_int(os.environ.get("GP_MAX_MEMORY_NODES") or 40, 40)
-        if max_memory_nodes > 0:
-            removed_mem = subgraph_store.prune_memory(self.memory_subgraph, max_memory_nodes, keep_ids=selected_set)
-            if removed_mem:
-                info["memory_pruned"] = {"removed": int(removed_mem), "max": max_memory_nodes}
 
         for nid in selected_set:
             n = self.working_subgraph.get_node(nid)
@@ -1063,10 +938,6 @@ class PlannerEnv:
             keep_recent_unmemorized=keep_recent,
         )
         info["pruned_unmemorized"] = int(pruned or 0)
-
-        budget_pruned = self._prune_working_for_budget(protect_ids=selected_set)
-        if budget_pruned and budget_pruned.get("removed"):
-            info["working_budget_prune"] = budget_pruned
 
         w_after = subgraph_store.stats(self.working_subgraph)
         m_after = subgraph_store.stats(self.memory_subgraph)
@@ -1343,112 +1214,17 @@ class PlannerEnv:
                 return dict(repo_node)
         return None
 
-    def _ensure_container_repo_root_detected(self) -> None:
-        """Best-effort detect the repository root directory inside the sandbox/container.
-
-        This is mainly for remote_swe: depending on the SWE-bench image/harness, the repo
-        may live at /repo, /testbed/repo, /testbed, etc. If we guess wrong, snippet reads
-        will silently fail (and you'd see empty `lines`).
-        """
-        if getattr(self.box, "_mode", None) != "remote_swe":
-            return
-        if getattr(self, "_container_repo_root_detected", False):
-            return
-        self._container_repo_root_detected = True
-        try:
-            cands = []
-            # Prefer configured workdir first.
-            if isinstance(self.repo_root_in_container, str) and self.repo_root_in_container.strip():
-                cands.append(self.repo_root_in_container.strip())
-            # Common SWE-bench layouts.
-            cands += ["/repo", "/testbed/repo", "/testbed", "/workspace/repo", "/workspace", "/work/repo", "/work"]
-            # De-dup while preserving order.
-            seen = set()
-            cands = [x for x in cands if isinstance(x, str) and x and not (x in seen or seen.add(x))]
-
-            py = """python - <<'PY'
-import os, json
-cands = %s
-markers = ['pyproject.toml','setup.py','setup.cfg','requirements.txt']
-def good(root):
-    if not os.path.isdir(root):
-        return False
-    if os.path.isdir(os.path.join(root,'.git')):
-        return True
-    for m in markers:
-        if os.path.isfile(os.path.join(root,m)):
-            return True
-    # fallback signals
-    for d in ['astropy','src','lib','package']:
-        if os.path.isdir(os.path.join(root,d)):
-            return True
-    return False
-
-found = None
-checked = []
-for r in cands:
-    checked.append(r)
-    if good(r):
-        found = r
-        break
-print(json.dumps({'repo_root': found, 'checked': checked}, ensure_ascii=False))
-PY""" % (repr(cands))
-
-            out, rc = self.box.run(py, timeout=30)
-            if int(rc) != 0:
-                return
-            last = (out or "").splitlines()[-1].strip() if (out or "").splitlines() else ""
-            data = json.loads(last) if last else {}
-            root = data.get("repo_root") if isinstance(data, dict) else None
-            if isinstance(root, str) and root.strip():
-                self.repo_root_in_container = root.strip()
-                if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and os.environ.get("GP_DEBUG_REPO_ROOT") == "1":
-                    print(f"[planner_env] detected repo_root_in_container={self.repo_root_in_container!r}", file=sys.stderr)
-        except Exception:
-            return
-
-
-
-
-
     def _read_node_snippet(self, node: Union[Mapping[str, Any], str]) -> Optional[Dict[str, Any]]:
         """Read snippet lines for a node.
 
-        Prefer sandbox runtime's ``read_file_lines`` for both local and remote backends.
-        For remote_swe, we also try to auto-detect the repository root inside the container,
-        because the exact mount point differs across harnesses/images.
+        - local backends: read from evaluator filesystem
+        - remote_swe: prefer snippet embedded in repo_graph; otherwise read inside remote container
         """
         try:
             if isinstance(node, str):
                 node = self._resolve_node(node) or {}
             if not isinstance(node, Mapping):
                 return None
-
-            # --- Preferred path: embedded snippets from repo_graph ---
-            # In remote_swe mode we build the repo graph *inside* the SWE container,
-            # transfer it back to the host (base64+gzip JSONL), then run explore locally.
-            # To keep explore fully local and avoid fragile remote file reads, we embed
-            # bounded snippet lines directly in the repo_graph nodes at build time.
-            try:
-                s_lines = node.get("snippet_lines")
-                if isinstance(s_lines, list) and all(isinstance(x, str) for x in s_lines):
-                    s0 = _safe_int(node.get("snippet_start") or node.get("start_line") or (node.get("span") or {}).get("start") or 1, 1)
-                    e0 = _safe_int(node.get("snippet_end") or node.get("end_line") or (node.get("span") or {}).get("end") or s0, s0)
-                    # Apply the same hard cap used elsewhere (prompt safety)
-                    max_snippet_lines = _safe_int(os.environ.get("GP_MAX_SNIPPET_LINES") or 120, 120)
-                    if max_snippet_lines > 0 and len(s_lines) > max_snippet_lines:
-                        s_lines = s_lines[:max_snippet_lines]
-                        e0 = s0 + len(s_lines) - 1
-                    return {
-                        "id": node.get("id"),
-                        "path": (node.get("path") or "").lstrip("/"),
-                        "start": s0,
-                        "end": e0,
-                        "snippet_lines": list(s_lines),
-                        "snippet": list(s_lines),
-                    }
-            except Exception:
-                pass
 
             path = (node.get("path") or "").lstrip("/")
             if not path:
@@ -1460,34 +1236,15 @@ PY""" % (repr(cands))
             start_line = int(node.get("start_line") or span_start or 1)
             end_line = int(node.get("end_line") or span_end or start_line)
 
-            # Hard cap snippet length to avoid prompt blow-ups
-            max_snippet_lines = _safe_int(os.environ.get("GP_MAX_SNIPPET_LINES") or 120, 120)
-            if max_snippet_lines > 0 and (end_line - start_line + 1) > max_snippet_lines:
-                end_line = start_line + max_snippet_lines - 1
-            if end_line < start_line:
-                end_line = start_line
 
-            reader = getattr(self.box, "read_file_lines", None)
-            if callable(reader):
-                # NOTE: In remote_swe we intentionally avoid remote file reads during explore.
-                # If snippet was not embedded in repo_graph, return None and let the caller
-                # proceed without snippet.
-                if getattr(self.box, "_mode", None) == "remote_swe":
-                    return None
-
-                abs_path = os.path.join(self.repo_root_in_container, path)
-                snippet_lines, rc = reader(abs_path, start_line, end_line, timeout=60)
-
-                if int(rc) != 0:
-                    if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and os.environ.get("GP_DEBUG_SNIPPET_ERRORS") == "1":
-                        try:
-                            err_payload = getattr(self.box, "_last_read_file_error", None)
-                            print(f"[planner_env] snippet read failed rc={rc} abs_path={abs_path!r} err={err_payload!r}", file=sys.stderr)
-                        except Exception:
-                            pass
-                    return None
-
-                snippet_lines = list(snippet_lines or [])
+            # 0) If repo_graph already carries snippet_lines/snippet, prefer it.
+            embedded = node.get("snippet_lines")
+            if not isinstance(embedded, list):
+                embedded = node.get("snippet")
+            if isinstance(embedded, list) and embedded:
+                # Best-effort truncate to keep prompt under control.
+                max_lines = _safe_int(os.environ.get("GP_MAX_SNIPPET_LINES", "120"), 120)
+                snippet_lines = [str(x) for x in embedded[: max(0, max_lines)]]
                 return {
                     "id": node.get("id"),
                     "path": path,
@@ -1497,8 +1254,45 @@ PY""" % (repr(cands))
                     "snippet": snippet_lines,
                 }
 
-            # Fallback: direct filesystem read (local backends only)
+            # remote_swe: read inside container (repo root is the remote workdir, typically /testbed)
+            if getattr(self.box, "_mode", None) == "remote_swe":
+                repo_root = getattr(self.box, "workdir", None) or os.environ.get("GP_REMOTE_REPO_ROOT", "/testbed")
+                abs_path = os.path.join(str(repo_root), path)
+                reader = getattr(self.box, "read_file_lines", None)
+                if not callable(reader):
+                    return None
+                snippet_lines, rc = reader(abs_path, start_line, end_line, timeout=60)
+                if int(rc) != 0:
+                    return None
+                snippet_lines = list(snippet_lines or [])
+                if not snippet_lines:
+                    return None
+                return {
+                    "id": node.get("id"),
+                    "path": path,
+                    "start": start_line,
+                    "end": end_line,
+                    "snippet_lines": snippet_lines,
+                    "snippet": snippet_lines,
+                }
+
+
+            # local (prefer sandbox runtime reader for consistency)
             abs_path = os.path.join(self.repo_root_in_container, path)
+            reader = getattr(self.box, "read_file_lines", None)
+            if callable(reader):
+                snippet_lines, rc = reader(abs_path, start_line, end_line, timeout=60)
+                if int(rc) == 0:
+                    snippet_lines = list(snippet_lines or [])
+                    return {
+                        "id": node.get("id"),
+                        "path": path,
+                        "start": start_line,
+                        "end": end_line,
+                        "snippet_lines": snippet_lines,
+                        "snippet": snippet_lines,
+                    }
+            # fallback: direct filesystem read
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                     lines2 = f.read().splitlines()
@@ -1513,6 +1307,7 @@ PY""" % (repr(cands))
                 }
             except Exception:
                 return None
+
         except Exception:
             return None
 
@@ -1621,36 +1416,6 @@ PY""" % (repr(cands))
                 continue
             existing.add(key)
             self.working_subgraph.edges.append(dict(e))
-
-
-    def _prune_working_for_budget(self, *, protect_ids: Optional[set[str]] = None) -> Dict[str, int]:
-        """Prune working_subgraph to fit prompt budget while keeping memorized nodes.
-
-        Invariant: we never remove memorized nodes, ensuring node_ids(M) ⊆ node_ids(W).
-        """
-        max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_TOTAL_CHARS") or 60000, 60000)
-        max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_TOTAL_SNIPPET_LINES") or 1500, 1500)
-        if max_chars <= 0 and max_lines <= 0:
-            return {"removed": 0, "total_snippet_lines": 0, "total_snippet_chars": 0}
-
-        keep_recent = _safe_int(os.environ.get("GP_KEEP_RECENT_UNMEMORIZED") or 20, 20)
-
-        keep_ids: set[str] = set()
-        # Protect M node ids even if a bug forgets to mark them memorized.
-        try:
-            keep_ids |= set(getattr(self.memory_subgraph, "node_ids", []) or [])
-        except Exception:
-            pass
-        if protect_ids:
-            keep_ids |= {x for x in protect_ids if isinstance(x, str) and x}
-
-        return subgraph_store.prune_working_by_budget(
-            self.working_subgraph,
-            max_total_snippet_lines=max_lines,
-            max_total_snippet_chars=max_chars,
-            keep_ids=keep_ids,
-            keep_recent_unmemorized=keep_recent,
-        )
 
 
     def _merge_repo_nodes_into_working(
