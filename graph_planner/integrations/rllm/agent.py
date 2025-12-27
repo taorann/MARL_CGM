@@ -45,10 +45,19 @@ from ...agents.common.contracts import (
 from ...infra import telemetry as telemetry_mod
 
 # rLLM types (vendored) are optional for tooling contexts.
+# IMPORTANT: AgentExecutionEngine asserts isinstance(agent, BaseAgent) where BaseAgent comes
+# from rllm.agents.agent in the upstream rllm package. Import from there to match the engine.
 try:  # pragma: no cover
-    from rllm.agents.base_agent import BaseAgent
+    from rllm.agents.agent import BaseAgent  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
-    BaseAgent = object  # type: ignore
+    try:
+        from rllm.rllm.agents.agent import BaseAgent  # type: ignore[attr-defined]
+    except Exception as e:  # pragma: no cover
+        raise ImportError(
+            "Cannot import BaseAgent from rllm (tried rllm.agents.agent and rllm.rllm.agents.agent). "
+            "Your rllm install layout is unexpected."
+        ) from e
+
 
 
 # -----------------------------------------------------------------------------
