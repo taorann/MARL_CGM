@@ -471,31 +471,45 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
 
     if action_name == "explore":
         op = str(params.get("op", "find")).lower()
-        anchors = _ensure_dict_list(params.get("anchors"))
+        # anchors: accept [{"id": ...}], {"id": ...}, ["id", ...], or "id"
+        anchors_raw = params.get("anchors")
+        anchors: List[Dict[str, Any]] = []
+        if isinstance(anchors_raw, dict):
+            if anchors_raw.get("id"):
+                anchors = [dict(anchors_raw)]
+        elif isinstance(anchors_raw, str):
+            s = anchors_raw.strip()
+            anchors = [{"id": s}] if s else []
+        elif isinstance(anchors_raw, list):
+            tmp: List[Dict[str, Any]] = []
+            for x in anchors_raw:
+                if isinstance(x, dict) and x.get("id"):
+                    tmp.append(dict(x))
+                elif isinstance(x, str):
+                    s = x.strip()
+                    if s:
+                        tmp.append({"id": s})
+            anchors = tmp
         nodes = _ensure_str_list(params.get("nodes"))
         query_raw = params.get("query")
-        # Keep a single query string (may contain multiple keywords).
-        query: Any = query_raw
+        # query: keep a single string (can contain multiple keywords)
+        query: Optional[str]
+        if isinstance(query_raw, str):
+            query = query_raw.strip() or None
+        elif isinstance(query_raw, list):
+            parts = [str(v).strip() for v in query_raw if isinstance(v, (str, int, float)) and str(v).strip()]
+            query = " ".join(parts).strip() or None
+        else:
+            query = None
         trimmed: Dict[str, Any] = {}
         if isinstance(query_raw, list) and len(query_raw) > 1:
-            trimmed["query"] = {"from": len(query_raw), "to": 1, "mode": "join"}
+            # we join list -> single query string
+            trimmed["query"] = {"from": len(query_raw), "to": 1}
         if isinstance(anchors, list) and len(anchors) > 1:
             trimmed["anchors"] = {"from": len(anchors), "to": 1}
             anchors = anchors[:1]
         if trimmed:
             meta["trimmed"] = trimmed
-
-        if isinstance(query_raw, list):
-            parts = [str(v).strip() for v in query_raw if isinstance(v, (str, int, float)) and str(v).strip()]
-            query = " ".join(parts) if parts else None
-        elif isinstance(query_raw, str):
-            q = query_raw.strip()
-            query = q or None
-
-        else:
-
-            query = None
-
 
         # 兼容旧版：explore.read
         # 兼容旧版：explore.read 已弃用；将其规范化为 explore.expand (hop=0)
