@@ -339,6 +339,21 @@ def log_event(event: Dict[str, Any]) -> None:
     tel.event(name, event, severity=_safe_str(event.get("severity") or "INFO"))
 
 
+def emit_event(name: str, payload: Mapping[str, Any], *, severity: str = "INFO") -> None:
+    """Backward-compat helper.
+
+    Some components historically called `telemetry.emit_event(name, payload)`.
+    The unified telemetry backend uses `Telemetry.event(...)`.
+    """
+
+    tel = get_telemetry()
+    try:
+        tel.event(_safe_str(name), dict(payload), severity=_safe_str(severity))
+    except Exception:
+        # Best-effort fallback to keep callers from crashing.
+        tel.event(_safe_str(name), {"payload": _safe_str(payload)}, severity=_safe_str(severity))
+
+
 def log_test_result(result: Dict[str, Any]) -> None:
     """
     Legacy: write test run details.
