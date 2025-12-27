@@ -75,17 +75,41 @@ def _safe_parse(src: str, filename: str) -> Optional[ast.AST]:
         return None
 
 
+def _clip_snippet_lines(
+    file_lines: Sequence[str],
+    start_line: int,
+    end_line: int,
+    *,
+    max_lines: int,
+) -> List[str]:
+    """Extract [start_line, end_line] (1-indexed, inclusive) and clip length."""
+    if not file_lines:
+        return []
+    s = max(1, int(start_line or 1))
+    e = max(s, int(end_line or s))
+    seg = list(file_lines[s - 1 : e])
+    if max_lines >= 0 and len(seg) > max_lines:
+        seg = seg[:max_lines]
+    return seg
+
+
 class GraphBuilder(ast.NodeVisitor):
-    def __init__(self, file_rel: str, file_node_id: str, *, source_lines: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        file_rel: str,
+        file_node_id: str,
+        *,
+        file_lines: Optional[Sequence[str]] = None,
+        embed_snippets: bool = True,
+        max_snippet_lines: int = 120,
+    ) -> None:
         self.file_rel = file_rel
         self.file_node_id = file_node_id
-        # Optional source lines for embedding snippets directly into nodes.
-        # This enables fully local explore/find/expand on the host, after the
-        # repo graph JSONL is built inside the SWE container and cached host-side.
-        self._source_lines: List[str] = list(source_lines or [])
-        self._max_snippet_lines: int = int(os.environ.get("GP_GRAPH_NODE_SNIPPET_LINES", "60") or 60)
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: List[Dict[str, Any]] = []
+        self._file_lines = list(file_lines or [])
+        self._embed_snippets = bool(embed_snippets)
+        self._max_snippet_lines = int(max_snippet_lines)
         # stack of container node ids (file/class/function)
         self.container_stack: List[str] = [file_node_id]
         # stack of names for qualname
@@ -105,31 +129,6 @@ class GraphBuilder(ast.NodeVisitor):
         if not self.scope_names:
             return name
         return ".".join(self.scope_names + [name])
-
-    def _snippet_payload(self, start: int, end: int) -> Dict[str, Any]:
-        """Return a compact snippet payload for a span.
-
-        We intentionally cap snippet length at build time to avoid huge repo_graph
-        payloads and to keep host-side local explore responsive.
-        """
-        if not self._source_lines:
-            return {}
-        # Defensive bounds
-        s = max(1, int(start or 1))
-        e = max(s, int(end or s))
-        e = min(e, len(self._source_lines) if self._source_lines else e)
-        # Cap lines
-        k = int(self._max_snippet_lines or 0)
-        if k > 0 and (e - s + 1) > k:
-            e = s + k - 1
-        if e < s:
-            e = s
-        lines = self._source_lines[s - 1 : e]
-        return {
-            "snippet_start": s,
-            "snippet_end": e,
-            "snippet_lines": lines,
-        }
 
     # ---- imports (edge: imports) ----
     def visit_Import(self, node: ast.Import) -> Any:
@@ -173,14 +172,17 @@ class GraphBuilder(ast.NodeVisitor):
         qn = self._qualname(node.name)
         start, end = _node_span(node)
         nid = f"class:{self.file_rel}:{qn}:{start}"
-        payload = {
+        payload: Dict[str, Any] = {
             "id": nid,
             "kind": "class",
             "name": qn,
             "path": self.file_rel,
             "span": {"start": start, "end": end},
         }
-        payload.update(self._snippet_payload(start, end))
+        if self._embed_snippets and self._file_lines:
+            snip = _clip_snippet_lines(self._file_lines, start, end, max_lines=self._max_snippet_lines)
+            if snip:
+                payload["snippet_lines"] = snip
         self._add_node(nid, payload)
         self._add_edge(self._current_container(), nid, "contains")
 
@@ -197,7 +199,7 @@ class GraphBuilder(ast.NodeVisitor):
         qn = self._qualname(name)
         start, end = _node_span(node)
         nid = f"func:{self.file_rel}:{qn}:{start}"
-        payload = {
+        payload2: Dict[str, Any] = {
             "id": nid,
             "kind": "function",
             "name": qn,
@@ -205,8 +207,11 @@ class GraphBuilder(ast.NodeVisitor):
             "span": {"start": start, "end": end},
             "async": bool(is_async),
         }
-        payload.update(self._snippet_payload(start, end))
-        self._add_node(nid, payload)
+        if self._embed_snippets and self._file_lines:
+            snip = _clip_snippet_lines(self._file_lines, start, end, max_lines=self._max_snippet_lines)
+            if snip:
+                payload2["snippet_lines"] = snip
+        self._add_node(nid, payload2)
         self._add_edge(self._current_container(), nid, "contains")
 
         self.container_stack.append(nid)
@@ -230,29 +235,48 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
     nodes: Dict[str, Dict[str, Any]] = {}
     edges: List[Dict[str, Any]] = []
 
+    embed_snippets = str(os.environ.get("GP_EMBED_REPO_SNIPPETS", "1")).strip().lower() in {"1", "true", "yes", "y"}
+    max_snippet_lines = int(os.environ.get("GP_MAX_SNIPPET_LINES", "120") or 120)
+
     for fp in iter_python_files(repo):
         rel = _rel_posix(fp, repo)
         file_id = f"file:{rel}"
-        # file node
+        try:
+            src = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        file_lines = src.splitlines()
+
+        # file node (optionally embeds a clipped preview snippet)
         if file_id not in nodes:
-            nodes[file_id] = {
+            file_payload: Dict[str, Any] = {
                 "id": file_id,
                 "kind": "file",
                 "name": rel,
                 "path": rel,
                 "span": None,
             }
-
-        try:
-            src = fp.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
+            if embed_snippets and file_lines:
+                file_payload["snippet_lines"] = _clip_snippet_lines(
+                    file_lines,
+                    1,
+                    len(file_lines),
+                    max_lines=max_snippet_lines,
+                )
+            nodes[file_id] = file_payload
 
         tree = _safe_parse(src, filename=rel)
         if tree is None:
             continue
 
-        gb = GraphBuilder(file_rel=rel, file_node_id=file_id, source_lines=src.splitlines())
+        gb = GraphBuilder(
+            file_rel=rel,
+            file_node_id=file_id,
+            file_lines=file_lines,
+            embed_snippets=embed_snippets,
+            max_snippet_lines=max_snippet_lines,
+        )
         gb.visit(tree)
 
         # merge
