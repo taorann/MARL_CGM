@@ -17,11 +17,12 @@ MemCandidates builder for Step 3.1
 """
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Iterable, List, Dict, Set, Tuple
+from typing import Any, Iterable, List, Dict, Set, Tuple, Optional
 
 from .types import Anchor, Candidate, Node, SubgraphLike
 from . import graph_adapter
@@ -35,15 +36,6 @@ _QUERY_STOPWORDS = {
     "does","do","did","can","could","should","would","may","might","feel","feels","like",
     "bug","missing","expected","suddenly","again","output","inputs","outputs","model","models",
 }
-
-# Terms that are often too generic on their own. We keep them, but down-weight them in scoring
-# to avoid 'information explosion' for queries like 'matrix'.
-_WEAK_TERMS = {
-    'matrix','matrices','array','arrays','vector','vectors','function','functions','method','methods',
-    'class','classes','module','modules','file','files','object','objects','property','properties',
-    'parameter','parameters','value','values','data','dataset','datasets','result','results',
-}
-
 
 
 def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
@@ -108,35 +100,224 @@ def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
     return terms[:max_terms]
 
 
-def process_query(query: Any, max_terms: int = 16) -> Dict[str, Any]:
-    """Normalize query into strong/weak term groups.
+# ----------------------------
+# Query DSL parsing for explore.find
+# ----------------------------
 
-    This is a small robustness helper for tool-call parameters. Models may return
-    either a free-form string or a list-like query. We normalize into a list of
-    terms and split them into:
-      - strong_terms: domain-specific tokens (identifiers, paths, dotted names, ...)
-      - weak_terms: generic words that tend to explode recall (e.g., 'matrix')
 
-    Return shape is intentionally stable so planner/env code can consume it.
+@dataclass(frozen=True)
+class QuerySpec:
+    raw: str
+    symbol_terms: Tuple[str, ...] = ()
+    path_terms: Tuple[str, ...] = ()
+    must_terms: Tuple[str, ...] = ()
+    must_not_terms: Tuple[str, ...] = ()
+    phrase_terms: Tuple[str, ...] = ()
+    free_terms: Tuple[str, ...] = ()
+
+
+_SEARCH_CACHE: Dict[int, Dict[str, Any]] = {}
+
+
+def _tokenize_free_text(s: str, *, max_terms: int = 24) -> List[str]:
+    toks = re.findall(r"[A-Za-z0-9_./:-]+", s or "")
+    out: List[str] = []
+    seen: Set[str] = set()
+    for t in toks:
+        tl = (t or "").strip().lower()
+        if not tl or len(tl) < 2:
+            continue
+        if tl in _QUERY_STOPWORDS:
+            continue
+        if tl in seen:
+            continue
+        seen.add(tl)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def parse_query_dsl(q: str) -> QuerySpec:
+    """Parse a lightweight DSL for explore.find.
+
+    Supported (order-insensitive):
+      - symbol:<term>   bias toward node name/id matches
+      - path:<term>     bias toward node path matches
+      - +term           required term (must appear)
+      - -term           forbidden term (must not appear)
+      - "phrase" / 'phrase' required-to-score phrase match (high boost)
+
+    The function is best-effort and intentionally permissive.
     """
-    raw = "" if query is None else (query if isinstance(query, str) else str(query))
-    terms = extract_query_terms(query, max_terms=max_terms)
-    strong_terms: List[str] = []
-    weak_terms: List[str] = []
-    for t in terms:
-        if (t or "").strip().lower() in _WEAK_TERMS:
-            weak_terms.append(t)
-        else:
-            strong_terms.append(t)
+    raw = (q or "").strip()
+    if not raw:
+        return QuerySpec(raw="")
 
-    return {
-        "query_raw": raw,
-        "terms": terms,
-        "strong_terms": strong_terms,
-        "weak_terms": weak_terms,
-    }
+    # Extract quoted phrases first (keep as phrases; also remove from the free text).
+    phrase_terms: List[str] = []
+    tmp = raw
+    for pat in (r"\"([^\"]{1,120})\"", r"'([^']{1,120})'"):
+        for m in re.finditer(pat, raw):
+            ph = (m.group(1) or "").strip()
+            if ph:
+                phrase_terms.append(ph)
+        tmp = re.sub(pat, " ", tmp)
+
+    # Normalise separators.
+    tmp = tmp.replace("\n", " ").replace("\t", " ")
+
+    symbol_terms: List[str] = []
+    path_terms: List[str] = []
+    must_terms: List[str] = []
+    must_not_terms: List[str] = []
+
+    tokens = tmp.split()
+    i = 0
+    free_parts: List[str] = []
+    while i < len(tokens):
+        tok = tokens[i]
+        tl = tok.lower()
+        if tl.startswith("symbol:"):
+            val = tok.split(":", 1)[1].strip()
+            if not val and i + 1 < len(tokens):
+                i += 1
+                val = tokens[i].strip()
+            if val:
+                symbol_terms.append(val)
+            i += 1
+            continue
+        if tl.startswith("path:"):
+            val = tok.split(":", 1)[1].strip()
+            if not val and i + 1 < len(tokens):
+                i += 1
+                val = tokens[i].strip()
+            if val:
+                path_terms.append(val)
+            i += 1
+            continue
+
+        if tok.startswith("+") and len(tok) > 1:
+            must_terms.append(tok[1:])
+            i += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            must_not_terms.append(tok[1:])
+            i += 1
+            continue
+
+        free_parts.append(tok)
+        i += 1
+
+    free_text = " ".join(free_parts)
+    free_terms = _tokenize_free_text(free_text, max_terms=24)
+    # Also tokenise the directive payloads: helps when user writes `symbol:foo.bar` etc.
+    # But keep the original directive payloads separately for exact scoring.
+    must_terms = [t for t in _tokenize_free_text(" ".join(must_terms), max_terms=12)]
+    must_not_terms = [t for t in _tokenize_free_text(" ".join(must_not_terms), max_terms=12)]
+
+    return QuerySpec(
+        raw=raw,
+        symbol_terms=tuple(symbol_terms[:3]),
+        path_terms=tuple(path_terms[:3]),
+        must_terms=tuple(must_terms[:6]),
+        must_not_terms=tuple(must_not_terms[:6]),
+        phrase_terms=tuple(phrase_terms[:6]),
+        free_terms=tuple(free_terms[:24]),
+    )
 
 
+def _get_repo_items_cache(repo_graph: SubgraphLike) -> Dict[str, Any]:
+    """Build/return a lightweight per-process cache for repo_graph search."""
+    key = id(repo_graph)
+    cached = _SEARCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    nodes_store = getattr(repo_graph, "nodes", {}) or {}
+    # items: (nid, node, name, path, kind, hay, dir)
+    items: List[Tuple[str, Dict[str, Any], str, str, str, str, str]] = []
+
+    def _add(nid: str, node: Dict[str, Any]) -> None:
+        nid_s = str(nid or node.get("id") or "")
+        name = str(node.get("name") or node.get("symbol") or "")
+        path = str(node.get("path") or "")
+        kind = str(node.get("kind") or "").lower()
+        hay = (nid_s + " " + name + " " + path).lower()
+        d = ""
+        try:
+            d = str(PurePosixPath(_norm_posix(path)).parent)
+        except Exception:
+            d = ""
+        items.append((nid_s, node, name, path, kind, hay, d))
+
+    if isinstance(nodes_store, dict):
+        for nid, node in nodes_store.items():
+            if isinstance(nid, str) and isinstance(node, dict):
+                _add(nid, node)
+    else:
+        for node in (nodes_store or []):
+            if isinstance(node, dict):
+                nid = node.get("id") or node.get("node_id") or node.get("name")
+                if isinstance(nid, str):
+                    _add(nid, node)
+
+    out = {"items": items, "N": len(items), "df": {}}
+    _SEARCH_CACHE[key] = out
+    return out
+
+
+def _df_for_token(cache: Dict[str, Any], token: str) -> int:
+    """Compute df(token) lazily and cache it."""
+    df_cache: Dict[str, int] = cache.get("df") or {}
+    tl = (token or "").lower()
+    if not tl:
+        return 0
+    if tl in df_cache:
+        return int(df_cache[tl])
+    cnt = 0
+    for (_nid, _node, _name, _path, _kind, hay, _d) in cache.get("items", []):
+        if tl in hay:
+            cnt += 1
+    df_cache[tl] = cnt
+    cache["df"] = df_cache
+    return cnt
+
+
+def _term_specificity_boost(t: str) -> float:
+    tl = (t or "").strip().lower()
+    if not tl:
+        return 0.0
+    b = 0.0
+    if "/" in tl:
+        b += 0.9
+    if "." in tl:
+        b += 0.6
+    if "_" in tl:
+        b += 0.4
+    if ":" in tl:
+        b += 0.3
+    if len(tl) >= 12:
+        b += 0.4
+    elif len(tl) >= 8:
+        b += 0.2
+    return b
+
+
+def _is_strong_term(t: str, *, cache: Dict[str, Any]) -> bool:
+    """Best-effort strong/weak split.
+
+    Strong terms are those that are structurally specific (path/dotted/identifier)
+    OR have low document frequency in the repo graph.
+    """
+    tl = (t or "").strip().lower()
+    if not tl or tl in _QUERY_STOPWORDS:
+        return False
+    if any(ch in tl for ch in ("/", ".", "_")) and len(tl) >= 5:
+        return True
+    N = int(cache.get("N") or 0) or 1
+    df = _df_for_token(cache, tl)
+    return df <= max(3, int(0.02 * N))
 
 
 def search_repo_candidates_by_query(
@@ -146,100 +327,147 @@ def search_repo_candidates_by_query(
     total_limit: int,
     dir_diversity_k: int = 4,
 ) -> List[Candidate]:
-    """Search repo_graph nodes when explore.find is called without anchors.
+    """Search repo_graph nodes for explore.find (no anchors).
 
-    We do a lightweight lexical match against node id/name/path.
+    This is intentionally *not* a full-text search; it's a small, explainable
+    lexical scorer over node id/name/path.
 
-    Query conventions (best-effort, optional):
-      - "path:<substr>"    prioritize path matches
-      - "symbol:<name>"   prioritize symbol/id/name matches
+    Query DSL (order-insensitive, best-effort):
+      - symbol:<term>         strong bias toward node id/name (exact > substring)
+      - path:<term>           strong bias toward node path
+      - +term                 required term (must appear)
+      - -term                 forbidden term (must not appear)
+      - "phrase" / 'phrase'  high-boost phrase match
+
+    Design goals:
+      1) avoid weak-term explosion (e.g. "matrix")
+      2) return a small top list with stable ordering
+      3) keep reasons explainable
     """
     q = (query or "").strip()
     if not q or not repo_graph:
         return []
 
-    q_lower = q.lower()
-    mode = "free"
-    payload = q
-    if q_lower.startswith("path:"):
-        mode, payload = "path", q[5:].strip()
-    elif q_lower.startswith("symbol:"):
-        mode, payload = "symbol", q[7:].strip()
+    spec = parse_query_dsl(q)
+    cache = _get_repo_items_cache(repo_graph)
+    N = int(cache.get("N") or 0) or 1
 
-    payload_lower = payload.lower()
-    toks = re.findall(r"[A-Za-z0-9_./:-]+", payload_lower)
-    toks = [t for t in toks if t and len(t) >= 2 and t not in _QUERY_STOPWORDS]
-    strong_terms = [t for t in toks if t not in _WEAK_TERMS]
+    # Determine which free terms are "strong"; we require at least one strong hit
+    # unless the query provides explicit directives (+/symbol/path/phrase).
+    free_terms = list(spec.free_terms)
+    strong_terms = [t for t in free_terms if _is_strong_term(t, cache=cache)]
+    if not strong_terms and free_terms:
+        # fallback: take the longest term as a pseudo-strong anchor
+        strong_terms = [max(free_terms, key=len)]
 
-    def norm_dir(p: str) -> str:
+    has_directive = bool(spec.symbol_terms or spec.path_terms or spec.must_terms or spec.phrase_terms)
+
+    # Precompute IDF-like weights for terms (weak terms are down-weighted, not excluded).
+    term_weights: Dict[str, float] = {}
+    for t in set([*(spec.must_terms or ()), *free_terms]):
+        tl = t.lower()
+        if not tl or tl in _QUERY_STOPWORDS:
+            continue
+        df = _df_for_token(cache, tl)
+        idf = math.log((N + 1.0) / (df + 1.0))
+        w = (1.0 + _term_specificity_boost(t)) * idf
+        # If too common, treat as weak.
+        if df >= int(0.10 * N):
+            w *= 0.3
+        term_weights[tl] = float(max(0.05, min(w, 6.0)))
+
+    def _norm_dir(p: str) -> str:
         try:
             return str(PurePosixPath(_norm_posix(p)).parent)
         except Exception:
             return ""
 
     scored: List[Candidate] = []
-    nodes_store = getattr(repo_graph, "nodes", {}) or {}
-
-    items: List[Tuple[str, Dict[str, Any]]] = []
-    if isinstance(nodes_store, dict):
-        for nid, node in nodes_store.items():
-            if isinstance(nid, str) and isinstance(node, dict):
-                items.append((nid, node))
-    else:
-        for node in (nodes_store or []):
-            if isinstance(node, dict):
-                nid = node.get("id") or node.get("node_id") or node.get("name")
-                if isinstance(nid, str):
-                    items.append((nid, node))
-
-    for nid, node in items:
-        nid_s = str(nid or node.get("id") or "")
-        name = str(node.get("name") or node.get("symbol") or "")
-        path = str(node.get("path") or "")
-        kind = str(node.get("kind") or "").lower()
-
-        hay = (nid_s + " " + name + " " + path).lower()
+    for nid_s, node, name, path, kind, hay, _d in cache.get("items", []):
+        hay = (hay or "").lower()
         if not hay:
+            continue
+
+        # forbidden terms
+        bad = False
+        for t in spec.must_not_terms:
+            if t.lower() in hay:
+                bad = True
+                break
+        if bad:
+            continue
+
+        # required terms
+        for t in spec.must_terms:
+            if t.lower() not in hay:
+                bad = True
+                break
+        if bad:
             continue
 
         score = 0.0
         reasons: List[str] = []
 
-        # Strong substring match on the whole payload
-        if payload_lower and payload_lower in hay:
-            score += 3.0
-            reasons.append("payload")
-
-        # Token matches (down-weight generic terms)
-        strong_matched = False
-        for t in toks:
-            if t in hay:
-                w = 0.25 if t in _WEAK_TERMS else 1.0
-                score += w
-                reasons.append(f"weak:{t}" if w < 1.0 else t)
-                if t not in _WEAK_TERMS:
-                    strong_matched = True
-
-        # If we have at least one non-generic term, require a strong match to avoid
-        # returning huge candidate sets for queries like "matrix".
-        if strong_terms and not strong_matched and not (payload_lower and payload_lower in hay):
-            continue
-
-        # Mode-specific boosts
-        if mode == "path" and payload_lower and payload_lower in path.lower():
-            score += 3.0
-            reasons.append("path")
-        if mode == "symbol" and payload_lower:
-            pl = payload_lower
-            if pl == nid_s.lower() or pl == name.lower():
-                score += 4.0
+        # Directives: symbol / path
+        for sym in spec.symbol_terms:
+            sl = sym.lower()
+            if not sl:
+                continue
+            if sl == (nid_s or "").lower() or sl == (name or "").lower():
+                score += 8.0
                 reasons.append("symbol_exact")
-            elif pl in nid_s.lower() or pl in name.lower():
-                score += 2.0
+            elif sl in (nid_s or "").lower() or sl in (name or "").lower():
+                score += 4.0
                 reasons.append("symbol")
 
-        if score <= 0:
+        for pt in spec.path_terms:
+            pl = pt.lower()
+            if not pl:
+                continue
+            if pl in (path or "").lower():
+                score += 7.0
+                reasons.append("path")
+            elif pl in (nid_s or "").lower():
+                score += 4.0
+                reasons.append("path_hint")
+
+        # Phrase matches (high boost, optional)
+        for ph in spec.phrase_terms:
+            phl = ph.lower()
+            if phl and phl in hay:
+                score += 4.0
+                reasons.append("phrase")
+
+        # Term matches (free + must)
+        matched_terms: List[Tuple[float, str]] = []
+        for t in [*spec.must_terms, *free_terms]:
+            tl = t.lower()
+            if not tl or tl in _QUERY_STOPWORDS:
+                continue
+            if tl in hay:
+                w = float(term_weights.get(tl) or 0.5)
+                score += w
+                matched_terms.append((w, tl))
+
+        # Weak-term explosion guard: require at least one strong term match
+        # unless the query uses directives.
+        if not has_directive:
+            if strong_terms:
+                if not any(st.lower() in hay for st in strong_terms):
+                    continue
+
+        if score <= 0.0:
             continue
+
+        # Prefer function/class nodes very slightly over raw files for anchoring.
+        if kind in {"func", "function", "class", "method"}:
+            score += 0.25
+        elif kind in {"file", "t-file"}:
+            score += 0.05
+
+        matched_terms.sort(key=lambda x: x[0], reverse=True)
+        for (_w, tl) in matched_terms[:5]:
+            reasons.append(tl)
 
         scored.append(
             {
@@ -250,7 +478,7 @@ def search_repo_candidates_by_query(
                 "degree": int(node.get("degree") or 0),
                 "from_anchor": False,
                 "score": float(score),
-                "reasons": list(dict.fromkeys(reasons))[:8],
+                "reasons": list(dict.fromkeys(reasons))[:10],
                 "name": (name or None),
             }
         )
@@ -262,7 +490,7 @@ def search_repo_candidates_by_query(
         buckets: Dict[str, List[Candidate]] = {}
         order: List[str] = []
         for c in scored:
-            d = norm_dir(str(c.get("path") or ""))
+            d = _norm_dir(str(c.get("path") or ""))
             if d not in buckets:
                 buckets[d] = []
                 order.append(d)
