@@ -418,13 +418,18 @@ class GraphPlannerRLLMAgent(BaseAgent):
         #  - none: disable tool use
         self.openai_tool_choice: Any = os.environ.get("GP_TOOL_CHOICE", "required")
 
+        # Internal message buffer (do NOT assign to BaseAgent.chat_completions property).
+        self._messages: List[Dict[str, str]] = []
+
         self._steps: List[_StepState] = []
         self.reset()
 
     # ----- rLLM API -----
     def reset(self) -> None:
         self._steps = []
-        self.chat_completions = [
+        # BaseAgent defines chat_completions as a read-only @property.
+        # Keep our own mutable buffer and expose it via a property override.
+        self._messages = [
             {"role": "system", "content": self.system_prompt},
         ]
 
@@ -433,11 +438,17 @@ class GraphPlannerRLLMAgent(BaseAgent):
 
         # The planner sees the observation (already preformatted by env).
         obs_text = observation if isinstance(observation, str) else _safe_json(observation)
-        self.chat_completions.append({"role": "user", "content": obs_text})
+        self._messages.append({"role": "user", "content": obs_text})
 
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
+
+
+    @property
+    def chat_completions(self) -> List[Dict[str, str]]:
+        """Full dialogue history for the engine (OpenAI chat format)."""
+        return list(self._messages)
 
     def update_from_model(self, model_response: str) -> ActionUnion:
         # Record model response.
@@ -473,9 +484,9 @@ class GraphPlannerRLLMAgent(BaseAgent):
 
         if wrapper_obj is not None:
             preamble = _first_sentence(str(wrapper_obj.get("content") or ""))
-            self.chat_completions.append({"role": "assistant", "content": preamble})
+            self._messages.append({"role": "assistant", "content": preamble})
         else:
-            self.chat_completions.append({"role": "assistant", "content": model_response or ""})
+            self._messages.append({"role": "assistant", "content": model_response or ""})
 
         action: Dict[str, Any]
         try:
