@@ -618,54 +618,49 @@ class PlannerEnv:
                 else:
                     candidates = []
 
+            # Expose candidates to the agent, but do NOT mutate working_subgraph.
+            # The planner should explicitly select an anchor via explore_expand.
             self.last_candidates = candidates
             info["candidates"] = candidates
-            # v5: choose exactly one anchor and immediately attach it to working_subgraph
-            anchor_id: Optional[str] = None
-            # If the model provided an anchor, respect it (after trimming in the parser)
-            if anchors:
-                a0 = anchors[0]
-                if isinstance(a0, dict) and isinstance(a0.get("id"), str):
-                    anchor_id = a0.get("id")
-                elif isinstance(a0, str):
-                    anchor_id = a0
-            # Otherwise pick the top candidate as the frontier anchor
-            if not anchor_id and candidates:
-                c0 = candidates[0] if isinstance(candidates[0], dict) else {}
-                if isinstance(c0, dict) and isinstance(c0.get("id"), str):
-                    anchor_id = c0.get("id")
 
-            if anchor_id:
-                self.frontier_anchor_id = anchor_id
-                info["anchor_selected"] = anchor_id
-                # ensure anchor node is present in working for the planner to read
-                self._merge_repo_nodes_into_working([anchor_id], status="frontier")
-                # best-effort: attach snippet lines to the anchor node
+            # Mark which already-present working nodes are in the last candidate set.
+            cand_ids: List[str] = []
+            for c in candidates:
+                nid = c.get("id") if isinstance(c, dict) else None
+                if isinstance(nid, str):
+                    cand_ids.append(nid)
+            cand_set = set(cand_ids)
+            if cand_set:
                 try:
-                    n = self._resolve_node(anchor_id) or {}
-                    sn = self._read_node_snippet(n) if n else None
-                    if sn and isinstance(sn.get("snippet_lines"), list):
-                        self.working_subgraph.update_node(anchor_id, {"snippet_lines": sn.get("snippet_lines", [])})
+                    for n in (self.working_subgraph.nodes or []):
+                        if isinstance(n, dict) and isinstance(n.get("id"), str):
+                            n["in_last_candidates"] = n.get("id") in cand_set
                 except Exception:
                     pass
-            # auto-attach snippets for candidates (explore has no separate read op)
-            cand_snippets = []
-            for c in candidates:
+
+            # Attach lightweight previews for the top-k candidates (for debugging/inspection).
+            k_preview = _safe_int(os.environ.get("GP_CANDIDATE_PREVIEW_K", "6"), 6)
+            max_lines = _safe_int(os.environ.get("GP_CANDIDATE_PREVIEW_LINES", "24"), 24)
+            previews: List[Dict[str, Any]] = []
+            for c in candidates[: max(0, k_preview)]:
                 try:
-                    nid = c.get("id")
-                    if isinstance(nid, str):
-                        n = self._resolve_node(nid) or {}
-                        sn = self._read_node_snippet(n) if n else None
-                        if sn:
-                            c["snippet_lines"] = sn.get("snippet_lines", [])
-                            cand_snippets.append(sn)
-                            try:
-                                self.working_subgraph.update_node(nid, {"snippet_lines": sn.get("snippet_lines", [])})
-                            except Exception:
-                                pass
+                    nid = c.get("id") if isinstance(c, dict) else None
+                    if not isinstance(nid, str):
+                        continue
+                    sn = self._read_node_snippet(nid)
+                    if sn and isinstance(sn.get("snippet_lines"), list):
+                        previews.append({
+                            "id": nid,
+                            "path": sn.get("path"),
+                            "start": sn.get("start"),
+                            "end": sn.get("end"),
+                            "snippet_lines": list(sn.get("snippet_lines", [])[: max(0, max_lines)]),
+                        })
                 except Exception:
                     continue
-            info["candidate_snippets"] = cand_snippets
+            if previews:
+                info["candidate_previews"] = previews
+
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -688,6 +683,15 @@ class PlannerEnv:
                     node_ids.append(nid)
 
             self._merge_repo_nodes_into_working(node_ids, status="explored")
+
+            # Runtime guard: keep working subgraph bounded. This prevents rare
+            # cases where repeated expands blow up local state (and later
+            # summaries/prompt formatting).
+            max_working = _safe_int(os.environ.get("GP_MAX_WORKING_NODES", "350"), default=350)
+            if max_working > 0 and len(self.working_subgraph.nodes) > max_working:
+                keep_recent = _safe_int(os.environ.get("GP_KEEP_RECENT_UNMEM", "120"), default=120)
+                subgraph_store.prune_working(self.working_subgraph, keep_recent_unmemorized=keep_recent)
+                info["pruned_working"] = True
             info["subgraph_stats"] = subgraph_store.stats(self.working_subgraph)
             return info
 
@@ -804,11 +808,9 @@ class PlannerEnv:
         except Exception:
             top_k = 8
 
-        keep_recent = selector.get("keep_recent_unmemorized")
-        try:
-            keep_recent = int(keep_recent) if keep_recent is not None else 20
-        except Exception:
-            keep_recent = 20
+        # Runtime guard: keep memorized nodes + a fixed recent tail of unmemorized nodes.
+        # Do not let the planner control pruning aggressiveness.
+        keep_recent = _safe_int(os.environ.get("GP_KEEP_RECENT_UNMEM", "120"), default=120)
 
         w_before = subgraph_store.stats(self.working_subgraph)
         m_before = subgraph_store.stats(self.memory_subgraph)
@@ -918,6 +920,22 @@ class PlannerEnv:
                 }
             )
             return info
+
+        # Ensure selected memorized nodes carry embedded snippets when present in
+        # the repo graph snapshot (older working nodes may lack snippet_lines).
+        for nid in selected_set:
+            n = self.working_subgraph.get_node(nid)
+            if not isinstance(n, dict):
+                continue
+            if n.get("snippet_lines"):
+                continue
+            r = self.repo_graph.get(nid)
+            if isinstance(r, dict) and r.get("snippet_lines"):
+                n["snippet_lines"] = r.get("snippet_lines")
+                if r.get("sig"):
+                    n["sig"] = r.get("sig")
+                if r.get("doc"):
+                    n["doc"] = r.get("doc")
 
         proj_nodes, proj_edges = subgraph_store.project_to_memory(self.working_subgraph, list(selected_set))
         subgraph_store.add_nodes(self.memory_subgraph, proj_nodes)
