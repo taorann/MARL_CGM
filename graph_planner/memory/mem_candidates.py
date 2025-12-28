@@ -243,7 +243,11 @@ def _get_repo_items_cache(repo_graph: SubgraphLike) -> Dict[str, Any]:
         name = str(node.get("name") or node.get("symbol") or "")
         path = str(node.get("path") or "")
         kind = str(node.get("kind") or "").lower()
-        hay = (nid_s + " " + name + " " + path).lower()
+        # "hay" is the searchable text representation of a node.
+        # Keep it compact: identifiers + path + (optional) signature/docstring.
+        sig = str(node.get("sig") or "")
+        doc = str(node.get("doc") or "")
+        hay = (nid_s + " " + name + " " + path + " " + sig + " " + doc).lower()
         d = ""
         try:
             d = str(PurePosixPath(_norm_posix(path)).parent)
@@ -361,6 +365,15 @@ def search_repo_candidates_by_query(
         strong_terms = [max(free_terms, key=len)]
 
     has_directive = bool(spec.symbol_terms or spec.path_terms or spec.must_terms or spec.phrase_terms)
+    # Special case: a single weak free-term like "matrix" tends to match too many
+    # places if we search the full haystack. In that case, only allow matches in
+    # structured fields (id/name/path), and let the model refine further.
+    weak_single_free = (
+        (not has_directive)
+        and (len(free_terms) == 1)
+        and free_terms
+        and (not _is_strong_term(free_terms[0], cache=cache))
+    )
 
     # Precompute IDF-like weights for terms (weak terms are down-weighted, not excluded).
     term_weights: Dict[str, float] = {}
@@ -385,8 +398,14 @@ def search_repo_candidates_by_query(
     scored: List[Candidate] = []
     for nid_s, node, name, path, kind, hay, _d in cache.get("items", []):
         hay = (hay or "").lower()
+        shallow = f"{nid_s} {name} {path}".lower()
         if not hay:
             continue
+
+        if weak_single_free:
+            t0 = free_terms[0].lower()
+            if t0 and t0 not in shallow:
+                continue
 
         # forbidden terms
         bad = False
@@ -444,14 +463,16 @@ def search_repo_candidates_by_query(
             tl = t.lower()
             if not tl or tl in _QUERY_STOPWORDS:
                 continue
-            if tl in hay:
+            # For the single-weak-term case, only match in id/name/path.
+            in_text = (tl in shallow) if weak_single_free else (tl in hay)
+            if in_text:
                 w = float(term_weights.get(tl) or 0.5)
                 score += w
                 matched_terms.append((w, tl))
 
         # Weak-term explosion guard: require at least one strong term match
         # unless the query uses directives.
-        if not has_directive:
+        if not has_directive and (not weak_single_free):
             if strong_terms:
                 if not any(st.lower() in hay for st in strong_terms):
                     continue
