@@ -120,25 +120,31 @@ If tool calling is unavailable, output EXACTLY ONE JSON object inside a fenced `
 
 Concepts:
 - repo_graph (G): full repository graph (read-only).
-- working_subgraph (W): planner-facing cache for exploration/reading/reasoning; may be noisy.
-- memory_subgraph (M): CGM-facing evidence graph; must be small and high-signal.
-- text_memory (T): planner-facing notes; CGM does NOT read it.
+- working_subgraph (W): your evolving view of the code graph (with code snippets). W can be large/noisy.
+- memory nodes (M): a *high-signal subset of W* marked as memorized. This subset is what CGM will use.
+- text_memory (T): your notes (planner-only). CGM does NOT read it.
 
 Tools (preferred):
-1) explore_find(query, anchor?)
-   - HARD RULE: provide at most ONE query string, and at most ONE anchor.
-2) explore_expand(anchor?)
-   - HARD RULE: at most ONE anchor (if omitted, env uses current frontier anchor).
-3) memory_commit(select_ids, keep_ids?, keep_recent_unmemorized?, note?, tag?)
-   - Writes ONLY select_ids into M (as an induced subgraph projection from W).
-   - keep_* only affects pruning/retention in W (does NOT write into M).
+1) explore_find(query)
+   - HARD RULE: provide exactly ONE query string.
+   - Query is a single string that may contain multiple keywords.
+   - Query supports a lightweight DSL:
+       +term   => strong (must match)
+       -term   => must NOT match
+       symbol:Foo  => strong symbol constraint
+       path:pkg/mod.py  => path constraint
+       "exact phrase"  => strong phrase
+2) explore_expand(anchor)
+   - HARD RULE: provide exactly ONE anchor id (from candidates or W).
+3) memory_commit(select_ids?, keep_ids?, note?, tag?)
+   - Marks select_ids as memorized (M ⊂ W). keep_ids means "keep memorized".
    - note/tag are optional; note writes into T (planner-only).
-4) memory_delete(delete_ids, note?, tag?)
-   - Deletes nodes from M; if nodes also exist in W, unmark memorized.
+4) memory_delete(delete_ids?, keep_ids?, note?, tag?)
+   - Unmarks memorized nodes.
 5) memory_commit_note(note, tag?)
    - Writes into T only; W and M unchanged.
 6) repair(plan?)
-   - HARD RULE: only call repair if memory_subgraph is NON-EMPTY.
+   - HARD RULE: only call repair if you have memorized at least one node.
 7) submit()
 8) noop(reason?)
 
@@ -152,14 +158,14 @@ PLANNER_CONTRACT = PlannerContract(
     allowed_params={
         # New: prefer <param name="action">{JSON}</param>
         # Compat: accept legacy params (op/anchors/...) and older "k" wrapper if emitted by older prompts.
-        "explore": {"thought", "action", "k", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
-        "memory": {"thought", "action", "k", "target", "intent", "selector"},
+        "explore": {"action", "k", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
+        "memory": {"action", "k", "target", "intent", "selector"},
         # v5 simplified: planner should only request a repair with a high-level plan.
         # The environment will always run CGM + apply edits; the planner must NOT propose patches.
         # For backward-compat we still accept `subplan` but always normalise to `plan`.
-        "repair": {"thought", "action", "k", "plan", "subplan"},
-        "submit": {"thought", "action", "k"},
-        "noop": {"thought", "action", "k"},
+        "repair": {"action", "k", "plan", "subplan"},
+        "submit": {"action", "k"},
+        "noop": {"action", "k"},
     },
     required_params={
         "repair": set(),
