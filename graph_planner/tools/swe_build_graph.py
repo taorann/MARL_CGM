@@ -87,10 +87,78 @@ def _clip_snippet_lines(
         return []
     s = max(1, int(start_line or 1))
     e = max(s, int(end_line or s))
-    seg = list(file_lines[s - 1 : e])
+    seg = [str(x).rstrip("\n") for x in list(file_lines[s - 1 : e])]
+
+    # If the snippet is long, keep both head and tail to preserve endings.
     if max_lines >= 0 and len(seg) > max_lines:
-        seg = seg[:max_lines]
+        if max_lines <= 3:
+            return seg[:max_lines]
+        head = max_lines // 2
+        tail = max_lines - head - 1
+        seg = seg[:head] + ["... <clipped>"] + seg[-tail:]
     return seg
+
+
+def _extract_sig_from_snippet(snippet_lines: Sequence[str]) -> str:
+    for ln in snippet_lines[:12]:
+        s = str(ln).strip()
+        if s.startswith("async def ") or s.startswith("def ") or s.startswith("class "):
+            return s
+    return ""
+
+
+def _truncate_doc(doc: Optional[str], max_chars: int = 240) -> str:
+    if not doc:
+        return ""
+    d = " ".join(str(doc).strip().split())
+    if len(d) > max_chars:
+        return d[: max_chars - 3] + "..."
+    return d
+
+
+def _file_summary_snippet(file_lines: Sequence[str], tree: Optional[ast.AST], *, max_lines: int) -> List[str]:
+    """Make a high-signal file-level snippet without embedding child bodies.
+
+    We include a short module header (docstring/imports/comments) and an index
+    of top-level def/class symbols with line numbers.
+    """
+    if not file_lines:
+        return []
+    max_lines = int(max_lines or 0)
+    if max_lines <= 0:
+        return []
+
+    header: List[str] = []
+    # Stop at the first top-level decorator/def/class.
+    for ln in file_lines:
+        s = str(ln)
+        if s.startswith("def ") or s.startswith("class ") or s.startswith("async def ") or s.startswith("@"):
+            break
+        header.append(s.rstrip("\n"))
+        if len(header) >= min(max_lines, 60):
+            break
+
+    symbols: List[str] = []
+    try:
+        body = getattr(tree, "body", []) if tree is not None else []
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.append(f"def {n.name} @ {getattr(n, 'lineno', '?')}")
+            elif isinstance(n, ast.ClassDef):
+                symbols.append(f"class {n.name} @ {getattr(n, 'lineno', '?')}")
+    except Exception:
+        symbols = []
+
+    out = header[:]
+    if symbols and len(out) < max_lines:
+        if out and out[-1] != "":
+            out.append("")
+        out.append("# Top-level symbols (name @ line):")
+        for sym in symbols:
+            if len(out) >= max_lines:
+                break
+            out.append(sym)
+    return out[:max_lines]
 
 
 class GraphBuilder(ast.NodeVisitor):
@@ -179,10 +247,13 @@ class GraphBuilder(ast.NodeVisitor):
             "path": self.file_rel,
             "span": {"start": start, "end": end},
         }
+        snip: List[str] = []
         if self._embed_snippets and self._file_lines:
             snip = _clip_snippet_lines(self._file_lines, start, end, max_lines=self._max_snippet_lines)
             if snip:
                 payload["snippet_lines"] = snip
+        payload["sig"] = _extract_sig_from_snippet(snip) or f"class {qn}"
+        payload["doc"] = _truncate_doc(ast.get_docstring(node) or "", max_chars=240)
         self._add_node(nid, payload)
         self._add_edge(self._current_container(), nid, "contains")
 
@@ -207,10 +278,14 @@ class GraphBuilder(ast.NodeVisitor):
             "span": {"start": start, "end": end},
             "async": bool(is_async),
         }
+        snip: List[str] = []
         if self._embed_snippets and self._file_lines:
             snip = _clip_snippet_lines(self._file_lines, start, end, max_lines=self._max_snippet_lines)
             if snip:
                 payload2["snippet_lines"] = snip
+        kind_kw = "async def" if is_async else "def"
+        payload2["sig"] = _extract_sig_from_snippet(snip) or f"{kind_kw} {qn}(...)"
+        payload2["doc"] = _truncate_doc(ast.get_docstring(node) or "", max_chars=240)
         self._add_node(nid, payload2)
         self._add_edge(self._current_container(), nid, "contains")
 
@@ -236,7 +311,13 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
     edges: List[Dict[str, Any]] = []
 
     embed_snippets = str(os.environ.get("GP_EMBED_REPO_SNIPPETS", "1")).strip().lower() in {"1", "true", "yes", "y"}
+    # Snippet budgets:
+    #   - File nodes: keep a compact module header + symbol index (avoid noisy code).
+    #   - Def nodes (func/class): allow a larger embedded snippet to support CGM.
+    # Backward-compat: GP_MAX_SNIPPET_LINES still works as a global fallback.
     max_snippet_lines = int(os.environ.get("GP_MAX_SNIPPET_LINES", "120") or 120)
+    max_file_snippet_lines = int(os.environ.get("GP_MAX_FILE_SNIPPET_LINES", "0") or 0) or max_snippet_lines
+    max_def_snippet_lines = int(os.environ.get("GP_MAX_DEF_SNIPPET_LINES", "0") or 0) or max_snippet_lines
 
     for fp in iter_python_files(repo):
         rel = _rel_posix(fp, repo)
@@ -248,7 +329,12 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
 
         file_lines = src.splitlines()
 
-        # file node (optionally embeds a clipped preview snippet)
+        tree = _safe_parse(src, filename=rel)
+        if tree is None:
+            continue
+
+        # file node: keep it compact (module header + symbol index), *not* raw code.
+        # This prevents weak-term explosion during lexical graph search.
         if file_id not in nodes:
             file_payload: Dict[str, Any] = {
                 "id": file_id,
@@ -256,26 +342,23 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
                 "name": rel,
                 "path": rel,
                 "span": None,
+                "sig": f"module {rel}",
+                "doc": _truncate_doc(ast.get_docstring(tree) or "", max_chars=320),
             }
             if embed_snippets and file_lines:
-                file_payload["snippet_lines"] = _clip_snippet_lines(
+                file_payload["snippet_lines"] = _file_summary_snippet(
                     file_lines,
-                    1,
-                    len(file_lines),
-                    max_lines=max_snippet_lines,
+                    tree,
+                    max_lines=max_file_snippet_lines,
                 )
             nodes[file_id] = file_payload
-
-        tree = _safe_parse(src, filename=rel)
-        if tree is None:
-            continue
 
         gb = GraphBuilder(
             file_rel=rel,
             file_node_id=file_id,
             file_lines=file_lines,
             embed_snippets=embed_snippets,
-            max_snippet_lines=max_snippet_lines,
+            max_snippet_lines=max_def_snippet_lines,
         )
         gb.visit(tree)
 
