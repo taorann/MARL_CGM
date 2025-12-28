@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ...core.actions import ActionUnion
-from ...agents.common.chat import ChatMessage
+from ...agents.common.chat import ChatMessage, summarise_observation
 from ...agents.common.contracts import (
     PLANNER_CONTRACT,
     ProtocolError,
@@ -434,16 +434,47 @@ class GraphPlannerRLLMAgent(BaseAgent):
         ]
 
     def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any]) -> None:
+        """Receive the latest env transition and append it into the chat history."""
         self._steps.append(_StepState(observation=observation, reward=float(reward), done=bool(done), info=dict(info or {})))
 
-        # The planner sees the observation (already preformatted by env).
-        obs_text = observation if isinstance(observation, str) else _safe_json(observation)
+        # The planner sees a compact, human-readable observation. Raw JSON tends to blow up the prompt.
+        send_raw = bool(os.environ.get("GP_SEND_RAW_OBS")) or bool(os.environ.get("DEBUG_SEND_RAW_OBS"))
+        if isinstance(observation, str):
+            obs_text = observation
+        elif send_raw:
+            obs_text = _safe_json(observation)
+        else:
+            issue_tokens = _safe_int(os.environ.get("GP_ISSUE_TOKENS"), default=320)
+            working_top_k = _safe_int(os.environ.get("GP_WORKING_TOP_K"), default=8)
+            working_list_limit = _safe_int(os.environ.get("GP_WORKING_LIST_LIMIT"), default=120)
+            memory_list_limit = _safe_int(os.environ.get("GP_MEMORY_LIST_LIMIT"), default=30)
+            text_memory_k = _safe_int(os.environ.get("GP_TEXT_MEMORY_K"), default=8)
+            max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_LINES"), default=80)
+            max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=6000)
+            try:
+                obs_text, _meta = summarise_observation(
+                    observation,
+                    reward=float(reward),
+                    done=bool(done),
+                    info=info or {},
+                    include_issue=True,
+                    issue_target_tokens=issue_tokens,
+                    steps_target=_safe_int(os.environ.get("GP_STEPS_TARGET"), default=6),
+                    working_top_k=working_top_k,
+                    working_list_limit=working_list_limit,
+                    memory_list_limit=memory_list_limit,
+                    text_memory_k=text_memory_k,
+                    working_max_lines=max_lines,
+                    working_max_chars=max_chars,
+                )
+            except Exception:
+                obs_text = _safe_json(observation)
+
         self._messages.append({"role": "user", "content": obs_text})
 
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
-
 
     @property
     def chat_completions(self) -> List[Dict[str, str]]:
