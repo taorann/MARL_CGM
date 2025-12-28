@@ -15,7 +15,7 @@ Protocol mapping
   We expose fine-grained tools to the planner model:
     - explore_find(query, anchor?)
     - explore_expand(anchor?)
-    - memory_commit(select_ids, keep_ids, keep_recent_unmemorized, note, tag)
+    - memory_commit(select_ids, keep_ids, note, tag)
     - memory_delete(delete_ids, note, tag)
     - memory_commit_note(note, tag)
     - repair(plan)
@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ...core.actions import ActionUnion
-from ...agents.common.chat import ChatMessage, summarise_observation
+from ...agents.common.chat import summarise_observation
 from ...agents.common.contracts import (
     PLANNER_CONTRACT,
     ProtocolError,
@@ -75,19 +75,14 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "explore_find",
-            "description": "Search the repository graph to surface a small set of high-signal candidate nodes, then choose exactly ONE as the next anchor. The engine will automatically pick the top candidate as frontier anchor if you do not provide an anchor hint.",
+            "description": "Search the repository graph to surface a small set of high-signal candidate nodes. This does NOT change the working subgraph; you must call explore_expand(anchor) to expand/merge.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "A SINGLE query string (do not split into arrays). You may use a lightweight DSL: symbol:<term> (prefer id/name matches), path:<term> (prefer path matches), +term (must include), -term (must NOT include), and quoted phrases (\"...\"). Keep it short (about 6-12 tokens) and include 1-2 strong identifier-like terms when possible.",
-                    },
-                    "anchor": {
-                        "type": "string",
-                        "description": "Optional anchor id hint. Usually empty for find.",
-                    },
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -104,11 +99,10 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                 "properties": {
                     "anchor": {
                         "type": "string",
-                        "description": "Anchor id to expand. If empty, env uses frontier_anchor_id.",
-                    },
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
+                        "description": "Anchor id to expand (exactly ONE).",
+                    }
                 },
-                "required": [],
+                "required": ["anchor"],
                 "additionalProperties": False,
             },
         },
@@ -129,17 +123,11 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                         **_NODE_ID_LIST,
                         "description": "Ids to keep in working_subgraph during pruning (NOT written into memory).",
                     },
-                    "keep_recent_unmemorized": {
-                        "type": "integer",
-                        "description": "Keep up to K recent unmemorized nodes in working_subgraph.",
-                        "minimum": 0,
-                    },
                     "note": {
                         "type": "string",
                         "description": "Optional planner-only text memory note to append.",
                     },
                     "tag": {"type": "string", "description": "Optional tag for this commit."},
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -157,7 +145,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                     "delete_ids": {**_NODE_ID_LIST, "description": "Ids to delete from memory_subgraph."},
                     "note": {"type": "string", "description": "Optional planner-only note to append."},
                     "tag": {"type": "string", "description": "Optional tag."},
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["delete_ids"],
                 "additionalProperties": False,
@@ -174,7 +161,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                 "properties": {
                     "note": {"type": "string", "description": "The note to append."},
                     "tag": {"type": "string", "description": "Optional tag."},
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["note"],
                 "additionalProperties": False,
@@ -194,7 +180,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                         "items": {"type": "string"},
                         "description": "Short step plan; do NOT include code patches.",
                     },
-                    "thought": {"type": "string", "description": "Model reasoning (kept for logging)."},
                 },
                 "required": ["plan"],
                 "additionalProperties": False,
@@ -208,7 +193,7 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
             "description": "Finalize the task (run tests / submit patch).",
             "parameters": {
                 "type": "object",
-                "properties": {"thought": {"type": "string", "description": "Model reasoning."}},
+                "properties": {},
                 "required": [],
                 "additionalProperties": False,
             },
@@ -223,7 +208,6 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "reason": {"type": "string", "description": "Why noop."},
-                    "thought": {"type": "string", "description": "Model reasoning."},
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -289,26 +273,22 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         ids = _norm_ids(v)
         return [{"id": s} for s in ids]
 
-    def _pop_thought(args: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        d = dict(args or {})
-        thought = d.pop("thought", "")
-        return (str(thought) if thought is not None else "", d)
-
     tool = str(name or "")
-    thought, args = _pop_thought(arguments)
+    args = dict(arguments or {})
 
     # explore
     if tool == "explore_find":
         query = args.get("query")
-        anchor = args.get("anchor")
-        anchors = _norm_anchors(anchor)
-        params: Dict[str, Any] = {"thought": thought, "op": "find", "query": query, "anchors": anchors}
+        # Query is a single free-form string (may contain multiple keywords / directives).
+        if isinstance(query, (list, tuple)):
+            query = " ".join([str(x) for x in query if x is not None]).strip()
+        params: Dict[str, Any] = {"op": "find", "query": query, "anchors": []}
         return {"name": "explore", "params": params}
 
     if tool == "explore_expand":
         anchor = args.get("anchor")
         anchors = _norm_anchors(anchor)
-        params = {"thought": thought, "op": "expand", "anchors": anchors}
+        params = {"op": "expand", "anchors": anchors}
         return {"name": "explore", "params": params}
 
     # memory
@@ -319,16 +299,13 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         keep_ids = args.get("keep_ids")
         if keep_ids is not None:
             selector["keep_ids"] = _norm_ids(keep_ids)
-        kru = args.get("keep_recent_unmemorized")
-        if kru is not None:
-            selector["keep_recent_unmemorized"] = kru
         note = args.get("note")
         if isinstance(note, str) and note.strip():
             selector["note"] = note
         tag = args.get("tag")
         if isinstance(tag, str) and tag.strip():
             selector["tag"] = tag
-        return {"name": "memory", "params": {"thought": thought, "intent": "commit", "selector": selector}}
+        return {"name": "memory", "params": {"intent": "commit", "selector": selector}}
 
     if tool == "memory_delete":
         selector: Dict[str, Any] = {"delete_ids": _norm_ids(args.get("delete_ids"))}
@@ -338,7 +315,7 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         tag = args.get("tag")
         if isinstance(tag, str) and tag.strip():
             selector["tag"] = tag
-        return {"name": "memory", "params": {"thought": thought, "intent": "delete", "selector": selector}}
+        return {"name": "memory", "params": {"intent": "delete", "selector": selector}}
 
     if tool == "memory_commit_note":
         selector: Dict[str, Any] = {"note": str(args.get("note") or "").strip()}
@@ -347,16 +324,15 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
             selector["tag"] = tag
         return {
             "name": "memory",
-            "params": {"thought": thought, "intent": "commit", "target": "note", "selector": selector},
+            "params": {"intent": "commit", "target": "note", "selector": selector},
         }
 
     # direct tools that match internal action names
     if tool in {"repair", "submit", "noop"}:
-        params = {"thought": thought, **args}
-        return {"name": tool, "params": params}
+        return {"name": tool, "params": args}
 
     # Unknown tool: fall back to noop.
-    return {"name": "noop", "params": {"thought": thought, "reason": f"unknown_tool:{tool}"}}
+    return {"name": "noop", "params": {"reason": f"unknown_tool:{tool}"}}
 
 
 def _maybe_parse_openai_tool_wrapper(model_response: str) -> Optional[Dict[str, Any]]:
@@ -427,14 +403,18 @@ class GraphPlannerRLLMAgent(BaseAgent):
     # ----- rLLM API -----
     def reset(self) -> None:
         self._steps = []
-        # BaseAgent defines chat_completions as a read-only @property.
-        # Keep our own mutable buffer and expose it via a property override.
+        # Keep a fixed-size message buffer (no unbounded growth):
+        #   0) system: contract + tool usage rules
+        #   1) assistant: last-step preamble (<=1 sentence)
+        #   2) user: latest summarized observation
         self._messages = [
             {"role": "system", "content": self.system_prompt},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": ""},
         ]
 
     def update_from_env(self, observation: Any, reward: float, done: bool, info: Dict[str, Any]) -> None:
-        """Receive the latest env transition and append it into the chat history."""
+        """Receive the latest env transition and refresh the user observation message."""
         self._steps.append(_StepState(observation=observation, reward=float(reward), done=bool(done), info=dict(info or {})))
 
         # The planner sees a compact, human-readable observation. Raw JSON tends to blow up the prompt.
@@ -459,7 +439,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     info=info or {},
                     include_issue=True,
                     issue_target_tokens=issue_tokens,
-                    steps_target=_safe_int(os.environ.get("GP_STEPS_TARGET"), default=6),
+                    steps_target=_safe_int(os.environ.get("GP_STEPS_TARGET"), default=0),
                     working_top_k=working_top_k,
                     working_list_limit=working_list_limit,
                     memory_list_limit=memory_list_limit,
@@ -470,7 +450,13 @@ class GraphPlannerRLLMAgent(BaseAgent):
             except Exception:
                 obs_text = _safe_json(observation)
 
-        self._messages.append({"role": "user", "content": obs_text})
+        # Replace the latest user message (keep message count fixed).
+        if not self._messages:
+            self.reset()
+        # Ensure structure: [system, assistant, user]
+        while len(self._messages) < 3:
+            self._messages.append({"role": "user", "content": ""})
+        self._messages[2] = {"role": "user", "content": obs_text}
 
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
@@ -513,11 +499,14 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     break
             return head[:240]
 
+        # Keep a fixed-size dialogue context: update the "preamble" slot
+        # instead of appending to history.
         if wrapper_obj is not None:
             preamble = _first_sentence(str(wrapper_obj.get("content") or ""))
-            self._messages.append({"role": "assistant", "content": preamble})
         else:
-            self._messages.append({"role": "assistant", "content": model_response or ""})
+            preamble = _first_sentence(str(model_response or ""))
+        if len(self._messages) >= 2 and isinstance(self._messages[1], dict):
+            self._messages[1]["content"] = preamble
 
         action: Dict[str, Any]
         try:
@@ -538,7 +527,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
         except ProtocolError as exc:
             # Optional rule-fallback (very conservative).
             if self.use_rule_fallback:
-                fallback = {"name": "noop", "params": {"thought": "", "reason": f"protocol_error:{exc.code}"}}
+                fallback = {"name": "noop", "params": {"reason": f"protocol_error:{exc.code}"}}
                 action = validate_planner_action(fallback)
             else:
                 raise
@@ -556,6 +545,17 @@ class GraphPlannerRLLMAgent(BaseAgent):
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
+
+    @property
+    def chat_completions(self) -> List[Dict[str, str]]:
+        """Messages passed to the OpenAI-compatible chat completions API.
+
+        Note: BaseAgent may define chat_completions as a read-only property. We
+        override it to expose our mutable fixed-size buffer.
+        """
+
+        # Keep shape stable: system, assistant(preamble), user(observation)
+        return list(self._messages)
 
     # ----- Tool-use helpers (read by GraphPlannerToolExecutionEngine) -----
     def get_openai_tools(self) -> List[Dict[str, Any]]:
