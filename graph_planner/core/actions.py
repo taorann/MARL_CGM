@@ -1,7 +1,7 @@
 # graph_planner/core/actions.py
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, RootModel, conint, field_validator
+from pydantic import BaseModel, Field, RootModel, conint
 
 # A) Explore（定位/阅读/扩展）
 class ExploreAction(BaseModel):
@@ -16,17 +16,7 @@ class ExploreAction(BaseModel):
     # 2) query   -> 在记忆（text_memory / memory_subgraph）里做 recall
     anchors: List[Dict[str, Any]] = Field(default_factory=list)
     nodes: List[str] = Field(default_factory=list)
-    query: Optional[str] = None
-
-
-    @field_validator("query", mode="before")
-    @classmethod
-    def _coerce_query_to_str(cls, v):
-        if v is None:
-            return None
-        if isinstance(v, (list, tuple)):
-            return " ".join(str(x) for x in v if x is not None).strip()
-        return str(v)
+    query: Optional[Union[str, List[str]]] = None
 
     # 图扩展半径 & 数量预算
     hop: conint(ge=0, le=2) = 1
@@ -57,7 +47,7 @@ class RepairAction(BaseModel):
     type: Literal["repair"] = "repair"
     apply: bool
     issue: Dict[str, Any]
-    plan: Optional[Union[str, List[str]]] = None  # 仅 apply=True 时需要，用于 Collater→CGM
+    plan: Optional[str] = None  # 仅 apply=True 时需要，用于 Collater→CGM
     plan_targets: List[Dict[str, Any]] = Field(default_factory=list)
     patch: Optional[Dict[str, Any]] = None
     schema_version: int = 1
