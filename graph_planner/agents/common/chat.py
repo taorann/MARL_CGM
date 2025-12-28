@@ -1,15 +1,11 @@
-"""Shared helpers for model-driven planner agents.
-
-This module also provides a lightweight ``ChatMessage`` typing alias used by
-the rLLM/OpenAI integration layer.
-"""
+"""Shared helpers for model-driven planner agents."""
 
 from __future__ import annotations
 
 import json
 from .text_compact import compact_issue_text
 import re
-from typing import Any, Dict, List, Tuple, TypedDict
+from typing import Any, Dict, List, Tuple
 
 from ...core.actions import (
     ActionUnion,
@@ -25,20 +21,6 @@ SYSTEM_PROMPT = PLANNER_SYSTEM_PROMPT
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})```", re.DOTALL)
 FALLBACK_REASON_KEY = "fallback_reason"
-
-class ChatMessage(TypedDict, total=False):
-    """A permissive chat message type (OpenAI-style).
-
-    Only ``role`` and ``content`` are commonly used; other keys are optional.
-    """
-
-    role: str
-    content: str
-    name: str
-    tool_call_id: str
-    tool_calls: Any
-    function_call: Any
-
 
 
 def _normalize_memory_intent(value: Any) -> str:
@@ -57,165 +39,239 @@ def _normalize_memory_intent(value: Any) -> str:
 
 
 def summarise_observation(
-    obs: Dict[str, Any],
+    obs: Any,
     reward: float,
     done: bool,
-    info: Dict[str, Any] | None,
+    info: Dict[str, Any],
     *,
     include_issue: bool = True,
     issue_target_tokens: int = 320,
+    steps_target: int = 6,
     working_top_k: int = 8,
-    working_max_lines: int = 50,
-    working_max_chars: int = 4000,
+    working_list_limit: int = 120,
+    memory_list_limit: int = 30,
+    text_memory_k: int = 8,
+    working_max_lines: int = 80,
+    working_max_chars: int = 6000,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Summarise environment observation into a compact planner prompt.
+    """Convert an env observation into a compact prompt string + metadata.
 
-    Point (1): Every turn can include the (compacted) issue text and the working subgraph,
-    with strict caps (top-k nodes, max lines, max chars) to avoid blowing up context.
-
-    Point (2): Explore op space is {find, expand}. No separate read op is surfaced to the model.
+    Goals:
+    - keep within prompt budget (avoid dumping raw JSON)
+    - show enough repo context for exploration (W), while keeping memorized set (M) visible
+    - show only top-k snippets to avoid blowing token budget
     """
-    issue = obs.get("issue") or {}
-    steps = obs.get("steps", 0)
-    last_info = obs.get("last_info") or {}
-    pack = obs.get("observation_pack") or {}
 
-    lines: List[str] = [
-        f"Issue: {issue.get('id', issue.get('issue_id', 'unknown'))} | step={steps} | reward={reward} | done={done}",
-    ]
+    def _clamp_int(x: Any, default: int) -> int:
+        try:
+            v = int(x)
+            return v if v >= 0 else default
+        except Exception:
+            return default
 
-    # --- Issue context (compacted) ---
-    if include_issue:
-        issue_compact = compact_issue_text(
-            str(issue.get("title", "")).strip(),
-            str(issue.get("body", "") or ""),
-            target_tokens=issue_target_tokens,
-        )
-        if issue_compact:
-            lines.append("Issue context:")
-            lines.append(issue_compact)
+    issue_target_tokens = _clamp_int(issue_target_tokens, 320)
+    steps_target = _clamp_int(steps_target, 6)
+    working_top_k = _clamp_int(working_top_k, 8)
+    working_list_limit = _clamp_int(working_list_limit, 120)
+    memory_list_limit = _clamp_int(memory_list_limit, 30)
+    text_memory_k = _clamp_int(text_memory_k, 8)
+    working_max_lines = _clamp_int(working_max_lines, 80)
+    working_max_chars = _clamp_int(working_max_chars, 6000)
 
-    # --- Working subgraph (top-k snippets) ---
-    subgraph = obs.get("subgraph") or {}
-    nodes = []
-    if isinstance(subgraph, dict):
-        nodes = subgraph.get("nodes") or []
-    elif isinstance(subgraph, list):
-        nodes = subgraph
-    if nodes:
-        # Prefer nodes that actually carry text/snippet lines.
-        def _has_text(n: Dict[str, Any]) -> bool:
-            if not isinstance(n, dict):
-                return False
-            if n.get("text") or n.get("content"):
-                return True
-            sl = n.get("snippet_lines")
-            return isinstance(sl, list) and any(isinstance(x, str) and x.strip() for x in sl)
+    if not isinstance(obs, dict):
+        # Fall back gracefully; caller may decide to send raw JSON for debugging.
+        summary = str(obs)
+        return summary, {"reward": reward, "done": done, "info": info or {}}
 
-        filtered = [n for n in nodes if isinstance(n, dict) and _has_text(n)]
-        if not filtered:
-            filtered = [n for n in nodes if isinstance(n, dict)]
+    issue = obs.get("issue")
+    steps = obs.get("steps")
+    last_info = obs.get("last_info")
+    text_memory = obs.get("text_memory") or {}
+    working_subgraph = obs.get("working_subgraph") or {}
 
-        # Stable top-k selection: prioritize failure_frame file, recently touched nodes, and last candidates.
-        ff_path = None
-        if isinstance(pack.get("failure_frame"), dict):
-            ff_path = pack.get("failure_frame", {}).get("path") or pack.get("failure_frame", {}).get("file")
-        last_cand_ids = set()
-        if isinstance(last_info, dict):
-            for c in (last_info.get("candidates") or []):
-                if isinstance(c, dict) and isinstance(c.get("id"), str):
-                    last_cand_ids.add(c.get("id"))
+    # Normalize working nodes
+    if isinstance(working_subgraph, dict):
+        nodes = working_subgraph.get("nodes") or []
+    elif isinstance(working_subgraph, list):
+        nodes = working_subgraph
+    else:
+        nodes = []
 
-        def _node_rank(n: Dict[str, Any]) -> Tuple[int, int, int, int]:
-            path = str(n.get("path") or "")
-            nid = n.get("id")
-            # 0 is better
-            in_fail_file = 0 if (ff_path and path and (path == ff_path or path.endswith(ff_path))) else 1
-            in_last_cands = 0 if (isinstance(nid, str) and nid in last_cand_ids) else 1
-            touched = n.get("gp_last_touched_step") or n.get("gp_added_step") or 0
+    # Normalize steps
+    if not isinstance(steps, list):
+        steps = []
+
+    # Rank nodes: memorize-marked first, then last_candidates, then higher score, then stable id
+    def _node_rank(n: Dict[str, Any]) -> Tuple[int, int, float, str]:
+        memorized = 1 if bool(n.get("memorized")) else 0
+        in_last = 1 if bool(n.get("in_last_candidates")) else 0
+        try:
+            score = float(n.get("score") or 0.0)
+        except Exception:
+            score = 0.0
+        nid = str(n.get("id") or "")
+        # sort descending for memorized/in_last/score
+        return (-memorized, -in_last, -score, nid)
+
+    nodes_sorted = sorted([n for n in nodes if isinstance(n, dict)], key=_node_rank)
+
+    # Helpers to format nodes/snippets
+    def _node_loc(n: Dict[str, Any]) -> str:
+        path = n.get("path") or n.get("file") or ""
+        span = n.get("span") or {}
+        if isinstance(span, dict):
+            s = span.get("start")
+            e = span.get("end")
+            if isinstance(s, int) and isinstance(e, int):
+                return f"{path}:{s}-{e}"
+            if isinstance(s, int):
+                return f"{path}:{s}"
+        return str(path)
+
+    def _node_title(n: Dict[str, Any]) -> str:
+        return str(n.get("name") or n.get("symbol") or n.get("title") or n.get("kind") or n.get("id") or "")
+
+    def _node_line(n: Dict[str, Any]) -> str:
+        nid = str(n.get("id") or "")
+        kind = str(n.get("kind") or "")
+        loc = _node_loc(n)
+        title = _node_title(n)
+        mem = "M" if bool(n.get("memorized")) else "-"
+        return f"- [{mem}] {nid} | {kind} | {title} | {loc}"
+
+    def _snippet_text(n: Dict[str, Any]) -> str:
+        # Prefer embedded snippet_lines
+        sl = n.get("snippet_lines")
+        if isinstance(sl, list) and sl:
             try:
-                touched_i = int(touched)
+                joined = "\n".join(str(x) for x in sl)
             except Exception:
-                touched_i = 0
-            score = n.get("score") or n.get("rank_score") or 0
-            try:
-                score_i = int(float(score) * 1000)
-            except Exception:
-                score_i = 0
-            # We want: failure file first, then last candidates, then more recent, then higher score.
-            return (in_fail_file, in_last_cands, -touched_i, -score_i)
+                joined = str(sl)
+            return joined
+        sn = n.get("snippet")
+        if isinstance(sn, str) and sn.strip():
+            return sn
+        return ""
 
-        filtered = sorted(filtered, key=_node_rank)
-        filtered = filtered[: max(1, int(working_top_k or 1))]
+    # Compose summary
+    out: List[str] = []
+    if include_issue and isinstance(issue, str) and issue.strip():
+        out.append("## Issue")
+        out.append(compact_issue_text(issue, target_tokens=issue_target_tokens))
+        out.append("")
 
+    if steps:
+        out.append("## Recent steps")
+        # Keep last steps_target steps
+        for s in steps[-steps_target:]:
+            if isinstance(s, str) and s.strip():
+                out.append(f"- {s.strip()}")
+        out.append("")
 
-        lines.append("Working subgraph (top-k snippets):")
-        for idx, n in enumerate(filtered, start=1):
-            nid = n.get("id") or "?"
-            path = n.get("path") or "?"
-            span = n.get("span") or {}
-            start = span.get("start", n.get("start", "?"))  # compat
-            end = span.get("end", n.get("end", "?"))        # compat
+    # Text memory notes (these are summaries, not chain-of-thought)
+    notes = text_memory.get("notes")
+    if isinstance(notes, list) and notes:
+        out.append("## Notes")
+        for s in notes[-text_memory_k:]:
+            if isinstance(s, str) and s.strip():
+                out.append(f"- {s.strip()}")
+        out.append("")
 
-            # Extract snippet text
-            snippet_text = ""
-            if isinstance(n.get("text"), str) and n.get("text").strip():
-                snippet_text = n.get("text")
-            elif isinstance(n.get("content"), str) and n.get("content").strip():
-                snippet_text = n.get("content")
+    # Memorized nodes are a high-signal subset of W, but we do not show a separate
+    # M section to avoid duplication. Memorized nodes are marked with [M] inside W.
+    mem_nodes = [n for n in nodes_sorted if bool(n.get("memorized"))]
+
+    # Candidates (from the most recent find). We show these explicitly because
+    # find no longer auto-merges candidates into W.
+    cands = last_info.get("candidates")
+    if isinstance(cands, list) and cands:
+        out.append(f"## Candidates — {len(cands)}")
+        for c in cands[:max(1, working_top_k)]:
+            if not isinstance(c, dict):
+                continue
+            nid = str(c.get("id") or "").strip()
+            if not nid:
+                continue
+            kind = str(c.get("kind") or "")
+            path = str(c.get("path") or "")
+            span = c.get("span")
+            if isinstance(span, dict):
+                s = span.get("start")
+                e = span.get("end")
+                if s is not None and e is not None:
+                    path = f"{path}:{s}-{e}"
+            score = c.get("score")
+            if isinstance(score, (int, float)):
+                out.append(f"- {nid} ({kind}) {path}  score={float(score):.3f}")
             else:
-                sl = n.get("snippet_lines")
-                if isinstance(sl, list):
-                    snippet_text = "\n".join([x for x in sl if isinstance(x, str)])
+                out.append(f"- {nid} ({kind}) {path}")
+        if len(cands) > max(1, working_top_k):
+            out.append(f"- ... (+{len(cands)-max(1, working_top_k)} more)")
+        out.append("")
 
-            if snippet_text:
-                # Cap by lines then by chars.
-                snippet_lines = snippet_text.splitlines()
-                snippet_text = "\n".join(snippet_lines[: max(1, int(working_max_lines or 1))])
-                if working_max_chars and len(snippet_text) > int(working_max_chars):
-                    snippet_text = snippet_text[: int(working_max_chars)] + "\n...<truncated>"
+    # Working nodes list (IDs only), then top-k snippets
+    if nodes_sorted:
+        out.append(f"## Working subgraph (W) — {len(nodes_sorted)} nodes")
+        out.append(f"(List truncated to {working_list_limit}; snippets shown for top {working_top_k} nodes.)")
+        for n in nodes_sorted[:working_list_limit]:
+            out.append(_node_line(n))
+        if len(nodes_sorted) > working_list_limit:
+            out.append(f"- ... (+{len(nodes_sorted)-working_list_limit} more)")
+        out.append("")
+        out.append("### Snippets (candidates + memorized)")
 
-            header = f"[{idx}] {path}:{start}-{end} (id={nid})"
-            lines.append(header)
-            if snippet_text:
-                lines.append(snippet_text)
+        # 1) candidate previews (find results)
+        entries: List[Tuple[str, str]] = []
+        seen: set[str] = set()
+        for p in (last_info.get("candidate_previews") or []):
+            pid = str(p.get("id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            sn_lines = p.get("snippet_lines") or []
+            snip = "\n".join(sn_lines).strip()
+            if snip:
+                entries.append((pid, snip))
+                seen.add(pid)
 
-    # --- Failure frame anchor (optional) ---
-    if pack.get("failure_frame"):
-        ff = pack["failure_frame"]
-        file_hint = ff.get("path") or ff.get("file")
-        if file_hint:
-            lines.append(f"Failure frame: {file_hint}:{ff.get('lineno')}")
-    # NOTE: Subgraph/memory stats intentionally omitted by default.
+        # 2) memorized nodes (subset of W)
+        for n in nodes_sorted:
+            if not bool(n.get("memorized")):
+                continue
+            nid = str(n.get("id") or "").strip()
+            if not nid or nid in seen:
+                continue
+            snip = _snippet_text(n)
+            if snip:
+                entries.append((nid, snip))
+                seen.add(nid)
 
-    # --- Last action/result echo ---
-    kind = last_info.get("kind")
-    op = last_info.get("op")
-    if kind == "explore" and op:
-        lines.append(f"Last op: explore/{op}")
-        cands = last_info.get("candidates") or []
-        if cands:
-            lines.append("Top candidates:\n" + _format_candidates(cands))
-        # Backward compat: if older code still supplies snippets, show a tiny preview.
-        snippets = last_info.get("snippets") or []
-        for snip in snippets[:2]:
-            snippet_lines = snip.get("snippet_lines") or snip.get("snippet") or []
-            if isinstance(snippet_lines, list):
-                preview = " | ".join([str(x) for x in snippet_lines[:2]])
-            else:
-                preview = str(snippet_lines)[:200]
-            lines.append(f"Snippet {snip.get('path')}@{snip.get('start')}->{snip.get('end')}: {preview}")
-    elif kind:
-        lines.append(f"Last op: {kind}")
+        # Limit total snippets we show
+        entries = entries[:working_top_k]
 
-    if kind == "repair":
-        lines.append(f"Patch applied: {last_info.get('applied')}")
-        if last_info.get("lint"):
-            lines.append(f"Lint rc={last_info['lint'].get('rc')}")
-        if last_info.get("tests"):
-            lines.append(f"Tests passed={last_info['tests'].get('passed')}")
+        used = 0
+        chars = 0
+        for nid, snip in entries:
+            # clamp lines/chars per snippet
+            sn_lines = snip.splitlines()
+            if working_max_lines and len(sn_lines) > working_max_lines:
+                sn_lines = sn_lines[:working_max_lines] + ["..."]
+            snip2 = "\n".join(sn_lines)
+            if working_max_chars and len(snip2) > working_max_chars:
+                snip2 = snip2[:working_max_chars] + "..."
 
-    summary = "\n".join(lines)
+            # global char budget per section
+            if working_max_chars and chars + len(snip2) > working_max_chars:
+                break
+            out.append(f"#### {nid}")
+            out.append("```")
+            out.append(snip2)
+            out.append("```")
+            out.append("")
+            used += 1
+            chars += len(snip2)
+
+    summary = "\n".join(out).strip()
+
     metadata = {
         "issue": issue,
         "steps": steps,
@@ -225,8 +281,6 @@ def summarise_observation(
         "info": info or {},
     }
     return summary, metadata
-
-
 
 def _normalize_plan_steps(plan, subplan=None):
     """Normalize repair plan/subplan into a List[str] with de-duplicated, non-empty steps."""
