@@ -38,9 +38,19 @@ def normalize_explore_query_and_anchors(
     # Normalize query to a single string (or None)
     q = query
     if isinstance(q, list):
+        # The protocol wants query_count=1, but the model may emit a list of
+        # tokens/keywords. Preserve information by joining.
         if len(q) > 1:
-            trimmed["query"] = {"from": len(q), "to": 1}
-        q = q[0] if q else None
+            trimmed["query"] = {"from": len(q), "to": 1, "join": True}
+        parts: List[str] = []
+        for x in q:
+            try:
+                s = str(x).strip()
+            except Exception:
+                s = ""
+            if s:
+                parts.append(s)
+        q = " ".join(parts) if parts else None
     if q is None:
         query_str: Optional[str] = None
     elif isinstance(q, str):
