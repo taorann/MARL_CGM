@@ -120,7 +120,8 @@ def _instance_roundtrip(
 ) -> QueueResponse:
     """Construct a QueueRequest and send it to the mapped runner."""
 
-    runner_id = aq._choose_runner(run_id)  # type: ignore[attr-defined]
+    # Prefer a free/reusable runner when possible (reduces "runner busy").
+    runner_id = aq.choose_runner(run_id, image=image)  # type: ignore[attr-defined]
     sif_path: Optional[Path] = None
     if image:
         sif_path = aq._image_to_sif(image)  # type: ignore[attr-defined]
