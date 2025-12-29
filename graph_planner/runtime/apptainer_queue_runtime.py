@@ -4,6 +4,7 @@ import os
 import json
 import time
 import uuid
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Mapping
 
@@ -33,11 +34,95 @@ class ApptainerQueueRuntime:
         self.default_timeout_sec = float(default_timeout_sec)
         self.poll_interval_sec = float(poll_interval_sec)
         self.max_stdout_bytes = int(max_stdout_bytes)
+
+        # Best-effort runner scheduling state. This is purely an optimization
+        # to reduce "runner busy" errors when num_runners>1.
+        #
+        # _job_to_runner maps a stable job signature (task_id + image) to a
+        # runner id so subsequent starts can reuse the same instance.
+        self._job_to_runner: Dict[str, int] = {}
         self._run_to_runner: Dict[str, int] = {}
+        self._run_to_job_sig: Dict[str, str] = {}
 
         # Runner liveness / startup waiting (for remote_swe).
         self.heartbeat_ttl_sec = float(os.environ.get("GP_RUNNER_HEARTBEAT_TTL_SEC", "180"))
         self.wait_for_runners_sec = float(os.environ.get("GP_WAIT_FOR_RUNNERS_SEC", "60"))
+
+    def _parse_task_id(self, run_id: str) -> Optional[str]:
+        """Extract task_id from a GraphPlanner run_id.
+
+        Expected: gp-<task_id>__<32-hex>. Returns None if unknown.
+        """
+        m = re.match(r"^gp-(.+)__[0-9a-f]{32}$", run_id)
+        if not m:
+            return None
+        return m.group(1)
+
+    def _runner_heartbeat_path(self, runner_id: int) -> Path:
+        return self.queue_root / f"runner-{runner_id}" / "heartbeat.json"
+
+    def _read_runner_heartbeat(self, runner_id: int) -> Optional[Mapping[str, object]]:
+        path = self._runner_heartbeat_path(runner_id)
+        try:
+            if not path.exists():
+                return None
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def choose_runner(self, run_id: str, *, image: Optional[str] = None) -> int:
+        """Choose a runner for this (run_id, image) pair.
+
+        Priority:
+          1) cached mapping for same (task_id, image)
+          2) reuse an already-running instance with same (task_id, image)
+          3) any free runner (current_run_id is None)
+          4) fallback deterministic hash (old behavior)
+        """
+        alive = self._alive_runner_ids()
+        if not alive:
+            # No heartbeat => pick runner 0 (will likely fail fast elsewhere)
+            return 0
+
+        if image:
+            task_id = self._parse_task_id(run_id) or ""
+            job_key = f"{task_id}::{image}"
+
+            cached = self._job_to_runner.get(job_key)
+            if cached is not None and cached in alive:
+                self._run_to_runner[run_id] = cached
+                return cached
+
+            # Reuse: find a runner already hosting the same task+image.
+            for rid in alive:
+                hb = self._read_runner_heartbeat(rid) or {}
+                if (
+                    hb.get("current_task_id") == task_id
+                    and hb.get("current_image") == image
+                    and hb.get("current_run_id")
+                ):
+                    self._job_to_runner[job_key] = rid
+                    self._run_to_runner[run_id] = rid
+                    return rid
+
+            # Free runner: pick the first idle.
+            for rid in alive:
+                hb = self._read_runner_heartbeat(rid) or {}
+                if hb.get("current_run_id") in (None, "", 0):
+                    self._job_to_runner[job_key] = rid
+                    self._run_to_runner[run_id] = rid
+                    return rid
+
+            # Fallback: stable hash on job_key (better than run_id hash).
+            chosen = alive[hash(job_key) % len(alive)]
+            self._job_to_runner[job_key] = chosen
+            self._run_to_runner[run_id] = chosen
+            return chosen
+
+        # No image => fallback to previous behavior, but keep run mapping.
+        chosen = self._choose_runner(run_id)
+        self._run_to_runner[run_id] = chosen
+        return chosen
     # ----------------------
     # 一次性容器（原有接口）
     # ----------------------
@@ -52,7 +137,7 @@ class ApptainerQueueRuntime:
         timeout_sec: Optional[float] = None,
         meta: Optional[Dict[str, str]] = None,
     ) -> ExecResult:
-        runner_id = self._choose_runner(run_id)
+        runner_id = self.choose_runner(run_id, image=image)
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -87,7 +172,7 @@ class ApptainerQueueRuntime:
         启动一个 Apptainer instance（每条轨迹一个），run_id 用来标识 instance。
         对应 runner 里的 handle_instance_start。
         """
-        runner_id = self._choose_runner(run_id)
+        runner_id = self.choose_runner(run_id, image=image)
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -120,7 +205,7 @@ class ApptainerQueueRuntime:
         在已启动的 instance 中执行一条命令（多步交互）。
         对应 runner 里的 handle_instance_exec。
         """
-        runner_id = self._choose_runner(run_id)
+        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -151,7 +236,7 @@ class ApptainerQueueRuntime:
         停止一个 instance（轨迹结束）。
         对应 runner 里的 handle_instance_stop。
         """
-        runner_id = self._choose_runner(run_id)
+        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -172,7 +257,7 @@ class ApptainerQueueRuntime:
     # 文件 put/get & cleanup（原有逻辑）
     # ----------------------
     def put_file(self, *, run_id: str, src: Path, dst: Path, meta: Optional[Dict[str, str]] = None) -> None:
-        runner_id = self._choose_runner(run_id)
+        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -185,7 +270,7 @@ class ApptainerQueueRuntime:
         self._roundtrip(req)
 
     def get_file(self, *, run_id: str, src: Path, dst: Path, meta: Optional[Dict[str, str]] = None) -> None:
-        runner_id = self._choose_runner(run_id)
+        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -198,7 +283,7 @@ class ApptainerQueueRuntime:
         self._roundtrip(req)
 
     def cleanup_run(self, run_id: str) -> None:
-        runner_id = self._choose_runner(run_id)
+        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -238,6 +323,8 @@ class ApptainerQueueRuntime:
         if not alive:
             # optionally wait a bit for runners to come up, to avoid 15min 'start' hangs
             if float(self.wait_for_runners_sec) <= 0:
+                if os.environ.get("GP_FAIL_IF_NO_RUNNERS", "").strip().lower() in {"1", "true", "yes"}:
+                    raise RuntimeError("No alive runners detected (heartbeat missing/stale).")
                 return
             deadline = time.time() + float(self.wait_for_runners_sec)
             while time.time() < deadline:
@@ -246,6 +333,8 @@ class ApptainerQueueRuntime:
                 if alive:
                     break
             if not alive:
+                if os.environ.get("GP_FAIL_IF_NO_RUNNERS", "").strip().lower() in {"1", "true", "yes"}:
+                    raise RuntimeError("No alive runners detected after waiting.")
                 return
 
         if int(req.runner_id) in alive:
