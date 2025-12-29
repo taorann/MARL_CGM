@@ -378,11 +378,27 @@ class SandboxRuntime:
                             "Stop the existing instance or set GP_REMOTE_SWE_ADOPT_BUSY=1 if you are sure it's safe. "
                             f"Raw message: {msg[:800]!r}"
                         )
-                    # If user explicitly allows adopting, try to verify image match when available.
+                    # If user explicitly allows adopting, verify image match.
                     mimg = re.search(r"current_image=([^\s]+)", msg)
-                    if mimg:
+                    req_img = str(self.cfg.docker_image or "")
+                    if not mimg:
+                        # If the proxy did not report current_image, adopting is unsafe.
+                        # Allow only if the user explicitly opts in.
+                        adopt_unverified = str(os.environ.get("GP_REMOTE_SWE_ADOPT_BUSY_UNVERIFIED", "0")).strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "y",
+                        }
+                        if not adopt_unverified:
+                            raise RuntimeError(
+                                "remote_swe runner is busy, but current_image is unknown. "
+                                f"Refusing to adopt current_run_id={cur}. "
+                                "Stop the existing instance or set GP_REMOTE_SWE_ADOPT_BUSY_UNVERIFIED=1 if you are sure it's safe. "
+                                f"Raw message: {msg[:800]!r}"
+                            )
+                    else:
                         cur_img = mimg.group(1)
-                        req_img = str(self.cfg.docker_image or "")
                         if req_img and cur_img and cur_img != req_img:
                             raise RuntimeError(
                                 "remote_swe busy instance image mismatch: "
