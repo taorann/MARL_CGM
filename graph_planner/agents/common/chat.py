@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-from .text_compact import compact_issue_text
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+
+from .text_compact import compact_issue_text
 
 from ...core.actions import (
     ActionUnion,
@@ -18,6 +20,21 @@ from ...core.actions import (
 from .contracts import PLANNER_SYSTEM_PROMPT
 
 SYSTEM_PROMPT = PLANNER_SYSTEM_PROMPT
+
+
+@dataclass
+class ChatMessage:
+    """A minimal chat message container.
+
+    Some integrations historically imported `ChatMessage` from this module.
+    The planner/runtime does not require this class at runtime, but providing
+    it keeps older imports working and avoids hard failures.
+    """
+
+    role: str
+    content: str
+    name: str | None = None
+    tool_calls: Any | None = None
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})```", re.DOTALL)
 FALLBACK_REASON_KEY = "fallback_reason"
