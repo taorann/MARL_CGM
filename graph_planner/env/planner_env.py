@@ -1244,9 +1244,30 @@ class PlannerEnv:
             if not isinstance(node, Mapping):
                 return None
 
-            path = (node.get("path") or "").lstrip("/")
-            if not path:
+            raw_path = str(node.get("path") or "").strip()
+            if not raw_path:
                 return None
+
+            # Nodes may carry either repo-relative paths ("a/b.py") or absolute
+            # in-sandbox paths ("/testbed/a/b.py"). We'll resolve to an absolute
+            # path for file reads, but keep a stable display path.
+            repo_root = str(self.repo_root or self.box.workdir or ".").rstrip("/")
+
+            def _resolve_abs(p: str) -> str:
+                if p.startswith("/"):
+                    # Already absolute? keep iff it is under repo_root.
+                    if repo_root and p.startswith(repo_root + "/"):
+                        return p
+                    # Otherwise treat as repo-relative with a leading slash.
+                    p = p.lstrip("/")
+                return os.path.join(repo_root, p)
+
+            abs_path = _resolve_abs(raw_path)
+            # Prefer repo-relative for readability in prompts/logs.
+            if raw_path.startswith(repo_root + "/"):
+                path = raw_path[len(repo_root) + 1 :]
+            else:
+                path = raw_path.lstrip("/")
 
             span = node.get("span") if isinstance(node, Mapping) else {}
             span_start = span.get("start") if isinstance(span, Mapping) else None
