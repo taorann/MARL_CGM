@@ -170,9 +170,10 @@ class ApptainerQueueRuntime:
         return self._resp_to_exec_result(resp)
 
     # ----------------------
+    # ----------------------
     # 文件 put/get & cleanup（原有逻辑）
     # ----------------------
-    def put_file(self, *, run_id: str, src: Path, dst: Path, meta: Optional[Dict[str, str]] = None) -> None:
+    def put_file(self, *, run_id: str, src: Path, dst: Path, timeout_sec: Optional[float] = None, meta: Optional[Dict[str, str]] = None) -> None:
         runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -181,11 +182,12 @@ class ApptainerQueueRuntime:
             type="put",
             src=str(src),
             dst=str(dst),
+            timeout_sec=float(timeout_sec or self.default_timeout_sec),
             meta=meta or {},
         )
         self._roundtrip(req)
 
-    def get_file(self, *, run_id: str, src: Path, dst: Path, meta: Optional[Dict[str, str]] = None) -> None:
+    def get_file(self, *, run_id: str, src: Path, dst: Path, timeout_sec: Optional[float] = None, meta: Optional[Dict[str, str]] = None) -> None:
         runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -194,23 +196,21 @@ class ApptainerQueueRuntime:
             type="get",
             src=str(src),
             dst=str(dst),
+            timeout_sec=float(timeout_sec or self.default_timeout_sec),
             meta=meta or {},
         )
         self._roundtrip(req)
 
-    def cleanup_run(self, run_id: str) -> None:
+    def cleanup_run(self, run_id: str, timeout_sec: Optional[float] = None) -> None:
         runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
             run_id=run_id,
             type="cleanup",
+            timeout_sec=float(timeout_sec or self.default_timeout_sec),
         )
         self._roundtrip(req)
-
-    # ----------------------
-    # 内部工具函数
-    # ----------------------
 
     def _heartbeat_path(self, rid: int) -> Path:
         return self.queue_root / f"runner-{rid}" / "heartbeat.json"
@@ -231,7 +231,8 @@ class ApptainerQueueRuntime:
                 ts = hp.stat().st_mtime
             if now - ts <= float(self.heartbeat_ttl_sec):
                 alive.append(rid)
-        re
+        return alive
+
     def _read_heartbeat(self, rid: int) -> Optional[Dict[str, object]]:
         """Read runner heartbeat metadata if present."""
         hp = self._heartbeat_path(rid)
