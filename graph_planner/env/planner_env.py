@@ -134,19 +134,10 @@ class PlannerEnv:
         issue_max_steps = self.issue.get("max_steps")
         env_max_steps = os.environ.get("GP_MAX_STEPS") or os.environ.get("GRAPH_PLANNER_MAX_STEPS")
         cfg_max_steps = getattr(self.config, "max_steps", None) or getattr(self.config, "episode_max_steps", None)
-        default_max_steps = 60
         try:
-            resolved = int(env_max_steps or issue_max_steps or cfg_max_steps or default_max_steps)
+            self.max_steps = int(env_max_steps or issue_max_steps or cfg_max_steps or 40)
         except Exception:
-            resolved = default_max_steps
-        # Unless user explicitly overrides via env, clamp to at least 60 for better inspection/debugging.
-        if env_max_steps is None:
-            try:
-                if int(resolved) < int(default_max_steps):
-                    resolved = int(default_max_steps)
-            except Exception:
-                resolved = default_max_steps
-        self.max_steps = int(resolved)
+            self.max_steps = 40
         # Unified telemetry (trajectory / events / metrics)
         self.telemetry = telemetry_mod.get_telemetry(run_id=effective_run_id)
         try:
@@ -348,21 +339,6 @@ class PlannerEnv:
         except Exception:
             pass
 
-        # If the caller didn't provide a trace dir, default to writing per-step
-        # working/memory subgraphs under the telemetry episode directory.
-        # This makes it easy to inspect "each step's graph" from the terminal.
-        try:
-            if not os.environ.get("GRAPH_PLANNER_TRACE_DIR"):
-                ep_dir = getattr(self.telemetry, "_episode_dir", None)
-                if ep_dir:
-                    trace_dir = Path(str(ep_dir)) / "graphs"
-                    trace_dir.mkdir(parents=True, exist_ok=True)
-                    os.environ["GRAPH_PLANNER_TRACE_DIR"] = str(trace_dir)
-                    if self._print_ops:
-                        print(f"[planner_env] trace_dir={trace_dir}")
-        except Exception:
-            pass
-
 
         return self._obs()
 
@@ -452,11 +428,6 @@ class PlannerEnv:
         info["done"] = bool(done)
 
         obs = self._obs()
-        # Best-effort: print a compact per-step state summary to the terminal.
-        try:
-            self._print_step_state(action_obj, info)
-        except Exception:
-            pass
         self._log_step_graphs()
         return obs, reward, done, info
 
@@ -661,9 +632,7 @@ class PlannerEnv:
             cand_set = set(cand_ids)
             if cand_set:
                 try:
-                    nodes_obj = getattr(self.working_subgraph, "nodes", None)
-                    it = nodes_obj.values() if isinstance(nodes_obj, dict) else (nodes_obj or [])
-                    for n in it:
+                    for n in (self.working_subgraph.nodes or []):
                         if isinstance(n, dict) and isinstance(n.get("id"), str):
                             n["in_last_candidates"] = n.get("id") in cand_set
                 except Exception:
@@ -1187,10 +1156,16 @@ class PlannerEnv:
             "runner_id": getattr(self, "runner_id", 0),
             "issue": self.issue,
             "steps": self.steps,
+            "step_id": self.steps,
             "last_info": self.last_info,
             # LLM 看到的是“当前工作图”，里面节点已经带 status/tags（explored/remembered）
             "subgraph": working_json,
             "subgraph_stats": working_stats,
+            # Backward-compatible / agent-friendly aliases
+            "working_subgraph": working_json,
+            "memory_subgraph": self.memory_subgraph.to_json_obj(),
+            "w": working_json,
+            "m": self.memory_subgraph.to_json_obj(),
             # 记忆图的统计信息（可选）
             "memory_stats": memory_stats,
             "text_memory": {"notes": (self.memory_text_store.get('session', limit=12) if self.memory_text_store else []), "count": (len(self.memory_text_store.get('session')) if self.memory_text_store else 0)},
@@ -1215,102 +1190,6 @@ class PlannerEnv:
             memory_path = os.path.join(out_dir, f"{step_prefix}.memory.json")
             _write_file_text(working_path, json.dumps(self.working_subgraph.to_json_obj(), indent=2))
             _write_file_text(memory_path, json.dumps(self.memory_subgraph.to_json_obj(), indent=2))
-        except Exception:
-            pass
-
-    def _print_step_state(self, action_obj: Any, info: Mapping[str, Any]) -> None:
-        """Print a compact per-step summary to the terminal.
-
-        This is intentionally lightweight (no heavy graph traversal) so it can be
-        enabled by default during debugging. It helps answer:
-          - what is currently in the working subgraph?
-          - which nodes are already memorized/committed?
-          - what did the last explore action return?
-        """
-
-        # Allow disabling via env.
-        env_flag = os.environ.get("GP_PRINT_STATE") or os.environ.get("GRAPH_PLANNER_PRINT_STATE")
-        if env_flag is not None and str(env_flag).strip().lower() in {"0", "false", "no", "off"}:
-            return
-
-        try:
-            kind = str(info.get("kind") or "")
-            op = str(info.get("op") or info.get("target") or "")
-        except Exception:
-            kind, op = "", ""
-
-        w_stats = subgraph_store.stats(getattr(self, "working_subgraph", None))
-        m_stats = subgraph_store.stats(getattr(self, "memory_subgraph", None))
-        print(
-            f"[planner_env] step={self.steps} kind={kind or type(action_obj).__name__} op={op} "
-            f"W(n={w_stats.get('n_nodes')},m={w_stats.get('n_memorized')}) "
-            f"M(n={m_stats.get('n_nodes')},e={m_stats.get('n_edges')})"
-        )
-
-        # Print a small list of recent working nodes.
-        try:
-            top_n = int(os.environ.get("GP_PRINT_WORKING_TOPN", "20"))
-        except Exception:
-            top_n = 20
-        try:
-            w = getattr(self, "working_subgraph", None)
-            w_node_ids = list(getattr(w, "node_ids", []) or [])
-            if top_n > 0 and w_node_ids:
-                recent = w_node_ids[-top_n:]
-                mem_nodes = getattr(getattr(self, "memory_subgraph", None), "nodes", {}) or {}
-                mem_set = set(mem_nodes.keys()) if isinstance(mem_nodes, dict) else set()
-
-                def _label(nid: str) -> str:
-                    node = None
-                    try:
-                        node = self._resolve_node(nid)
-                    except Exception:
-                        node = None
-                    if isinstance(node, dict):
-                        name = node.get("name") or node.get("symbol") or node.get("qualname")
-                        path = node.get("path")
-                        if name and path:
-                            return f"{path}:{name}"
-                        if name:
-                            return str(name)
-                    return nid
-
-                lines = []
-                for nid in recent:
-                    nd = None
-                    try:
-                        nd = w.get_node(nid) if w is not None else None
-                    except Exception:
-                        nd = None
-                    memorized = False
-                    if isinstance(nd, dict) and bool(nd.get("memorized")):
-                        memorized = True
-                    if nid in mem_set:
-                        memorized = True
-                    tag = "M" if memorized else " "
-                    lines.append(f"  [{tag}] {_truncate(_label(nid), 140)}")
-                if lines:
-                    print("[planner_env] working_recent:\n" + "\n".join(lines))
-        except Exception:
-            pass
-
-        # For explore ops, print a compact candidate summary.
-        try:
-            if str(info.get("kind")) == "explore" and isinstance(info.get("candidates"), list):
-                cand = info.get("candidates") or []
-                try:
-                    k = int(os.environ.get("GP_PRINT_CANDIDATE_TOPK", "6"))
-                except Exception:
-                    k = 6
-                if k > 0 and cand:
-                    preview = []
-                    for c in cand[:k]:
-                        if not isinstance(c, dict):
-                            continue
-                        cid = c.get("id")
-                        name = c.get("name") or c.get("path") or ""
-                        preview.append(f"  - {cid} {name}".strip())
-                    print(f"[planner_env] candidates n={len(cand)} top={min(k,len(cand))}:\n" + "\n".join(preview))
         except Exception:
             pass
 
