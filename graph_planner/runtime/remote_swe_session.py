@@ -51,9 +51,9 @@ def _summarize_stdout(op: str, stdout: str, *, max_chars: int = 2000) -> str:
 _ACTIVE_REMOTE_SWE_SESSIONS: "set[weakref.ReferenceType[Any]]" = set()
 _CLEANUP_HOOK_INSTALLED: bool = False
 
-# Track (ssh_target, remote_repo, num_runners) pools we have cleaned in this process.
-_CLEANED_REMOTE_POOLS: "set[tuple[str, str, int]]" = set()
-_CLEANED_REMOTE_POOLS_LOCK = threading.Lock()
+# Cleanup guard: avoid multiple concurrent cleanup_pool calls per process.
+_POOL_CLEANED_KEYS: set[str] = set()
+_POOL_CLEAN_LOCK = threading.Lock()
 
 
 def _cleanup_active_remote_swe_sessions(reason: str = "atexit") -> None:
@@ -416,38 +416,42 @@ class RemoteSweSession:
             )
         self._runners_ensured = True
 
-    
-    def _cleanup_pool_once(self, timeout_sec: float = 600.0) -> None:
-        """Best-effort cleanup of runner pool before starting new runs.
 
-        This implements strategy A:
-        - At the beginning of an evaluation script, free any stale/broken instances
-          that are still occupying runner slots (even if run_id differs).
-        - Done once per (ssh_target, remote_repo, num_runners) in this local process.
+    def cleanup_pool(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Best-effort: stop any lingering instances occupying runner slots.
+
+        This is idempotent and safe to call even if no instances exist.
         """
-        if self.num_runners <= 0:
-            return
-        key = (str(self.ssh_target), str(self.remote_repo), int(self.num_runners))
-        with _CLEANED_REMOTE_POOLS_LOCK:
-            if key in _CLEANED_REMOTE_POOLS:
-                return
-            payload: Dict[str, Any] = {
-                "op": "cleanup_pool",
-                    "run_id": self.run_id,
-                    "num_runners": int(self.num_runners),
-                    "force": True,
-                "timeout": float(timeout_sec),
-                "cwd": "/testbed",
-            }
-            resp = self._call_proxy(payload, timeout=float(timeout_sec))
-            if isinstance(resp, dict) and resp.get("ok") is False:
-                raise RuntimeError(f"remote cleanup_pool failed: {resp!r}")
-            _CLEANED_REMOTE_POOLS.add(key)
+        payload: Dict[str, Any] = {
+            "op": "cleanup_pool",
+            "run_id": self.run_id,
+            "timeout": float(timeout or 60.0),
+            # no image/cmd needed
+        }
+        return self._call_proxy(payload, timeout=float(timeout or 60.0))
 
+
+    def _cleanup_pool_once(self) -> None:
+        key = f"{self.ssh_target}|{self.remote_repo}|{int(self.num_runners)}"
+        with _POOL_CLEAN_LOCK:
+            if key in _POOL_CLEANED_KEYS:
+                return
+            _POOL_CLEANED_KEYS.add(key)
+        try:
+            self.cleanup_pool(timeout=float(os.environ.get("GP_REMOTE_CLEANUP_TIMEOUT", "60") or 60.0))
+        except Exception:
+            # Allow retry on later sessions if cleanup fails.
+            with _POOL_CLEAN_LOCK:
+                _POOL_CLEANED_KEYS.discard(key)
+            raise
     def start(self, timeout: Optional[float] = None, cwd: str = "/testbed") -> Dict[str, Any]:
         self._ensure_remote_runners()
-        # Strategy A: free stale instances occupying runner slots before starting new runs.
-        self._cleanup_pool_once(timeout_sec=600.0)
+        # Free runner slots if previous runs crashed and left instances behind.
+        try:
+            self._cleanup_pool_once()
+        except Exception:
+            # Don't hard-fail on cleanup; start may still succeed.
+            pass
         # Allow plenty of time for the initial container bootstrap even if callers
         # pass a smaller timeout (e.g., snippet-level defaults).
         effective_timeout = max(float(timeout or 0.0), 300.0)
