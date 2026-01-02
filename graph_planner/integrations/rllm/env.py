@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -28,6 +29,9 @@ else:
 
 from ...env.planner_env import PlannerEnv
 from ...runtime.sandbox import SandboxConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 if BaseEnv is None:
@@ -161,6 +165,53 @@ else:
             self._last_observation = observation
             self._step_count += 1
 
+            # ------------------------------------------------------------------
+            # Optional human-facing debug prints.
+            #
+            # By design, the agent loop prints the model tool-call and the reward/done
+            # signal, but it does NOT print the tool results. Tool results live in
+            # observation["last_info"] (and telemetry logs). This block makes it
+            # easier to debug by printing a compact summary when enabled.
+            #
+            # Enable via:
+            #   export GP_PRINT_STEP_INFO=1
+            # ------------------------------------------------------------------
+            if str(os.environ.get("GP_PRINT_STEP_INFO", "0")).lower() not in ("0", "false", "", "none"):
+                try:
+                    kind = info.get("kind")
+                    op = info.get("op")
+                    if kind == "explore" and op in ("find", "expand"):
+                        cands = info.get("candidates")
+                        if isinstance(cands, list):
+                            top_ids = []
+                            for c in cands[:5]:
+                                if isinstance(c, dict) and isinstance(c.get("id"), str):
+                                    top_ids.append(c["id"])
+                            logger.info(
+                                "[gp-env] explore.%s candidates=%s top=%s",
+                                op,
+                                len(cands),
+                                top_ids,
+                            )
+                            # Print one lightweight preview if available.
+                            previews = info.get("candidate_previews")
+                            if isinstance(previews, list) and previews:
+                                p0 = previews[0] if isinstance(previews[0], dict) else None
+                                if isinstance(p0, dict):
+                                    snippet_lines = p0.get("snippet_lines")
+                                    if isinstance(snippet_lines, list):
+                                        preview_text = "\n".join(str(x) for x in snippet_lines[:8])
+                                        logger.info(
+                                            "[gp-env] preview %s:%s-%s\n%s",
+                                            p0.get("path"),
+                                            p0.get("start"),
+                                            p0.get("end"),
+                                            preview_text,
+                                        )
+                except Exception:
+                    # Never let debug printing break the environment.
+                    pass
+
             adjusted = float(reward) * self.reward_scale
             if not done:
                 adjusted -= self.step_penalty
@@ -182,12 +233,6 @@ else:
                     adjusted -= self.timeout_penalty
 
             reward = adjusted
-            if done:
-                # Best-effort cleanup: stop remote_swe instance at end of trajectory.
-                try:
-                    self.close()
-                except Exception:
-                    pass
             return observation, reward, done, info
 
         def close(self) -> None:
