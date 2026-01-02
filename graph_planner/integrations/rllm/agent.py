@@ -560,7 +560,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
             print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
 
         telemetry_mod.emit_event("planner_action", {"action": action})
-        return ActionUnion(action=action)
+        return action  # ActionUnion is a typing.Union; return the concrete action instance
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
