@@ -6,9 +6,10 @@ import os
 import sys
 import shlex
 import subprocess
+import select
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 def _dbg(msg: str) -> None:
     if os.environ.get("DEBUG") or os.environ.get("EBUG"):
@@ -98,33 +99,110 @@ class RemoteSweSession:
         )
 
         t0 = time.perf_counter()
-        proc = subprocess.run(
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        proc = subprocess.Popen(
             self._build_ssh_cmd(),
-            input=json.dumps(payload).encode("utf-8"),
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=ssh_timeout,
         )
+        assert proc.stdin is not None and proc2.stdout is not None and proc2.stderr is not None
+        try:
+            proc.stdin.write(payload_bytes)
+            proc.stdin.close()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
+
+        # Stream remote stderr so long waits are visible (queue wait, Slurm pending, etc).
+        stream_stdio = os.environ.get("GP_PRINT_REMOTE_STDIO", "").strip().lower() in {"1","true","yes"}
+        hb_sec = float(os.environ.get("GP_SSH_HEARTBEAT_SEC", "0") or 0.0)
+        last_hb = time.time()
+        stderr_chunks: List[bytes] = []
+
+        # We intentionally *don't* stream stdout; it must remain a single JSON object.
+        while True:
+            # Check for remote stderr output.
+            r, _, _ = select.select([proc2.stderr], [], [], 0.2)
+            if r:
+                try:
+                    chunk = os.read(proc2.stderr.fileno(), 4096)
+                except Exception:
+                    chunk = b""
+                if chunk:
+                    stderr_chunks.append(chunk)
+                    if stream_stdio:
+                        try:
+                            sys.stderr.buffer.write(chunk)
+                            sys.stderr.buffer.flush()
+                        except Exception:
+                            pass
+
+            # Heartbeat while waiting (useful when stdout/stderr are quiet).
+            if hb_sec > 0 and (time.time() - last_hb) >= hb_sec:
+                print("[remote_swe_session] still waiting for remote_swe_proxy...", file=sys.stderr)
+                last_hb = time.time()
+
+            rc = proc.poll()
+            if rc is not None:
+                break
+
+            # Enforce SSH timeout ourselves (Popen doesn't support it directly).
+            if (time.perf_counter() - t0) > ssh_timeout:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise TimeoutError(f"Remote swe_proxy timed out after {ssh_timeout:.1f}s")
+
+        # Drain remaining streams.
+        try:
+            stdout_bytes = proc2.stdout.read() or b""
+        except Exception:
+            stdout_bytes = b""
+        try:
+            rest = proc2.stderr.read() or b""
+            if rest:
+                stderr_chunks.append(rest)
+                if stream_stdio:
+                    try:
+                        sys.stderr.buffer.write(rest)
+                        sys.stderr.buffer.flush()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        class _Proc:
+            returncode: int = int(proc2.returncode or 0)
+            stdout: bytes = stdout_bytes
+            stderr: bytes = b"".join(stderr_chunks)
+
+        proc2 = _Proc()
         dt = time.perf_counter() - t0
+
         _dbg(
             f"done op={payload.get('op')!r} run_id={payload.get('run_id')!r} "
-            f"rc={proc.returncode} dt={dt:.2f}s stdout_bytes={len(proc.stdout)} stderr_bytes={len(proc.stderr)}"
+            f"rc={proc2.returncode} dt={dt:.2f}s stdout_bytes={len(proc2.stdout)} stderr_bytes={len(proc2.stderr)}"
         )
-        if proc.returncode != 0:
+        if proc2.returncode != 0:
             raise RuntimeError(
-                f"Remote swe_proxy failed (rc={proc.returncode}). "
-                f"stderr={proc.stderr.decode('utf-8', errors='ignore')}"
+                f"Remote swe_proxy failed (rc={proc2.returncode}). "
+                f"stderr={proc2.stderr.decode('utf-8', errors='ignore')}"
             )
         # Forward remote stderr to local log when DEBUG is on (runner/proxy writes progress there).
-        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and proc.stderr:
-            stderr_preview = proc.stderr.decode("utf-8", errors="ignore")
+        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and proc2.stderr:
+            stderr_preview = proc2.stderr.decode("utf-8", errors="ignore")
             print("[remote_swe_session][remote_stderr]" + stderr_preview, file=sys.stderr)
-        raw = proc.stdout.decode("utf-8", errors="replace")
+        raw = proc2.stdout.decode("utf-8", errors="replace")
         try:
             resp = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f"Failed to decode swe_proxy JSON response. stdout={proc.stdout!r}"
+                f"Failed to decode swe_proxy JSON response. stdout={proc2.stdout!r}"
             ) from exc
 
         # Normalize keys across proxy versions.
@@ -171,8 +249,9 @@ class RemoteSweSession:
         return resp
 
     def _ensure_remote_runners(self) -> None:
-        if not self.ensure_runners or self.num_runners <= 0 or self._runners_ensured:
+        if not self.ensure_runners or self.num_runners <= 0:
             return
+        # ensure_runners is idempotent; we run it before each start to recover from lost Slurm jobs.
 
         repo = shlex.quote(self.remote_repo)
         cd_cmd = f"cd {repo}"
@@ -189,10 +268,10 @@ class RemoteSweSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if proc.returncode != 0:
+        if proc2.returncode != 0:
             raise RuntimeError(
-                f"Remote ensure_runners failed (rc={proc.returncode}). "
-                f"stderr={proc.stderr.decode('utf-8', errors='ignore')}"
+                f"Remote ensure_runners failed (rc={proc2.returncode}). "
+                f"stderr={proc2.stderr.decode('utf-8', errors='ignore')}"
             )
         self._runners_ensured = True
 
