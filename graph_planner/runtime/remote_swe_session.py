@@ -8,6 +8,9 @@ import shlex
 import subprocess
 import select
 import time
+import atexit
+import signal
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
 
@@ -34,6 +37,106 @@ def _summarize_stdout(op: str, stdout: str, *, max_chars: int = 2000) -> str:
         return s
     return s[:max_chars] + f"...<truncated {len(s) - max_chars} chars>"
 
+
+
+# -----------------------------------------------------------------------------
+# Best-effort cleanup: if the local process exits (exception/KeyboardInterrupt),
+# try to stop remote instances so runners are freed.
+#
+# Disable with: GP_DISABLE_REMOTE_ATEXIT_STOP=1
+# Configure timeout with: GP_REMOTE_ATEXIT_STOP_TIMEOUT (seconds, default 60)
+# -----------------------------------------------------------------------------
+
+_ACTIVE_REMOTE_SWE_SESSIONS: "set[weakref.ReferenceType[Any]]" = set()
+_CLEANUP_HOOK_INSTALLED: bool = False
+
+
+def _cleanup_active_remote_swe_sessions(reason: str = "atexit") -> None:
+    if os.environ.get("GP_DISABLE_REMOTE_ATEXIT_STOP", "").strip().lower() in {"1", "true", "yes"}:
+        return
+    try:
+        timeout = float(os.environ.get("GP_REMOTE_ATEXIT_STOP_TIMEOUT", "60") or 60.0)
+    except Exception:
+        timeout = 60.0
+
+    # Iterate over weakrefs to avoid keeping sessions alive.
+    for ref in list(_ACTIVE_REMOTE_SWE_SESSIONS):
+        sess = ref()
+        if sess is None:
+            continue
+        try:
+            # Stop should be idempotent on the proxy/runner side.
+            sess.stop(timeout=timeout)
+        except Exception:
+            pass
+
+
+def _install_cleanup_hooks_once() -> None:
+    global _CLEANUP_HOOK_INSTALLED
+    if _CLEANUP_HOOK_INSTALLED:
+        return
+    if os.environ.get("GP_DISABLE_REMOTE_ATEXIT_STOP", "").strip().lower() in {"1", "true", "yes"}:
+        _CLEANUP_HOOK_INSTALLED = True
+        return
+
+    _CLEANUP_HOOK_INSTALLED = True
+    try:
+        atexit.register(_cleanup_active_remote_swe_sessions)
+    except Exception:
+        pass
+
+    # Also handle SIGINT/SIGTERM (best-effort). SIGKILL cannot be handled.
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            prev = signal.getsignal(sig)
+
+            def _handler(signum, frame, _prev=prev, _sig=sig):
+                try:
+                    _cleanup_active_remote_swe_sessions(reason=f"signal:{signum}")
+                finally:
+                    # Chain to previous handler.
+                    if callable(_prev):
+                        try:
+                            _prev(signum, frame)
+                            return
+                        except Exception:
+                            pass
+                    if _prev == signal.SIG_IGN:
+                        return
+                    # Restore default then re-raise signal.
+                    try:
+                        signal.signal(_sig, signal.SIG_DFL)
+                        os.kill(os.getpid(), signum)
+                    except Exception:
+                        return
+
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
+
+def _register_active_session(sess: Any) -> None:
+    try:
+        _ACTIVE_REMOTE_SWE_SESSIONS.add(weakref.ref(sess))
+    except Exception:
+        return
+    _install_cleanup_hooks_once()
+
+
+def _deregister_active_session(sess: Any) -> None:
+    # Remove matching weakrefs.
+    try:
+        dead = []
+        for ref in list(_ACTIVE_REMOTE_SWE_SESSIONS):
+            obj = ref()
+            if obj is None or obj is sess:
+                dead.append(ref)
+        for ref in dead:
+            _ACTIVE_REMOTE_SWE_SESSIONS.discard(ref)
+    except Exception:
+        pass
 
 
 
@@ -320,7 +423,13 @@ class RemoteSweSession:
             "timeout": effective_timeout,
             "cwd": cwd or "/repo",
         }
-        return self._call_proxy(payload, timeout=effective_timeout)
+        resp = self._call_proxy(payload, timeout=effective_timeout)
+        try:
+            if isinstance(resp, dict) and bool(resp.get('ok', True)) and int(resp.get('returncode') or 0) == 0:
+                _register_active_session(self)
+        except Exception:
+            pass
+        return resp
 
     def exec(
         self,
@@ -341,7 +450,13 @@ class RemoteSweSession:
             payload["cwd"] = cwd
         if env:
             payload["env"] = env
-        return self._call_proxy(payload, timeout=timeout)
+        resp = self._call_proxy(payload, timeout=timeout)
+        try:
+            # Even if stop fails, we don't want to keep the session in registry forever.
+            _deregister_active_session(self)
+        except Exception:
+            pass
+        return resp
 
     def stop(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
