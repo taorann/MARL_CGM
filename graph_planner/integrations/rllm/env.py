@@ -182,6 +182,12 @@ else:
                     adjusted -= self.timeout_penalty
 
             reward = adjusted
+            if done:
+                # Ensure remote_swe instances are stopped at the end of each trajectory.
+                try:
+                    self.close()
+                except Exception:
+                    pass
             return observation, reward, done, info
 
         def close(self) -> None:
