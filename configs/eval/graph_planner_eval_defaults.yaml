@@ -19,7 +19,7 @@ planner_top_p: 0.95
 planner_timeout: 180
 max_prompt_tokens: 4096
 max_response_tokens: 4096
-max_steps: 20  # increased for deeper trajectories; override via GP_MAX_STEPS
+max_steps: 60  # increased for deeper trajectories; override via GP_MAX_STEPS
 enable_rule_fallback: false
 parallel: 4
 cgm_model_path: models/CodeFuse-CGM
