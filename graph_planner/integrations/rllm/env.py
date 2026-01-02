@@ -47,7 +47,7 @@ else:
             self,
             entry: Dict[str, Any],
             *,
-            max_steps: int = 8,
+            max_steps: int = 60,
             reward_scale: float | None = None,
             failure_penalty: float | None = None,
             step_penalty: float | None = None,
@@ -57,19 +57,24 @@ else:
             synthesis_strategy: str | None = None,
         ) -> None:
             self.entry = deepcopy(entry)
-            # IMPORTANT:
-            # The evaluation script passes `max_steps` via env_args (CLI/YAML), and
-            # that value should be the *source of truth*. Some SWE-bench datasets
-            # also embed a per-task `max_steps` field; if we always prefer the
-            # entry field, the CLI/YAML setting becomes ineffective and we can
-            # terminate unexpectedly early (e.g. always stopping at 5 steps).
-            #
-            # Therefore: prefer the explicit argument, and only fall back to the
-            # entry field when the caller did not specify a value.
+            # Determine step budget. Preference order:
+            # 1) explicit env var GP_MAX_STEPS (for quick overrides)
+            # 2) constructor argument max_steps (from eval config/CLI)
+            # 3) entry["max_steps"] (task-level metadata)
+            # and enforce a minimum of 60 (override via GP_MAX_STEPS if you really want smaller).
+            env_override = os.environ.get("GP_MAX_STEPS")
             try:
-                self.max_steps = int(max_steps)
+                override_val = int(env_override) if env_override is not None and str(env_override).strip() else None
             except Exception:
-                self.max_steps = int(entry.get("max_steps", 8))
+                override_val = None
+            entry_steps = None
+            try:
+                entry_steps = int(entry.get("max_steps")) if entry.get("max_steps") is not None else None
+            except Exception:
+                entry_steps = None
+            candidates = [v for v in [override_val, int(max_steps) if max_steps is not None else None, entry_steps] if isinstance(v, int)]
+            self.max_steps = max([60] + candidates) if candidates else 60
+            self.entry["max_steps"] = self.max_steps
             base_reward_scale = float(entry.get("reward_scale", 1.0))
             self.reward_scale = float(
                 reward_scale if reward_scale is not None else base_reward_scale
@@ -122,13 +127,6 @@ else:
         def reset(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             self.close()
             self._planner = self._spawn_planner()
-            if bool(os.environ.get("DEBUG_ACTION_RESULT")):
-                try:
-                    print(
-                        f"[gp-env] reset: max_steps={self.max_steps} entry.max_steps={self.entry.get('max_steps')} issue_uid={self._issue_uid}"
-                    )
-                except Exception:
-                    pass
             try:
                 observation = self._planner.reset()
             except Exception:
@@ -254,11 +252,7 @@ else:
                 extra_payload = json.loads(raw_entry)
             else:
                 extra_payload = extra_info
-            # Prefer the wrapper/env args (if present) over the embedded entry.
-            if isinstance(extra_info, dict) and "max_steps" in extra_info:
-                max_steps = int(extra_info.get("max_steps") or 0) or 8
-            else:
-                max_steps = int(extra_payload.get("max_steps", 8))
+            max_steps = int(extra_payload.get("max_steps", 8))
             return GraphPlannerRLLMEnv(entry=extra_payload, max_steps=max_steps, **env_kwargs)
 
         # ------------------------------------------------------------------
@@ -303,8 +297,6 @@ else:
                 self._issue_uid,
             ]
             issue["id"] = "__".join([p for p in parts if p]) or self._issue_uid
-            # Keep PlannerEnv and the wrapper aligned on termination conditions.
-            issue["max_steps"] = int(self.max_steps)
             # Ensure remote_swe instance isolation: prefer explicit run_id when available.
             # Fallback: ensure run_id exists and is unique per trajectory.
             issue.setdefault("run_id", issue["id"])
