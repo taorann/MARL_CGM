@@ -59,6 +59,20 @@ except Exception:  # pragma: no cover
         ) from e
 
 
+@dataclass
+class _ActionResult:
+    """Minimal rLLM-compatible action wrapper.
+
+    Upstream rLLM's AgentExecutionEngine expects agent.update_from_model() to
+    return an object with an `.action` attribute. Some versions of this repo
+    model the internal action union via `typing.Union[...]`, which is *not*
+    instantiable. This wrapper keeps us compatible without depending on a
+    specific rLLM version.
+    """
+
+    action: Any
+
+
 
 # -----------------------------------------------------------------------------
 # OpenAI tool schema (Qwen3 / OpenAI-compat) for the planner.
@@ -391,7 +405,7 @@ class _StepState:
     done: bool
     info: Dict[str, Any]
     model_response: str | None = None
-    action: ActionUnion | None = None
+    action: Dict[str, Any] | None = None
 
 
 class GraphPlannerRLLMAgent(BaseAgent):
@@ -476,49 +490,58 @@ class GraphPlannerRLLMAgent(BaseAgent):
         while len(self._messages) < 3:
             self._messages.append({"role": "user", "content": ""})
         self._messages[2] = {"role": "user", "content": obs_text}
-                # Optional terminal debug: print working-subgraph nodes and memorized flags.
-                # Default ON; disable via GP_PRINT_STATE=0.
-                if os.environ.get("GP_PRINT_STATE", "1").strip().lower() not in {"0", "false", "no", "off"}:
-                    try:
-                        if isinstance(observation, dict):
-                            w = observation.get("subgraph") or observation.get("working_subgraph") or {}
-                            ms = observation.get("memory_stats") or {}
-                        else:
-                            w, ms = {}, {}
-                        if isinstance(w, dict):
-                            node_ids = w.get("node_ids") or []
-                            nodes = w.get("nodes") or []
-                            node_map: Dict[str, Any] = {}
-                            if isinstance(nodes, list):
-                                for n in nodes:
-                                    if isinstance(n, dict) and n.get("id") is not None:
-                                        node_map[str(n.get("id"))] = n
-                            topn = int(os.environ.get("GP_PRINT_WORKING_TOPN", "20") or 20)
-                            show_ids = list(node_ids)[-topn:] if isinstance(node_ids, list) else []
-                            items = []
-                            for nid in show_ids:
-                                nd = node_map.get(str(nid), {}) if isinstance(node_map, dict) else {}
-                                mem = bool(nd.get("memorized"))
-                                tag = "[M]" if mem else "[ ]"
-                                label = nd.get("symbol") or nd.get("name") or nd.get("path") or str(nid)
-                                items.append(f"{tag}{label}")
-                            if items:
-                                print("[gp-agent]  W.nodes:", " | ".join(items))
-                        if isinstance(ms, dict) and ms:
-                            print(f"[gp-agent]  memory_stats: n_nodes={ms.get('n_nodes', 0)} n_edges={ms.get('n_edges', 0)}")
-                    except Exception:
-                        pass
 
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
+
+        # Optional step-state printing for interactive debugging.
+        if os.environ.get("GP_PRINT_STATE", "1").strip().lower() not in {"0", "false", "no", "off"}:
+            try:
+                step_idx = len(self._steps) - 1
+                kind = (info or {}).get("kind")
+                op = (info or {}).get("op")
+                obs = observation if isinstance(observation, dict) else {}
+
+                def _node_ids(subgraph_obj: Any) -> List[str]:
+                    if isinstance(subgraph_obj, dict):
+                        if isinstance(subgraph_obj.get("node_ids"), list):
+                            return [str(x) for x in subgraph_obj.get("node_ids") or []]
+                        nodes = subgraph_obj.get("nodes")
+                        if isinstance(nodes, dict):
+                            return [str(k) for k in nodes.keys()]
+                    return []
+
+                w_obj = obs.get("working_subgraph") or obs.get("w") or {}
+                m_obj = obs.get("memory_subgraph") or obs.get("m") or {}
+                w_ids = _node_ids(w_obj)
+                m_ids = _node_ids(m_obj)
+                m_set = set(m_ids)
+
+                print(f"[gp-state] step={step_idx} kind={kind} op={op} W={len(w_ids)} M={len(m_ids)}")
+
+                topn = _safe_int(os.environ.get("GP_PRINT_WORKING_TOPN"), default=20)
+                tail = w_ids[-topn:] if topn > 0 else []
+                if tail:
+                    fmt = [f"{'[M]' if nid in m_set else '[ ]'}{nid}" for nid in tail]
+                    print("[gp-state] W.tail=", ", ".join(fmt))
+
+                # Surface explore results if present.
+                cands = (info or {}).get("candidates")
+                if isinstance(cands, list) and cands:
+                    topk = _safe_int(os.environ.get("GP_PRINT_CANDIDATE_TOPK"), default=8)
+                    show = [str(x) for x in cands[: max(1, topk)]]
+                    print(f"[gp-state] candidates({len(cands)}):", ", ".join(show))
+            except Exception:
+                # Never fail the run due to debug printing.
+                pass
 
     @property
     def chat_completions(self) -> List[Dict[str, str]]:
         """Full dialogue history for the engine (OpenAI chat format)."""
         return list(self._messages)
 
-    def update_from_model(self, model_response: str) -> ActionUnion:
+    def update_from_model(self, model_response: str) -> Any:
         # Record model response.
         if self._steps:
             self._steps[-1].model_response = model_response
@@ -559,7 +582,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
         if len(self._messages) >= 2 and isinstance(self._messages[1], dict):
             self._messages[1]["content"] = preamble
 
-        action: ActionUnion
+        action: Any
         try:
             # 1) Preferred: tool wrapper JSON (produced by our engine).
             if wrapper_obj is not None:
@@ -591,8 +614,13 @@ class GraphPlannerRLLMAgent(BaseAgent):
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
 
-        telemetry_mod.emit_event("planner_action", {"action": action})
-        return action  # ActionUnion is a typing.Union alias; return the concrete action object
+        # Telemetry should stay JSON-friendly even when `action` is a dataclass.
+        telemetry_mod.emit_event("planner_action", {"action": _safe_json(action)})
+
+        # rLLM expects an object with a `.action` attribute (engine does:
+        #   action = action.action
+        # ). Do NOT instantiate typing.Union aliases.
+        return _ActionResult(action=action)
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
@@ -645,16 +673,6 @@ try:  # pragma: no cover
             try:
                 return await super().run_agent_trajectory_async(idx, application_id, seed=seed, mode=mode, **kwargs)
             finally:
-                # Best-effort env cleanup: release remote containers even if the trajectory errors.
-                try:
-                    envs = getattr(self, "envs", None) or getattr(self, "environments", None) or getattr(self, "_envs", None)
-                    if isinstance(envs, (list, tuple)) and 0 <= idx < len(envs):
-                        env = envs[idx]
-                        close = getattr(env, "close", None)
-                        if callable(close):
-                            close()
-                except Exception:
-                    pass
                 _CURRENT_AGENT.reset(token)
 
         async def _get_openai_async(self, prompt, _, **kwargs):
