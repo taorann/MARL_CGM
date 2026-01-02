@@ -391,7 +391,7 @@ class _StepState:
     done: bool
     info: Dict[str, Any]
     model_response: str | None = None
-    action: Dict[str, Any] | None = None
+    action: ActionUnion | None = None
 
 
 class GraphPlannerRLLMAgent(BaseAgent):
@@ -476,65 +476,42 @@ class GraphPlannerRLLMAgent(BaseAgent):
         while len(self._messages) < 3:
             self._messages.append({"role": "user", "content": ""})
         self._messages[2] = {"role": "user", "content": obs_text}
+                # Optional terminal debug: print working-subgraph nodes and memorized flags.
+                # Default ON; disable via GP_PRINT_STATE=0.
+                if os.environ.get("GP_PRINT_STATE", "1").strip().lower() not in {"0", "false", "no", "off"}:
+                    try:
+                        if isinstance(observation, dict):
+                            w = observation.get("subgraph") or observation.get("working_subgraph") or {}
+                            ms = observation.get("memory_stats") or {}
+                        else:
+                            w, ms = {}, {}
+                        if isinstance(w, dict):
+                            node_ids = w.get("node_ids") or []
+                            nodes = w.get("nodes") or []
+                            node_map: Dict[str, Any] = {}
+                            if isinstance(nodes, list):
+                                for n in nodes:
+                                    if isinstance(n, dict) and n.get("id") is not None:
+                                        node_map[str(n.get("id"))] = n
+                            topn = int(os.environ.get("GP_PRINT_WORKING_TOPN", "20") or 20)
+                            show_ids = list(node_ids)[-topn:] if isinstance(node_ids, list) else []
+                            items = []
+                            for nid in show_ids:
+                                nd = node_map.get(str(nid), {}) if isinstance(node_map, dict) else {}
+                                mem = bool(nd.get("memorized"))
+                                tag = "[M]" if mem else "[ ]"
+                                label = nd.get("symbol") or nd.get("name") or nd.get("path") or str(nid)
+                                items.append(f"{tag}{label}")
+                            if items:
+                                print("[gp-agent]  W.nodes:", " | ".join(items))
+                        if isinstance(ms, dict) and ms:
+                            print(f"[gp-agent]  memory_stats: n_nodes={ms.get('n_nodes', 0)} n_edges={ms.get('n_edges', 0)}")
+                    except Exception:
+                        pass
 
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
-
-            # Extra step-level visibility for debugging: show candidate hits from
-            # the last find, and a compact view of W/M.
-            try:
-                obs = observation
-                if isinstance(obs, str):
-                    obs = json.loads(obs)
-                if isinstance(obs, dict):
-                    last_info = obs.get("last_info") or {}
-                    cands = last_info.get("candidates")
-                    if isinstance(cands, list) and cands:
-                        top = []
-                        for c in cands[:8]:
-                            if not isinstance(c, dict):
-                                continue
-                            cid = str(c.get("id") or "").strip()
-                            if not cid:
-                                continue
-                            top.append(cid)
-                        if top:
-                            print("[gp-agent]  candidates:", ", ".join(top))
-
-                    def _sub_nodes(obj: Any) -> list[dict]:
-                        if not isinstance(obj, dict):
-                            return []
-                        nodes = obj.get("nodes")
-                        if isinstance(nodes, list):
-                            return [n for n in nodes if isinstance(n, dict)]
-                        # tolerate dict[id->node]
-                        if isinstance(nodes, dict):
-                            return [n for n in nodes.values() if isinstance(n, dict)]
-                        return []
-
-                    w = obs.get("working_subgraph") or obs.get("w") or obs.get("subgraph") or {}
-                    m = obs.get("memory_subgraph") or obs.get("m") or {}
-                    w_nodes = _sub_nodes(w)
-                    m_nodes = _sub_nodes(m)
-                    w_mem = sum(1 for n in w_nodes if bool(n.get("memorized")))
-                    print(f"[gp-agent]  W(n={len(w_nodes)}, memorized={w_mem})  M(n={len(m_nodes)}, e={len((m or {}).get('edges') or [])})")
-
-                    # Print a short list of working node ids so you can see the
-                    # working set evolving.
-                    if w_nodes:
-                        shown = []
-                        for n in w_nodes[:20]:
-                            nid = str(n.get("id") or "").strip()
-                            if not nid:
-                                continue
-                            tag = "[M]" if bool(n.get("memorized")) else ""
-                            shown.append(f"{nid}{tag}")
-                        if shown:
-                            print("[gp-agent]  W.nodes:", ", ".join(shown))
-            except Exception:
-                # Never let debug printing break a run.
-                pass
 
     @property
     def chat_completions(self) -> List[Dict[str, str]]:
@@ -582,7 +559,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
         if len(self._messages) >= 2 and isinstance(self._messages[1], dict):
             self._messages[1]["content"] = preamble
 
-        action: Dict[str, Any]
+        action: ActionUnion
         try:
             # 1) Preferred: tool wrapper JSON (produced by our engine).
             if wrapper_obj is not None:
@@ -615,7 +592,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
             print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
 
         telemetry_mod.emit_event("planner_action", {"action": action})
-        return ActionUnion(action=action)
+        return action  # ActionUnion is a typing.Union alias; return the concrete action object
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
@@ -668,6 +645,16 @@ try:  # pragma: no cover
             try:
                 return await super().run_agent_trajectory_async(idx, application_id, seed=seed, mode=mode, **kwargs)
             finally:
+                # Best-effort env cleanup: release remote containers even if the trajectory errors.
+                try:
+                    envs = getattr(self, "envs", None) or getattr(self, "environments", None) or getattr(self, "_envs", None)
+                    if isinstance(envs, (list, tuple)) and 0 <= idx < len(envs):
+                        env = envs[idx]
+                        close = getattr(env, "close", None)
+                        if callable(close):
+                            close()
+                except Exception:
+                    pass
                 _CURRENT_AGENT.reset(token)
 
         async def _get_openai_async(self, prompt, _, **kwargs):
