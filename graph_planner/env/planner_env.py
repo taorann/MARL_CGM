@@ -192,6 +192,10 @@ class PlannerEnv:
         self.last_candidates: List[Dict[str, Any]] = []
         self.last_reads: List[Dict[str, Any]] = []
 
+        # Optional "frontier" anchor id to use when the model omits anchors.
+        # This is especially useful when using a find->expand policy.
+        self.frontier_anchor_id: Optional[str] = None
+
     # ------------------------------------------------------------
     # 兼容接口：env.subgraph → working_subgraph
     # ------------------------------------------------------------
@@ -546,104 +550,6 @@ class PlannerEnv:
     # ------------------------------------------------------------------
     # Explore / Memory
     # ------------------------------------------------------------------
-    def _canonicalize_node_id(self, raw_id: str) -> Optional[str]:
-        """Try to map a possibly-untyped node id to an actual repo-graph node id.
-
-        We accept ids that omit the leading node-type prefix (e.g., 'func:') and
-        try common prefixes. This fixes cases where the model copies the id
-        without the prefix.
-        """
-        if not isinstance(raw_id, str):
-            return None
-        rid = raw_id.strip()
-        if not rid:
-            return None
-
-        repo_nodes = getattr(self, "_repo_nodes_by_id", None) or {}
-
-        # Fast path
-        if rid in repo_nodes:
-            return rid
-
-        # If already typed but not found, try dropping the first type segment.
-        if ":" in rid:
-            base = rid.split(":", 1)[1]
-            if base in repo_nodes:
-                return base
-
-        # Common type prefixes used by our repo_graph builder.
-        prefixes = (
-            "func:",
-            "class:",
-            "method:",
-            "file:",
-            "var:",
-            "const:",
-            "type:",
-            "module:",
-        )
-        for p in prefixes:
-            cand = p + rid
-            if cand in repo_nodes:
-                return cand
-
-        # If ends with a numeric line suffix, try stripping it.
-        parts = rid.split(":")
-        if parts and parts[-1].isdigit():
-            base = ":".join(parts[:-1])
-            if base in repo_nodes:
-                return base
-            for p in prefixes:
-                cand = p + base
-                if cand in repo_nodes:
-                    return cand
-            if ":" in base:
-                base2 = base.split(":", 1)[1]
-                if base2 in repo_nodes:
-                    return base2
-                for p in prefixes:
-                    cand = p + base2
-                    if cand in repo_nodes:
-                        return cand
-
-        return None
-
-    def _canonicalize_anchors(self, anchors: Any, info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Normalize/repair anchor ids so expand can resolve them in repo_graph."""
-        if not anchors:
-            return []
-        out: List[Dict[str, Any]] = []
-        rewrites: List[Dict[str, str]] = []
-        dropped: List[str] = []
-
-        for a in anchors:
-            if isinstance(a, dict) and isinstance(a.get("id"), str):
-                raw_id = a["id"]
-                cid = self._canonicalize_node_id(raw_id)
-                if cid:
-                    if cid != raw_id:
-                        rewrites.append({"from": raw_id, "to": cid})
-                    out.append({"id": cid})
-                else:
-                    dropped.append(raw_id)
-            elif isinstance(a, dict):
-                # keep non-id anchors (kind/text) as-is
-                out.append(a)
-            elif isinstance(a, str):
-                cid = self._canonicalize_node_id(a)
-                if cid:
-                    rewrites.append({"from": a, "to": cid})
-                    out.append({"id": cid})
-                else:
-                    dropped.append(a)
-
-        if rewrites:
-            info["anchor_id_rewrite"] = rewrites
-        if dropped:
-            info["anchor_id_dropped"] = dropped
-
-        return out
-
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
         """
         实现 ExploreAction 的两个子操作：
@@ -667,15 +573,6 @@ class PlannerEnv:
         if not self.repo_graph:
             info["error"] = "missing-repo-graph"
             return info
-
-        # Repair/normalize anchors so that ids produced by the model (which may
-        # omit the node-type prefix like 'func:') can still resolve.
-        anchors = self._canonicalize_anchors(anchors, info=info)
-        # If anchors were provided but could not be resolved, fall back to the
-        # latest frontier anchor (typically the top-1 candidate from the last find).
-        if not anchors and getattr(self, "frontier_anchor_id", None):
-            anchors = [{"id": str(getattr(self, "frontier_anchor_id"))}]
-            info["anchors_fallback_to_frontier"] = True
 
         # 数量预算：兼容旧字段 limit，同时支持 total_limit/max_per_anchor/dir_diversity_k
         total_limit = _safe_int(getattr(act, "total_limit", None) or act.limit or 32, 32)
@@ -725,19 +622,30 @@ class PlannerEnv:
                 else:
                     candidates = []
 
-            # Expose candidates to the agent, but do NOT mutate working_subgraph.
-            # The planner should explicitly select an anchor via explore_expand.
+            # Expose candidates to the agent.
             self.last_candidates = candidates
-            # Remember the top-1 candidate as frontier, so a later expand can
-            # fall back to it when the model provides an unresolved anchor id.
-            try:
-                if candidates and isinstance(candidates[0], dict) and isinstance(candidates[0].get("id"), str):
-                    self.frontier_anchor_id = candidates[0]["id"]
-                    info["frontier_anchor_id"] = self.frontier_anchor_id
-            except Exception:
-                pass
-
             info["candidates"] = candidates
+
+            # Policy: after a successful find, seed the working_subgraph (W) with
+            # the top-k candidates as isolated nodes (no neighbor expansion).
+            # This makes the search progress visible in the prompt/terminal and
+            # enables a simple find->expand workflow.
+            k_add = _safe_int(os.environ.get("GP_FIND_ADD_TO_WORKING_TOPK", "1"), default=1)
+            added_to_working: List[str] = []
+            if k_add > 0 and candidates:
+                for c in candidates[: max(0, k_add)]:
+                    nid = c.get("id") if isinstance(c, dict) else None
+                    if isinstance(nid, str) and nid and (nid in self._repo_nodes_by_id):
+                        added_to_working.append(nid)
+                if added_to_working:
+                    # Use the first candidate as the default frontier anchor.
+                    self.frontier_anchor_id = added_to_working[0]
+                    # Merge nodes into W (induced edges among them are safe).
+                    self._merge_repo_nodes_into_working(added_to_working, status="found")
+                    info["added_to_working"] = list(added_to_working)
+                    info["frontier_anchor_id"] = self.frontier_anchor_id
+                    if self._print_ops:
+                        print(f"[planner_env] find seeded W with {len(added_to_working)} node(s): {added_to_working[:6]}")
 
             # Mark which already-present working nodes are in the last candidate set.
             cand_ids: List[str] = []
@@ -790,30 +698,13 @@ class PlannerEnv:
                 dir_diversity_k=dir_diversity_k,
             )
             self.last_candidates = candidates
-            try:
-                if candidates and isinstance(candidates[0], dict) and isinstance(candidates[0].get("id"), str):
-                    self.frontier_anchor_id = candidates[0]["id"]
-                    info["frontier_anchor_id"] = self.frontier_anchor_id
-            except Exception:
-                pass
-
             info["candidates"] = candidates
+
             node_ids: List[str] = []
-            # include anchor nodes themselves (not only neighbors)
-            for a in (anchors or []):
-                if isinstance(a, dict) and isinstance(a.get("id"), str):
-                    node_ids.append(a["id"])
             for c in candidates:
                 nid = c.get("id")
                 if isinstance(nid, str):
                     node_ids.append(nid)
-
-            # dedupe (preserve order)
-            try:
-                seen = set()
-                node_ids = [x for x in node_ids if (x not in seen and not seen.add(x))]
-            except Exception:
-                pass
 
             self._merge_repo_nodes_into_working(node_ids, status="explored")
 
@@ -1282,8 +1173,16 @@ class PlannerEnv:
         """
         working_stats = subgraph_store.stats(self.working_subgraph)
         working_json = self.working_subgraph.to_json_obj()
+        memory_json = self.memory_subgraph.to_json_obj()
         memory_stats = subgraph_store.stats(self.memory_subgraph)
         obs_pack = self._observation_pack(mem_stats=memory_stats, query_stats=None)
+
+        # Some downstream summarizers / integrations expect the shorthand keys
+        # `w` (working) and `m` (memory). Keep them in sync with the three-graph
+        # design to avoid "W is empty" artifacts in terminal output.
+        k_last = _safe_int(os.environ.get("GP_OBS_LAST_CANDIDATES_K", "12"), default=12)
+        last_cands = list(self.last_candidates or [])[: max(0, k_last)]
+        last_reads = list(self.last_reads or [])[: max(0, k_last)]
 
         return {
             "runner_id": getattr(self, "runner_id", 0),
@@ -1291,15 +1190,17 @@ class PlannerEnv:
             "steps": self.steps,
             "last_info": self.last_info,
             # LLM 看到的是“当前工作图”，里面节点已经带 status/tags（explored/remembered）
-            # Backward-compatible keys:
             "subgraph": working_json,
             "subgraph_stats": working_stats,
-            # Preferred keys used by summarise_observation (W/M rendering):
+            # Explicit three-graph fields (and shorthand aliases).
             "working_subgraph": working_json,
-            "memory_subgraph": self.memory_subgraph.to_json_obj(),
-            # Short aliases (some prompts / debug scripts refer to them):
-            "w": working_stats,
-            "m": memory_stats,
+            "memory_subgraph": memory_json,
+            "w": working_json,
+            "m": memory_json,
+            "frontier_anchor_id": getattr(self, "frontier_anchor_id", None),
+            # Lightweight last-step artifacts for debugging / prompting.
+            "last_candidates": last_cands,
+            "last_reads": last_reads,
             # 记忆图的统计信息（可选）
             "memory_stats": memory_stats,
             "text_memory": {"notes": (self.memory_text_store.get('session', limit=12) if self.memory_text_store else []), "count": (len(self.memory_text_store.get('session')) if self.memory_text_store else 0)},
