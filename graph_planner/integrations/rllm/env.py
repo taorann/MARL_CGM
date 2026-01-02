@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -31,9 +30,6 @@ from ...env.planner_env import PlannerEnv
 from ...runtime.sandbox import SandboxConfig
 
 
-logger = logging.getLogger(__name__)
-
-
 if BaseEnv is None:
 
     class GraphPlannerRLLMEnv:  # type: ignore[misc]
@@ -47,11 +43,15 @@ else:
     class GraphPlannerRLLMEnv(BaseEnv):
         """Adapter that exposes :class:`PlannerEnv` through the rLLM ``BaseEnv`` API."""
 
+        # Default episode budget. Many SWE-bench style tasks require >10 steps
+        # even before calling repair/submit (find → expand → memory → ...).
+        DEFAULT_MAX_STEPS: int = 60
+
         def __init__(
             self,
             entry: Dict[str, Any],
             *,
-            max_steps: int = 8,
+            max_steps: int = DEFAULT_MAX_STEPS,
             reward_scale: float | None = None,
             failure_penalty: float | None = None,
             step_penalty: float | None = None,
@@ -61,7 +61,38 @@ else:
             synthesis_strategy: str | None = None,
         ) -> None:
             self.entry = deepcopy(entry)
-            self.max_steps = int(entry.get("max_steps", max_steps))
+
+            # --- max_steps resolution ---
+            # Priority:
+            #   1) env override (GP_MAX_STEPS / GRAPH_PLANNER_MAX_STEPS)
+            #   2) explicit constructor arg
+            #   3) entry['max_steps']
+            # And we clamp to at least DEFAULT_MAX_STEPS unless env override is set.
+            env_override = os.environ.get("GP_MAX_STEPS") or os.environ.get(
+                "GRAPH_PLANNER_MAX_STEPS"
+            )
+            entry_steps = entry.get("max_steps")
+            if env_override is not None:
+                raw_steps = env_override
+            else:
+                # If the dataset/entry requests a larger budget than the default
+                # constructor arg, honour the larger value.
+                raw_steps = max_steps
+                try:
+                    if entry_steps is not None and int(entry_steps) > int(max_steps):
+                        raw_steps = entry_steps
+                except Exception:
+                    pass
+            try:
+                resolved = int(raw_steps)  # type: ignore[arg-type]
+            except Exception:
+                try:
+                    resolved = int(entry_steps) if entry_steps is not None else int(self.DEFAULT_MAX_STEPS)
+                except Exception:
+                    resolved = int(self.DEFAULT_MAX_STEPS)
+            if env_override is None and resolved < int(self.DEFAULT_MAX_STEPS):
+                resolved = int(self.DEFAULT_MAX_STEPS)
+            self.max_steps = int(resolved)
             base_reward_scale = float(entry.get("reward_scale", 1.0))
             self.reward_scale = float(
                 reward_scale if reward_scale is not None else base_reward_scale
@@ -165,53 +196,6 @@ else:
             self._last_observation = observation
             self._step_count += 1
 
-            # ------------------------------------------------------------------
-            # Optional human-facing debug prints.
-            #
-            # By design, the agent loop prints the model tool-call and the reward/done
-            # signal, but it does NOT print the tool results. Tool results live in
-            # observation["last_info"] (and telemetry logs). This block makes it
-            # easier to debug by printing a compact summary when enabled.
-            #
-            # Enable via:
-            #   export GP_PRINT_STEP_INFO=1
-            # ------------------------------------------------------------------
-            if str(os.environ.get("GP_PRINT_STEP_INFO", "0")).lower() not in ("0", "false", "", "none"):
-                try:
-                    kind = info.get("kind")
-                    op = info.get("op")
-                    if kind == "explore" and op in ("find", "expand"):
-                        cands = info.get("candidates")
-                        if isinstance(cands, list):
-                            top_ids = []
-                            for c in cands[:5]:
-                                if isinstance(c, dict) and isinstance(c.get("id"), str):
-                                    top_ids.append(c["id"])
-                            logger.info(
-                                "[gp-env] explore.%s candidates=%s top=%s",
-                                op,
-                                len(cands),
-                                top_ids,
-                            )
-                            # Print one lightweight preview if available.
-                            previews = info.get("candidate_previews")
-                            if isinstance(previews, list) and previews:
-                                p0 = previews[0] if isinstance(previews[0], dict) else None
-                                if isinstance(p0, dict):
-                                    snippet_lines = p0.get("snippet_lines")
-                                    if isinstance(snippet_lines, list):
-                                        preview_text = "\n".join(str(x) for x in snippet_lines[:8])
-                                        logger.info(
-                                            "[gp-env] preview %s:%s-%s\n%s",
-                                            p0.get("path"),
-                                            p0.get("start"),
-                                            p0.get("end"),
-                                            preview_text,
-                                        )
-                except Exception:
-                    # Never let debug printing break the environment.
-                    pass
-
             adjusted = float(reward) * self.reward_scale
             if not done:
                 adjusted -= self.step_penalty
@@ -286,7 +270,7 @@ else:
                 extra_payload = json.loads(raw_entry)
             else:
                 extra_payload = extra_info
-            max_steps = int(extra_payload.get("max_steps", 8))
+            max_steps = int(extra_payload.get("max_steps", GraphPlannerRLLMEnv.DEFAULT_MAX_STEPS))
             return GraphPlannerRLLMEnv(entry=extra_payload, max_steps=max_steps, **env_kwargs)
 
         # ------------------------------------------------------------------
@@ -334,6 +318,14 @@ else:
             # Ensure remote_swe instance isolation: prefer explicit run_id when available.
             # Fallback: ensure run_id exists and is unique per trajectory.
             issue.setdefault("run_id", issue["id"])
+
+            # Propagate episode budget to the lower-level PlannerEnv as well.
+            # (PlannerEnv also has its own max_steps budget; keeping them aligned
+            #  makes logs/telemetry consistent.)
+            try:
+                issue["max_steps"] = int(self.max_steps)
+            except Exception:
+                issue["max_steps"] = self.DEFAULT_MAX_STEPS
             return issue
 
         @property
