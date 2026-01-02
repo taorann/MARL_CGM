@@ -53,7 +53,7 @@ class ApptainerQueueRuntime:
         timeout_sec: Optional[float] = None,
         meta: Optional[Dict[str, str]] = None,
     ) -> ExecResult:
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -88,7 +88,7 @@ class ApptainerQueueRuntime:
         启动一个 Apptainer instance（每条轨迹一个），run_id 用来标识 instance。
         对应 runner 里的 handle_instance_start。
         """
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -121,7 +121,7 @@ class ApptainerQueueRuntime:
         在已启动的 instance 中执行一条命令（多步交互）。
         对应 runner 里的 handle_instance_exec。
         """
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -152,7 +152,7 @@ class ApptainerQueueRuntime:
         停止一个 instance（轨迹结束）。
         对应 runner 里的 handle_instance_stop。
         """
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -173,8 +173,40 @@ class ApptainerQueueRuntime:
     # ----------------------
     # 文件 put/get & cleanup（原有逻辑）
     # ----------------------
+
+    def stop_instance_on_runner(
+        self,
+        *,
+        runner_id: int,
+        run_id: str,
+        cwd: Path,
+        env: Optional[Mapping[str, str]] = None,
+        timeout_sec: Optional[float] = None,
+        meta: Optional[Dict[str, str]] = None,
+    ) -> ExecResult:
+        """Force-send an instance_stop to a specific runner id.
+
+        This is used by swe_proxy cleanup_pool to reclaim runner slots even when the
+        run_id is unknown or heartbeat-based routing is stale.
+        """
+        req = QueueRequest(
+            req_id=self._new_req_id(),
+            runner_id=int(runner_id),
+            run_id=str(run_id or ""),
+            type="instance_stop",
+            image="",
+            sif_path="",
+            cmd=[],
+            cwd=str(cwd),
+            env=dict(env or {}),
+            timeout_sec=float(timeout_sec or self.default_timeout_sec),
+            meta=meta or {},
+        )
+        resp = self._roundtrip(req)
+        return self._resp_to_exec_result(resp)
+
     def put_file(self, *, run_id: str, src: Path, dst: Path, timeout_sec: Optional[float] = None, meta: Optional[Dict[str, str]] = None) -> None:
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -188,7 +220,7 @@ class ApptainerQueueRuntime:
         self._roundtrip(req)
 
     def get_file(self, *, run_id: str, src: Path, dst: Path, timeout_sec: Optional[float] = None, meta: Optional[Dict[str, str]] = None) -> None:
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -202,7 +234,7 @@ class ApptainerQueueRuntime:
         self._roundtrip(req)
 
     def cleanup_run(self, run_id: str, timeout_sec: Optional[float] = None) -> None:
-        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
+        runner_id = self._choose_runner(run_id)
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -397,6 +429,18 @@ class ApptainerQueueRuntime:
         req.runner_id = int(new_rid)
 
     def _choose_runner(self, run_id: str) -> int:
+        # Cross-process routing: swe_proxy is typically invoked per request, so in-memory
+        # mappings are not preserved. Prefer the runner whose heartbeat currently owns this run_id.
+        try:
+            target = str(run_id or "").strip()
+            if target:
+                for rid_scan in range(max(int(self.num_runners), 1)):
+                    hb = self._read_heartbeat(rid_scan)
+                    if hb and str(hb.get("current_run_id") or "") == target:
+                        return int(rid_scan)
+        except Exception:
+            pass
+
         # Prefer alive runners to avoid routing to PENDING / dead runners (common on Slurm).
         alive = self._alive_runner_ids()
         rid = self._run_to_runner.get(run_id)
@@ -469,4 +513,3 @@ class ApptainerQueueRuntime:
             ok=True,
             error=None,
         )
-
