@@ -1152,20 +1152,21 @@ class PlannerEnv:
         memory_stats = subgraph_store.stats(self.memory_subgraph)
         obs_pack = self._observation_pack(mem_stats=memory_stats, query_stats=None)
 
+        memory_json = self.memory_subgraph.to_json_obj()
         return {
             "runner_id": getattr(self, "runner_id", 0),
             "issue": self.issue,
             "steps": self.steps,
-            "step_id": self.steps,
             "last_info": self.last_info,
             # LLM 看到的是“当前工作图”，里面节点已经带 status/tags（explored/remembered）
             "subgraph": working_json,
-            "subgraph_stats": working_stats,
-            # Backward-compatible / agent-friendly aliases
+            # === Backward/compat aliases (used by agent-side state printing) ===
             "working_subgraph": working_json,
-            "memory_subgraph": self.memory_subgraph.to_json_obj(),
+            "memory_subgraph": memory_json,
+            # short aliases
             "w": working_json,
-            "m": self.memory_subgraph.to_json_obj(),
+            "m": memory_json,
+            "subgraph_stats": working_stats,
             # 记忆图的统计信息（可选）
             "memory_stats": memory_stats,
             "text_memory": {"notes": (self.memory_text_store.get('session', limit=12) if self.memory_text_store else []), "count": (len(self.memory_text_store.get('session')) if self.memory_text_store else 0)},
