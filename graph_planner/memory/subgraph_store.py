@@ -101,6 +101,27 @@ class Subgraph:
         if step is not None and nid in self.nodes:
             self.nodes[nid]["gp_last_touched_step"] = int(step)
 
+    # -------- Protocol / backward-compat helpers --------
+    def iter_node_ids(self) -> Iterable[str]:
+        """Iterate node ids in the subgraph.
+
+        Many consumers treat Subgraph as a `SubgraphLike` protocol which
+        requires `iter_node_ids()`. Older versions used `node_ids` as the
+        recency cache; if it is present we prefer that order.
+        """
+        # Prefer recency order if available.
+        if self.node_ids:
+            for nid in list(self.node_ids):
+                if nid in self.nodes:
+                    yield nid
+            return
+        # Fallback: dictionary order.
+        yield from self.nodes.keys()
+
+    def contains(self, node_id: str) -> bool:
+        """Protocol helper: return True iff node_id exists in this subgraph."""
+        return str(node_id) in self.nodes
+
 
 @dataclass
 class WorkingSubgraph(Subgraph):
