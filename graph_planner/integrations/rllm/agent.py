@@ -224,6 +224,25 @@ def _safe_json(obj: Any) -> str:
         return repr(obj)
 
 
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    """Best-effort int parsing for env/config values."""
+    if x is None:
+        return int(default)
+    try:
+        # Accept strings like "120" or "120.0"
+        if isinstance(x, str):
+            s = x.strip()
+            if s == "":
+                return int(default)
+            try:
+                return int(s)
+            except ValueError:
+                return int(float(s))
+        return int(x)
+    except Exception:
+        return int(default)
 def _truncate(s: str, n: int = 500) -> str:
     if s is None:
         return ""
