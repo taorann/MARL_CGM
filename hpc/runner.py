@@ -39,7 +39,12 @@ CURRENT_IMAGE: Optional[str] = None
 CURRENT_SIF: Optional[str] = None
 CURRENT_BOUND_AT: Optional[float] = None
 
+# last time this runner received any request (used to reap orphan instances)
+LAST_REQ_AT: Optional[float] = None
+
 LOCK_TTL_SEC = float(os.environ.get("RUNNER_LOCK_TTL_SEC", "7200"))  # 2h 默认
+ORPHAN_TTL_SEC = float(os.environ.get("RUNNER_ORPHAN_TTL_SEC", "1800"))  # 30min: no requests -> auto stop
+INSTANCE_CHECK_SEC = float(os.environ.get("RUNNER_INSTANCE_CHECK_SEC", "30"))  # check instance liveness
 
 
 def _ensure_dir(p: Path) -> None:
@@ -67,6 +72,8 @@ def _write_heartbeat(extra: Optional[Dict[str, Any]] = None) -> None:
         "current_image": CURRENT_IMAGE,
         "instance": INSTANCE_NAME,
         "bound_at": CURRENT_BOUND_AT,
+        "last_req_at": LAST_REQ_AT,
+        "orphan_ttl_sec": ORPHAN_TTL_SEC,
     }
     if extra:
         meta.update(extra)
@@ -160,12 +167,40 @@ def main() -> None:
     _write_heartbeat()
 
     last_hb = 0.0
+    last_instance_check = 0.0
     while True:
         now = _now()
         if now - last_hb >= 2.0:
-            # stale lock auto-heal：锁过期且 instance 不在了
-            if CURRENT_RUN_ID and _is_lock_stale() and (not _instance_exists()):
-                _clear_lock("stale_lock_instance_missing")
+            # If the instance disappeared for any reason, clear the lock quickly.
+            # We don't want 'busy' runners with no instance.
+            try:
+                if CURRENT_RUN_ID:
+                    # Liveness check is relatively expensive; do it less frequently.
+                    if (now - last_instance_check) >= float(INSTANCE_CHECK_SEC):
+                        if not _instance_exists():
+                            _clear_lock('instance_missing')
+                        last_instance_check = now
+            except Exception:
+                pass
+
+            # Orphan reaper: if no requests for a long time, stop the instance and free the runner.
+            try:
+                if CURRENT_RUN_ID and ORPHAN_TTL_SEC > 0 and LAST_REQ_AT is not None:
+                    if (now - float(LAST_REQ_AT)) > float(ORPHAN_TTL_SEC):
+                        # Best-effort stop; regardless of return code, clear lock if instance is gone.
+                        try:
+                            subprocess.run([APPTAINER_BIN, 'instance', 'stop', INSTANCE_NAME],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+                        except Exception:
+                            pass
+                        if not _instance_exists():
+                            _clear_lock('orphan_ttl_stop')
+                        else:
+                            _write_heartbeat({'orphan_ttl_stop': 'attempted'})
+            except Exception:
+                pass
+
+            # Periodic heartbeat
             _write_heartbeat()
             last_hb = now
 
@@ -188,7 +223,9 @@ def handle_one_request(req_path: Path, outbox: Path) -> None:
     try:
         data: Dict[str, Any] = json.loads(req_path.read_text(encoding="utf-8"))
         req = QueueRequest(**data)
-        _write_heartbeat({"last_req_id": req.req_id, "type": req.type, "seen_run_id": req.run_id})
+        global LAST_REQ_AT
+        LAST_REQ_AT = _now()
+        _write_heartbeat({"last_req_id": req.req_id, "type": req.type, "seen_run_id": req.run_id, "last_req_at": LAST_REQ_AT})
 
         if req.type == "exec":
             resp = handle_exec(req)
