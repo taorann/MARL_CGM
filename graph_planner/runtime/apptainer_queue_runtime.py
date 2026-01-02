@@ -288,6 +288,47 @@ class ApptainerQueueRuntime:
             parts.append(f"rid={rid}: {state} age={age:.1f}s current_run_id={cur!r}")
         return "; ".join(parts)
 
+    
+    def choose_runner(self, run_id: str, image: Optional[str] = None, wait_sec: Optional[float] = None) -> int:
+        """Public runner selection API used by swe_proxy.
+
+        IMPORTANT: `swe_proxy.py` is typically invoked as a short-lived process for EACH request.
+        Therefore, we CANNOT rely on in-process state to keep a stable (run_id -> runner_id) mapping
+        across calls.
+
+        Routing rules (in order):
+        1) If any *alive* runner heartbeat reports current_run_id == run_id, route to that runner.
+           (This makes instance_exec/instance_stop work across independent swe_proxy invocations.)
+        2) If this process already has a cached mapping, route consistently (prefer alive).
+        3) Otherwise, pick an *idle* alive runner for a new run_id and wait up to `wait_sec` if none are ready.
+
+        The optional `image` is currently only used for debug / future extensions.
+        """
+
+        # (1) Prefer the runner that is already bound to this run_id (from heartbeat), even if it's busy.
+        try:
+            for rid in self._alive_runner_ids():
+                hb = self._read_heartbeat(rid)
+                cur = (hb or {}).get('current_run_id')
+                if cur is not None and str(cur) == str(run_id):
+                    self._run_to_runner[str(run_id)] = int(rid)
+                    return int(rid)
+        except Exception:
+            # Don't fail routing due to heartbeat parse issues; fall back to other strategies.
+            pass
+
+        # (2) If we've already bound run_id -> runner_id in this process, route consistently.
+        if self._run_to_runner.get(str(run_id)) is not None:
+            return self._choose_runner(str(run_id))
+
+        # (3) New run_id: wait for an idle runner.
+        w = wait_sec
+        if w is None:
+            try:
+                w = float(os.environ.get('GP_RUNNER_WAIT_SEC', '') or 0.0) or float(self.default_timeout_sec)
+            except Exception:
+                w = float(self.default_timeout_sec)
+        return self._choose_runner_for_start(str(run_id), float(w))
     def _choose_runner_for_start(self, run_id: str, wait_sec: float) -> int:
         """Choose an *idle* alive runner for a new instance_start. Wait if all busy or not yet alive."""
         # Sticky mapping: if we've already chosen a runner for this run_id, keep it.
