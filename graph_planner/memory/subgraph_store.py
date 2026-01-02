@@ -67,6 +67,32 @@ class Subgraph:
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(str(node_id))
 
+    # ---- Protocol helpers (GraphPlanner SubgraphLike) ----
+    def iter_node_ids(self) -> Iterable[str]:
+        """Iterate node ids in recency/order.
+
+        Several downstream modules treat subgraphs as "SubgraphLike" and expect
+        this method to exist (e.g., mem_candidates). We implement it on the base
+        container so both repo_graph and working/memory graphs satisfy the
+        protocol.
+        """
+
+        # Prefer stable recency list when available.
+        if isinstance(self.node_ids, list) and self.node_ids:
+            for nid in list(self.node_ids):
+                if nid in self.nodes:
+                    yield nid
+            # Include any nodes not present in node_ids (should be rare).
+            for nid in self.nodes.keys():
+                if nid not in set(self.node_ids):
+                    yield nid
+            return
+        for nid in self.nodes.keys():
+            yield nid
+
+    def contains(self, node_id: str) -> bool:
+        return str(node_id) in self.nodes
+
     def add_node(self, node: Node) -> None:
         nid = _node_id(node)
         if not nid:
@@ -100,27 +126,6 @@ class Subgraph:
         self.node_ids.append(nid)
         if step is not None and nid in self.nodes:
             self.nodes[nid]["gp_last_touched_step"] = int(step)
-
-    # -------- Protocol / backward-compat helpers --------
-    def iter_node_ids(self) -> Iterable[str]:
-        """Iterate node ids in the subgraph.
-
-        Many consumers treat Subgraph as a `SubgraphLike` protocol which
-        requires `iter_node_ids()`. Older versions used `node_ids` as the
-        recency cache; if it is present we prefer that order.
-        """
-        # Prefer recency order if available.
-        if self.node_ids:
-            for nid in list(self.node_ids):
-                if nid in self.nodes:
-                    yield nid
-            return
-        # Fallback: dictionary order.
-        yield from self.nodes.keys()
-
-    def contains(self, node_id: str) -> bool:
-        """Protocol helper: return True iff node_id exists in this subgraph."""
-        return str(node_id) in self.nodes
 
 
 @dataclass
