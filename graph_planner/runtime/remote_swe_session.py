@@ -197,10 +197,31 @@ class RemoteSweSession:
             f"rc={rc} dt={dt:.2f}s stdout_bytes={len(stdout_bytes)} stderr_bytes={len(stderr_bytes)}"
         )
 
+        # NOTE: swe_proxy prints a JSON object to stdout even on failure and exits
+        # non-zero. We should attempt to decode stdout to surface the real error.
+        raw = stdout_bytes.decode("utf-8", errors="replace")
+        parsed: Any = None
+        try:
+            parsed = json.loads(raw) if raw.strip() else None
+        except Exception:
+            parsed = None
+
         if rc != 0:
+            stderr_txt = stderr_bytes.decode("utf-8", errors="ignore")
+            if isinstance(parsed, dict):
+                # Common keys used by swe_proxy.
+                proxy_err = parsed.get("error") or parsed.get("stderr") or parsed.get("err")
+                proxy_rc = parsed.get("returncode") or parsed.get("rc") or rc
+                raise RuntimeError(
+                    "Remote swe_proxy failed. "
+                    f"ssh_rc={rc} proxy_rc={proxy_rc} proxy_error={proxy_err!r} "
+                    f"proxy_resp={parsed!r} remote_stderr={stderr_txt!r}"
+                )
+            # No JSON => include stdout/stderr previews.
+            stdout_preview = raw[:2000]
             raise RuntimeError(
-                f"Remote swe_proxy failed (rc={rc}). "
-                f"stderr={stderr_bytes.decode('utf-8', errors='ignore')}"
+                "Remote swe_proxy failed. "
+                f"ssh_rc={rc} stdout={stdout_preview!r} remote_stderr={stderr_txt!r}"
             )
 
         # Forward remote stderr to local log when DEBUG is on (runner/proxy writes progress there).
@@ -208,9 +229,9 @@ class RemoteSweSession:
             stderr_preview = stderr_bytes.decode("utf-8", errors="ignore")
             print("[remote_swe_session][remote_stderr]" + stderr_preview, file=sys.stderr)
 
-        raw = stdout_bytes.decode("utf-8", errors="replace")
+        # Decode response (stdout must be a single JSON object).
         try:
-            resp = json.loads(raw)
+            resp = parsed if parsed is not None else json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
                 f"Failed to decode swe_proxy JSON response. stdout={stdout_bytes!r}"
