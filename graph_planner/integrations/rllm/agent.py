@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pydantic import BaseModel
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ...core.actions import ActionUnion
@@ -393,6 +394,11 @@ class _StepState:
     model_response: str | None = None
     action: Dict[str, Any] | None = None
 
+class ActionResult(BaseModel):
+    """Wrapper returned to rLLM so the engine can access `.action`."""
+    action: ActionUnion
+
+
 
 class GraphPlannerRLLMAgent(BaseAgent):
     """GraphPlanner decision agent for rLLM."""
@@ -486,7 +492,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
         """Full dialogue history for the engine (OpenAI chat format)."""
         return list(self._messages)
 
-    def update_from_model(self, model_response: str) -> ActionUnion:
+    def update_from_model(self, model_response: str) -> ActionResult:
         # Record model response.
         if self._steps:
             self._steps[-1].model_response = model_response
@@ -560,7 +566,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
             print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
 
         telemetry_mod.emit_event("planner_action", {"action": action})
-        return action  # ActionUnion is a typing.Union; return the concrete action instance
+        return ActionResult(action=action)
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
@@ -613,6 +619,20 @@ try:  # pragma: no cover
             try:
                 return await super().run_agent_trajectory_async(idx, application_id, seed=seed, mode=mode, **kwargs)
             finally:
+                # Best-effort resource cleanup: always close the env bound to this runner.
+                # This ensures remote containers are stopped even if the trajectory crashes.
+                try:
+                    envs = getattr(self, "envs", None) or getattr(self, "environments", None)
+                    env = None
+                    if isinstance(envs, (list, tuple)) and 0 <= int(idx) < len(envs):
+                        env = envs[int(idx)]
+                    else:
+                        env = getattr(self, "env", None)
+                    close = getattr(env, "close", None) if env is not None else None
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
                 _CURRENT_AGENT.reset(token)
 
         async def _get_openai_async(self, prompt, _, **kwargs):
