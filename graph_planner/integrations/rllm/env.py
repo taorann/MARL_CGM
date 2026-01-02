@@ -43,15 +43,11 @@ else:
     class GraphPlannerRLLMEnv(BaseEnv):
         """Adapter that exposes :class:`PlannerEnv` through the rLLM ``BaseEnv`` API."""
 
-        # Default episode budget. Many SWE-bench style tasks require >10 steps
-        # even before calling repair/submit (find → expand → memory → ...).
-        DEFAULT_MAX_STEPS: int = 60
-
         def __init__(
             self,
             entry: Dict[str, Any],
             *,
-            max_steps: int = DEFAULT_MAX_STEPS,
+            max_steps: int = 8,
             reward_scale: float | None = None,
             failure_penalty: float | None = None,
             step_penalty: float | None = None,
@@ -61,38 +57,19 @@ else:
             synthesis_strategy: str | None = None,
         ) -> None:
             self.entry = deepcopy(entry)
-
-            # --- max_steps resolution ---
-            # Priority:
-            #   1) env override (GP_MAX_STEPS / GRAPH_PLANNER_MAX_STEPS)
-            #   2) explicit constructor arg
-            #   3) entry['max_steps']
-            # And we clamp to at least DEFAULT_MAX_STEPS unless env override is set.
-            env_override = os.environ.get("GP_MAX_STEPS") or os.environ.get(
-                "GRAPH_PLANNER_MAX_STEPS"
-            )
-            entry_steps = entry.get("max_steps")
-            if env_override is not None:
-                raw_steps = env_override
-            else:
-                # If the dataset/entry requests a larger budget than the default
-                # constructor arg, honour the larger value.
-                raw_steps = max_steps
-                try:
-                    if entry_steps is not None and int(entry_steps) > int(max_steps):
-                        raw_steps = entry_steps
-                except Exception:
-                    pass
+            # IMPORTANT:
+            # The evaluation script passes `max_steps` via env_args (CLI/YAML), and
+            # that value should be the *source of truth*. Some SWE-bench datasets
+            # also embed a per-task `max_steps` field; if we always prefer the
+            # entry field, the CLI/YAML setting becomes ineffective and we can
+            # terminate unexpectedly early (e.g. always stopping at 5 steps).
+            #
+            # Therefore: prefer the explicit argument, and only fall back to the
+            # entry field when the caller did not specify a value.
             try:
-                resolved = int(raw_steps)  # type: ignore[arg-type]
+                self.max_steps = int(max_steps)
             except Exception:
-                try:
-                    resolved = int(entry_steps) if entry_steps is not None else int(self.DEFAULT_MAX_STEPS)
-                except Exception:
-                    resolved = int(self.DEFAULT_MAX_STEPS)
-            if env_override is None and resolved < int(self.DEFAULT_MAX_STEPS):
-                resolved = int(self.DEFAULT_MAX_STEPS)
-            self.max_steps = int(resolved)
+                self.max_steps = int(entry.get("max_steps", 8))
             base_reward_scale = float(entry.get("reward_scale", 1.0))
             self.reward_scale = float(
                 reward_scale if reward_scale is not None else base_reward_scale
@@ -145,6 +122,13 @@ else:
         def reset(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             self.close()
             self._planner = self._spawn_planner()
+            if bool(os.environ.get("DEBUG_ACTION_RESULT")):
+                try:
+                    print(
+                        f"[gp-env] reset: max_steps={self.max_steps} entry.max_steps={self.entry.get('max_steps')} issue_uid={self._issue_uid}"
+                    )
+                except Exception:
+                    pass
             try:
                 observation = self._planner.reset()
             except Exception:
@@ -270,7 +254,11 @@ else:
                 extra_payload = json.loads(raw_entry)
             else:
                 extra_payload = extra_info
-            max_steps = int(extra_payload.get("max_steps", GraphPlannerRLLMEnv.DEFAULT_MAX_STEPS))
+            # Prefer the wrapper/env args (if present) over the embedded entry.
+            if isinstance(extra_info, dict) and "max_steps" in extra_info:
+                max_steps = int(extra_info.get("max_steps") or 0) or 8
+            else:
+                max_steps = int(extra_payload.get("max_steps", 8))
             return GraphPlannerRLLMEnv(entry=extra_payload, max_steps=max_steps, **env_kwargs)
 
         # ------------------------------------------------------------------
@@ -315,17 +303,11 @@ else:
                 self._issue_uid,
             ]
             issue["id"] = "__".join([p for p in parts if p]) or self._issue_uid
+            # Keep PlannerEnv and the wrapper aligned on termination conditions.
+            issue["max_steps"] = int(self.max_steps)
             # Ensure remote_swe instance isolation: prefer explicit run_id when available.
             # Fallback: ensure run_id exists and is unique per trajectory.
             issue.setdefault("run_id", issue["id"])
-
-            # Propagate episode budget to the lower-level PlannerEnv as well.
-            # (PlannerEnv also has its own max_steps budget; keeping them aligned
-            #  makes logs/telemetry consistent.)
-            try:
-                issue["max_steps"] = int(self.max_steps)
-            except Exception:
-                issue["max_steps"] = self.DEFAULT_MAX_STEPS
             return issue
 
         @property
