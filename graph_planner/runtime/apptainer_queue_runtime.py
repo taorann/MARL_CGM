@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import json
+import sys
 import time
 import uuid
-import re
 from pathlib import Path
 from typing import Dict, List, Optional, Mapping
 
@@ -34,95 +34,11 @@ class ApptainerQueueRuntime:
         self.default_timeout_sec = float(default_timeout_sec)
         self.poll_interval_sec = float(poll_interval_sec)
         self.max_stdout_bytes = int(max_stdout_bytes)
-
-        # Best-effort runner scheduling state. This is purely an optimization
-        # to reduce "runner busy" errors when num_runners>1.
-        #
-        # _job_to_runner maps a stable job signature (task_id + image) to a
-        # runner id so subsequent starts can reuse the same instance.
-        self._job_to_runner: Dict[str, int] = {}
         self._run_to_runner: Dict[str, int] = {}
-        self._run_to_job_sig: Dict[str, str] = {}
 
         # Runner liveness / startup waiting (for remote_swe).
         self.heartbeat_ttl_sec = float(os.environ.get("GP_RUNNER_HEARTBEAT_TTL_SEC", "180"))
         self.wait_for_runners_sec = float(os.environ.get("GP_WAIT_FOR_RUNNERS_SEC", "60"))
-
-    def _parse_task_id(self, run_id: str) -> Optional[str]:
-        """Extract task_id from a GraphPlanner run_id.
-
-        Expected: gp-<task_id>__<32-hex>. Returns None if unknown.
-        """
-        m = re.match(r"^gp-(.+)__[0-9a-f]{32}$", run_id)
-        if not m:
-            return None
-        return m.group(1)
-
-    def _runner_heartbeat_path(self, runner_id: int) -> Path:
-        return self.queue_root / f"runner-{runner_id}" / "heartbeat.json"
-
-    def _read_runner_heartbeat(self, runner_id: int) -> Optional[Mapping[str, object]]:
-        path = self._runner_heartbeat_path(runner_id)
-        try:
-            if not path.exists():
-                return None
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
-    def choose_runner(self, run_id: str, *, image: Optional[str] = None) -> int:
-        """Choose a runner for this (run_id, image) pair.
-
-        Priority:
-          1) cached mapping for same (task_id, image)
-          2) reuse an already-running instance with same (task_id, image)
-          3) any free runner (current_run_id is None)
-          4) fallback deterministic hash (old behavior)
-        """
-        alive = self._alive_runner_ids()
-        if not alive:
-            # No heartbeat => pick runner 0 (will likely fail fast elsewhere)
-            return 0
-
-        if image:
-            task_id = self._parse_task_id(run_id) or ""
-            job_key = f"{task_id}::{image}"
-
-            cached = self._job_to_runner.get(job_key)
-            if cached is not None and cached in alive:
-                self._run_to_runner[run_id] = cached
-                return cached
-
-            # Reuse: find a runner already hosting the same task+image.
-            for rid in alive:
-                hb = self._read_runner_heartbeat(rid) or {}
-                if (
-                    hb.get("current_task_id") == task_id
-                    and hb.get("current_image") == image
-                    and hb.get("current_run_id")
-                ):
-                    self._job_to_runner[job_key] = rid
-                    self._run_to_runner[run_id] = rid
-                    return rid
-
-            # Free runner: pick the first idle.
-            for rid in alive:
-                hb = self._read_runner_heartbeat(rid) or {}
-                if hb.get("current_run_id") in (None, "", 0):
-                    self._job_to_runner[job_key] = rid
-                    self._run_to_runner[run_id] = rid
-                    return rid
-
-            # Fallback: stable hash on job_key (better than run_id hash).
-            chosen = alive[hash(job_key) % len(alive)]
-            self._job_to_runner[job_key] = chosen
-            self._run_to_runner[run_id] = chosen
-            return chosen
-
-        # No image => fallback to previous behavior, but keep run mapping.
-        chosen = self._choose_runner(run_id)
-        self._run_to_runner[run_id] = chosen
-        return chosen
     # ----------------------
     # 一次性容器（原有接口）
     # ----------------------
@@ -137,7 +53,7 @@ class ApptainerQueueRuntime:
         timeout_sec: Optional[float] = None,
         meta: Optional[Dict[str, str]] = None,
     ) -> ExecResult:
-        runner_id = self.choose_runner(run_id, image=image)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -172,7 +88,7 @@ class ApptainerQueueRuntime:
         启动一个 Apptainer instance（每条轨迹一个），run_id 用来标识 instance。
         对应 runner 里的 handle_instance_start。
         """
-        runner_id = self.choose_runner(run_id, image=image)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -205,7 +121,7 @@ class ApptainerQueueRuntime:
         在已启动的 instance 中执行一条命令（多步交互）。
         对应 runner 里的 handle_instance_exec。
         """
-        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         sif_path = self._image_to_sif(docker_image)
         req = QueueRequest(
             req_id=self._new_req_id(),
@@ -236,7 +152,7 @@ class ApptainerQueueRuntime:
         停止一个 instance（轨迹结束）。
         对应 runner 里的 handle_instance_stop。
         """
-        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -257,7 +173,7 @@ class ApptainerQueueRuntime:
     # 文件 put/get & cleanup（原有逻辑）
     # ----------------------
     def put_file(self, *, run_id: str, src: Path, dst: Path, meta: Optional[Dict[str, str]] = None) -> None:
-        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -270,7 +186,7 @@ class ApptainerQueueRuntime:
         self._roundtrip(req)
 
     def get_file(self, *, run_id: str, src: Path, dst: Path, meta: Optional[Dict[str, str]] = None) -> None:
-        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -283,7 +199,7 @@ class ApptainerQueueRuntime:
         self._roundtrip(req)
 
     def cleanup_run(self, run_id: str) -> None:
-        runner_id = self._run_to_runner.get(run_id) or self._choose_runner(run_id)
+        runner_id = self._choose_runner_for_start(run_id, float(timeout_sec or self.default_timeout_sec))
         req = QueueRequest(
             req_id=self._new_req_id(),
             runner_id=runner_id,
@@ -315,7 +231,101 @@ class ApptainerQueueRuntime:
                 ts = hp.stat().st_mtime
             if now - ts <= float(self.heartbeat_ttl_sec):
                 alive.append(rid)
-        return alive
+        re
+    def _read_heartbeat(self, rid: int) -> Optional[Dict[str, object]]:
+        """Read runner heartbeat metadata if present."""
+        hp = self._heartbeat_path(rid)
+        if not hp.exists():
+            return None
+        try:
+            data = json.loads(hp.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    def _runner_is_alive(self, hb: Optional[Dict[str, object]]) -> bool:
+        if not hb:
+            return False
+        try:
+            ts = float(hb.get("ts", 0.0) or 0.0)
+        except Exception:
+            return False
+        return (time.time() - ts) <= float(self.heartbeat_ttl_sec)
+
+    def _runner_is_idle(self, hb: Optional[Dict[str, object]]) -> bool:
+        if not self._runner_is_alive(hb):
+            return False
+        # busy if bound to a run_id
+        cur = hb.get("current_run_id")
+        return (cur is None) or (str(cur).strip() == "")
+
+    def _idle_runner_ids(self) -> List[int]:
+        idle: List[int] = []
+        for rid in self._alive_runner_ids():
+            hb = self._read_heartbeat(rid)
+            if self._runner_is_idle(hb):
+                idle.append(rid)
+        return idle
+
+    def _format_runner_status(self) -> str:
+        """Human-friendly summary for debugging / timeout errors."""
+        parts: List[str] = []
+        now = time.time()
+        for rid in range(max(int(self.num_runners), 1)):
+            hb = self._read_heartbeat(rid)
+            if not hb:
+                parts.append(f"rid={rid}: no_heartbeat")
+                continue
+            try:
+                age = now - float(hb.get("ts", 0.0) or 0.0)
+            except Exception:
+                age = float("inf")
+            cur = hb.get("current_run_id")
+            state = "idle" if self._runner_is_idle(hb) else ("busy" if self._runner_is_alive(hb) else "stale")
+            parts.append(f"rid={rid}: {state} age={age:.1f}s current_run_id={cur!r}")
+        return "; ".join(parts)
+
+    def _choose_runner_for_start(self, run_id: str, wait_sec: float) -> int:
+        """Choose an *idle* alive runner for a new instance_start. Wait if all busy or not yet alive."""
+        # Sticky mapping: if we've already chosen a runner for this run_id, keep it.
+        rid0 = self._run_to_runner.get(run_id)
+        if rid0 is not None:
+            try:
+                rid_int = int(rid0)
+                hb0 = self._read_heartbeat(rid_int)
+                if self._runner_is_idle(hb0):
+                    return rid_int
+            except Exception:
+                pass
+
+        fail_fast = os.environ.get("GP_FAIL_IF_NO_RUNNERS", "").strip().lower() in {"1", "true", "yes"}
+        poll_sec = float(os.environ.get("GP_RUNNER_POLL_SEC", "1.0") or 1.0)
+        progress_sec = float(os.environ.get("GP_QUEUE_PROGRESS_SEC", "10.0") or 10.0)
+
+        t0 = time.time()
+        last_log = 0.0
+        while True:
+            idle = self._idle_runner_ids()
+            if idle:
+                new_rid = int(idle[hash(run_id) % len(idle)])
+                self._run_to_runner[run_id] = new_rid
+                return new_rid
+
+            if fail_fast:
+                raise RuntimeError("No idle runners available. " + self._format_runner_status())
+
+            now = time.time()
+            if now - t0 >= float(wait_sec):
+                raise RuntimeError("Timed out waiting for an idle runner. " + self._format_runner_status())
+
+            if now - last_log >= progress_sec:
+                # IMPORTANT: write to stderr; proxy stdout must remain pure JSON.
+                print(f"[queue] waiting for idle runner... {self._format_runner_status()}", file=sys.stderr)
+                last_log = now
+
+            time.sleep(poll_sec)
 
     def _maybe_reroute_to_alive(self, req: QueueRequest) -> None:
         """If there are alive runners and req.runner_id is not one of them, reroute."""
@@ -323,8 +333,6 @@ class ApptainerQueueRuntime:
         if not alive:
             # optionally wait a bit for runners to come up, to avoid 15min 'start' hangs
             if float(self.wait_for_runners_sec) <= 0:
-                if os.environ.get("GP_FAIL_IF_NO_RUNNERS", "").strip().lower() in {"1", "true", "yes"}:
-                    raise RuntimeError("No alive runners detected (heartbeat missing/stale).")
                 return
             deadline = time.time() + float(self.wait_for_runners_sec)
             while time.time() < deadline:
@@ -333,8 +341,6 @@ class ApptainerQueueRuntime:
                 if alive:
                     break
             if not alive:
-                if os.environ.get("GP_FAIL_IF_NO_RUNNERS", "").strip().lower() in {"1", "true", "yes"}:
-                    raise RuntimeError("No alive runners detected after waiting.")
                 return
 
         if int(req.runner_id) in alive:
