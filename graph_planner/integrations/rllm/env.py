@@ -110,7 +110,14 @@ else:
         def reset(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             self.close()
             self._planner = self._spawn_planner()
-            observation = self._planner.reset()
+            try:
+                observation = self._planner.reset()
+            except Exception:
+                # Ensure remote_swe instances are stopped if reset fails mid-flight.
+                try:
+                    self.close()
+                finally:
+                    raise
             self._last_observation = observation
             self._step_count = 0
             info = {
@@ -141,7 +148,14 @@ else:
         def step(self, action: Any) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
             if self._planner is None:
                 raise RuntimeError("Environment has not been reset before step().")
-            observation, reward, done, info = self._planner.step(action)
+            try:
+                observation, reward, done, info = self._planner.step(action)
+            except Exception:
+                # If a step raises, tear down the planner to free remote resources.
+                try:
+                    self.close()
+                finally:
+                    raise
             info = info or {}
             info.setdefault("max_steps", self.max_steps)
             self._last_observation = observation
