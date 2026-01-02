@@ -100,13 +100,21 @@ class RemoteSweSession:
 
         t0 = time.perf_counter()
         payload_bytes = json.dumps(payload).encode("utf-8")
+
         proc = subprocess.Popen(
             self._build_ssh_cmd(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        assert proc.stdin is not None and proc2.stdout is not None and proc2.stderr is not None
+
+        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError("Failed to spawn ssh process with stdio pipes")
+
         try:
             proc.stdin.write(payload_bytes)
             proc.stdin.close()
@@ -118,7 +126,7 @@ class RemoteSweSession:
             raise
 
         # Stream remote stderr so long waits are visible (queue wait, Slurm pending, etc).
-        stream_stdio = os.environ.get("GP_PRINT_REMOTE_STDIO", "").strip().lower() in {"1","true","yes"}
+        stream_stdio = os.environ.get("GP_PRINT_REMOTE_STDIO", "").strip().lower() in {"1", "true", "yes"}
         hb_sec = float(os.environ.get("GP_SSH_HEARTBEAT_SEC", "0") or 0.0)
         last_hb = time.time()
         stderr_chunks: List[bytes] = []
@@ -126,10 +134,14 @@ class RemoteSweSession:
         # We intentionally *don't* stream stdout; it must remain a single JSON object.
         while True:
             # Check for remote stderr output.
-            r, _, _ = select.select([proc2.stderr], [], [], 0.2)
+            try:
+                r, _, _ = select.select([proc.stderr], [], [], 0.2)
+            except Exception:
+                r = []
+
             if r:
                 try:
-                    chunk = os.read(proc2.stderr.fileno(), 4096)
+                    chunk = os.read(proc.stderr.fileno(), 4096)
                 except Exception:
                     chunk = b""
                 if chunk:
@@ -160,11 +172,11 @@ class RemoteSweSession:
 
         # Drain remaining streams.
         try:
-            stdout_bytes = proc2.stdout.read() or b""
+            stdout_bytes = proc.stdout.read() or b""
         except Exception:
             stdout_bytes = b""
         try:
-            rest = proc2.stderr.read() or b""
+            rest = proc.stderr.read() or b""
             if rest:
                 stderr_chunks.append(rest)
                 if stream_stdio:
@@ -176,33 +188,32 @@ class RemoteSweSession:
         except Exception:
             pass
 
-        class _Proc:
-            returncode: int = int(proc2.returncode or 0)
-            stdout: bytes = stdout_bytes
-            stderr: bytes = b"".join(stderr_chunks)
-
-        proc2 = _Proc()
+        stderr_bytes = b"".join(stderr_chunks)
         dt = time.perf_counter() - t0
+        rc = int(proc.returncode or 0)
 
         _dbg(
             f"done op={payload.get('op')!r} run_id={payload.get('run_id')!r} "
-            f"rc={proc2.returncode} dt={dt:.2f}s stdout_bytes={len(proc2.stdout)} stderr_bytes={len(proc2.stderr)}"
+            f"rc={rc} dt={dt:.2f}s stdout_bytes={len(stdout_bytes)} stderr_bytes={len(stderr_bytes)}"
         )
-        if proc2.returncode != 0:
+
+        if rc != 0:
             raise RuntimeError(
-                f"Remote swe_proxy failed (rc={proc2.returncode}). "
-                f"stderr={proc2.stderr.decode('utf-8', errors='ignore')}"
+                f"Remote swe_proxy failed (rc={rc}). "
+                f"stderr={stderr_bytes.decode('utf-8', errors='ignore')}"
             )
+
         # Forward remote stderr to local log when DEBUG is on (runner/proxy writes progress there).
-        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and proc2.stderr:
-            stderr_preview = proc2.stderr.decode("utf-8", errors="ignore")
+        if (os.environ.get("DEBUG") or os.environ.get("EBUG")) and stderr_bytes:
+            stderr_preview = stderr_bytes.decode("utf-8", errors="ignore")
             print("[remote_swe_session][remote_stderr]" + stderr_preview, file=sys.stderr)
-        raw = proc2.stdout.decode("utf-8", errors="replace")
+
+        raw = stdout_bytes.decode("utf-8", errors="replace")
         try:
             resp = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f"Failed to decode swe_proxy JSON response. stdout={proc2.stdout!r}"
+                f"Failed to decode swe_proxy JSON response. stdout={stdout_bytes!r}"
             ) from exc
 
         # Normalize keys across proxy versions.
@@ -219,15 +230,15 @@ class RemoteSweSession:
 
             ok = resp.get("ok", True)
             try:
-                rc = int(resp.get("returncode") or 0)
+                resp_rc = int(resp.get("returncode") or 0)
             except Exception:
-                rc = 0
-            if ok is False and rc == 0:
-                rc = 1
-                resp["returncode"] = rc
+                resp_rc = 0
+            if ok is False and resp_rc == 0:
+                resp_rc = 1
+                resp["returncode"] = resp_rc
 
             # Print a short preview on failures (or when explicitly enabled).
-            if os.environ.get("GP_PRINT_REMOTE_STDIO") or (ok is False or rc != 0):
+            if os.environ.get("GP_PRINT_REMOTE_STDIO") or (ok is False or resp_rc != 0):
                 try:
                     op = str(payload.get("op") or "")
                     stdout_preview = (resp.get("stdout") or "")
@@ -238,7 +249,8 @@ class RemoteSweSession:
                         stderr_preview = "\n".join([str(x) for x in stderr_preview[:60]])
                     if stdout_preview:
                         print(
-                            "[remote_swe_session][proxy_stdout]\n" + _summarize_stdout(op, str(stdout_preview), max_chars=2000),
+                            "[remote_swe_session][proxy_stdout]\n"
+                            + _summarize_stdout(op, str(stdout_preview), max_chars=2000),
                             file=sys.stderr,
                         )
                     if stderr_preview:
@@ -268,10 +280,10 @@ class RemoteSweSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if proc2.returncode != 0:
+        if proc.returncode != 0:
             raise RuntimeError(
-                f"Remote ensure_runners failed (rc={proc2.returncode}). "
-                f"stderr={proc2.stderr.decode('utf-8', errors='ignore')}"
+                f"Remote ensure_runners failed (rc={proc.returncode}). "
+                f"stderr={proc.stderr.decode('utf-8', errors='ignore')}"
             )
         self._runners_ensured = True
 
