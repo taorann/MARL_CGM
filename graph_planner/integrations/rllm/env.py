@@ -183,7 +183,7 @@ else:
 
             reward = adjusted
             if done:
-                # Ensure remote_swe instances are stopped at the end of each trajectory.
+                # Best-effort cleanup: stop remote_swe instance at end of trajectory.
                 try:
                     self.close()
                 except Exception:
