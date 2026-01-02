@@ -35,6 +35,21 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ...core.actions import ActionUnion
+
+
+class _ActionResult:
+    """Minimal wrapper expected by rLLM engine.
+
+    rLLM's AgentExecutionEngine expects ``agent.update_from_model`` to return an
+    object with an ``.action`` attribute.
+
+    IMPORTANT: ``ActionUnion`` is a *typing alias* (``typing.Union[...]``), so
+    it cannot be instantiated. We therefore return this wrapper.
+    """
+
+    def __init__(self, action: ActionUnion):
+        self.action = action
+
 from ...agents.common.chat import summarise_observation
 from ...agents.common.contracts import (
     PLANNER_CONTRACT,
@@ -57,20 +72,6 @@ except Exception:  # pragma: no cover
             "Cannot import BaseAgent from rllm (tried rllm.agents.agent and rllm.rllm.agents.agent). "
             "Your rllm install layout is unexpected."
         ) from e
-
-
-@dataclass
-class _ActionResult:
-    """Minimal rLLM-compatible action wrapper.
-
-    Upstream rLLM's AgentExecutionEngine expects agent.update_from_model() to
-    return an object with an `.action` attribute. Some versions of this repo
-    model the internal action union via `typing.Union[...]`, which is *not*
-    instantiable. This wrapper keeps us compatible without depending on a
-    specific rLLM version.
-    """
-
-    action: Any
 
 
 
@@ -495,45 +496,45 @@ class GraphPlannerRLLMAgent(BaseAgent):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
 
-        # Optional step-state printing for interactive debugging.
-        if os.environ.get("GP_PRINT_STATE", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        # Verbose per-step state print: working/memory node ids + memorized marks.
+        # Enabled by default; set GP_PRINT_STATE=0 to turn off.
+        _ps = os.environ.get("GP_PRINT_STATE", "1").strip().lower()
+        if _ps not in {"0", "false", "no", "off"}:
             try:
-                step_idx = len(self._steps) - 1
-                kind = (info or {}).get("kind")
-                op = (info or {}).get("op")
-                obs = observation if isinstance(observation, dict) else {}
+                if not isinstance(observation, dict):
+                    return
+                ws = observation.get("working_subgraph") or observation.get("subgraph") or {}
+                ms = observation.get("memory_subgraph") or {}
+                w_nodes = []
+                m_nodes = []
+                if isinstance(ws, dict):
+                    w_nodes = ws.get("nodes") or []
+                elif isinstance(ws, list):
+                    w_nodes = ws
+                if isinstance(ms, dict):
+                    m_nodes = ms.get("nodes") or []
+                elif isinstance(ms, list):
+                    m_nodes = ms
 
-                def _node_ids(subgraph_obj: Any) -> List[str]:
-                    if isinstance(subgraph_obj, dict):
-                        if isinstance(subgraph_obj.get("node_ids"), list):
-                            return [str(x) for x in subgraph_obj.get("node_ids") or []]
-                        nodes = subgraph_obj.get("nodes")
-                        if isinstance(nodes, dict):
-                            return [str(k) for k in nodes.keys()]
-                    return []
+                m_ids = set()
+                for n in m_nodes:
+                    if isinstance(n, dict):
+                        m_ids.add(str(n.get("id") or ""))
+                    else:
+                        m_ids.add(str(n))
 
-                w_obj = obs.get("working_subgraph") or obs.get("w") or {}
-                m_obj = obs.get("memory_subgraph") or obs.get("m") or {}
-                w_ids = _node_ids(w_obj)
-                m_ids = _node_ids(m_obj)
-                m_set = set(m_ids)
-
-                print(f"[gp-state] step={step_idx} kind={kind} op={op} W={len(w_ids)} M={len(m_ids)}")
-
-                topn = _safe_int(os.environ.get("GP_PRINT_WORKING_TOPN"), default=20)
-                tail = w_ids[-topn:] if topn > 0 else []
-                if tail:
-                    fmt = [f"{'[M]' if nid in m_set else '[ ]'}{nid}" for nid in tail]
-                    print("[gp-state] W.tail=", ", ".join(fmt))
-
-                # Surface explore results if present.
-                cands = (info or {}).get("candidates")
-                if isinstance(cands, list) and cands:
-                    topk = _safe_int(os.environ.get("GP_PRINT_CANDIDATE_TOPK"), default=8)
-                    show = [str(x) for x in cands[: max(1, topk)]]
-                    print(f"[gp-state] candidates({len(cands)}):", ", ".join(show))
+                # Print a tail slice to keep logs manageable.
+                tail = w_nodes[-12:] if len(w_nodes) > 12 else w_nodes
+                out = []
+                for n in tail:
+                    if isinstance(n, dict):
+                        nid = str(n.get("id") or "")
+                    else:
+                        nid = str(n)
+                    mark = "[M]" if nid in m_ids else "[-]"
+                    out.append(f"{mark}{nid}")
+                print(f"[gp-agent] W(n={len(w_nodes)}) M(n={len(m_nodes)}) W.tail=" + ", ".join(out))
             except Exception:
-                # Never fail the run due to debug printing.
                 pass
 
     @property
@@ -541,7 +542,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
         """Full dialogue history for the engine (OpenAI chat format)."""
         return list(self._messages)
 
-    def update_from_model(self, model_response: str) -> Any:
+    def update_from_model(self, model_response: str) -> _ActionResult:
         # Record model response.
         if self._steps:
             self._steps[-1].model_response = model_response
@@ -582,7 +583,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
         if len(self._messages) >= 2 and isinstance(self._messages[1], dict):
             self._messages[1]["content"] = preamble
 
-        action: Any
+        action: Dict[str, Any]
         try:
             # 1) Preferred: tool wrapper JSON (produced by our engine).
             if wrapper_obj is not None:
@@ -614,12 +615,8 @@ class GraphPlannerRLLMAgent(BaseAgent):
         if bool(os.environ.get("DEBUG_ACTION_RESULT")):
             print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
 
-        # Telemetry should stay JSON-friendly even when `action` is a dataclass.
-        telemetry_mod.emit_event("planner_action", {"action": _safe_json(action)})
-
-        # rLLM expects an object with a `.action` attribute (engine does:
-        #   action = action.action
-        # ). Do NOT instantiate typing.Union aliases.
+        telemetry_mod.emit_event("planner_action", {"action": action})
+        # IMPORTANT: return a wrapper with `.action` for rLLM engine
         return _ActionResult(action=action)
 
     def get_current_state(self) -> Optional[_StepState]:
