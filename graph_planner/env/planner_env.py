@@ -546,6 +546,104 @@ class PlannerEnv:
     # ------------------------------------------------------------------
     # Explore / Memory
     # ------------------------------------------------------------------
+    def _canonicalize_node_id(self, raw_id: str) -> Optional[str]:
+        """Try to map a possibly-untyped node id to an actual repo-graph node id.
+
+        We accept ids that omit the leading node-type prefix (e.g., 'func:') and
+        try common prefixes. This fixes cases where the model copies the id
+        without the prefix.
+        """
+        if not isinstance(raw_id, str):
+            return None
+        rid = raw_id.strip()
+        if not rid:
+            return None
+
+        repo_nodes = getattr(self, "_repo_nodes_by_id", None) or {}
+
+        # Fast path
+        if rid in repo_nodes:
+            return rid
+
+        # If already typed but not found, try dropping the first type segment.
+        if ":" in rid:
+            base = rid.split(":", 1)[1]
+            if base in repo_nodes:
+                return base
+
+        # Common type prefixes used by our repo_graph builder.
+        prefixes = (
+            "func:",
+            "class:",
+            "method:",
+            "file:",
+            "var:",
+            "const:",
+            "type:",
+            "module:",
+        )
+        for p in prefixes:
+            cand = p + rid
+            if cand in repo_nodes:
+                return cand
+
+        # If ends with a numeric line suffix, try stripping it.
+        parts = rid.split(":")
+        if parts and parts[-1].isdigit():
+            base = ":".join(parts[:-1])
+            if base in repo_nodes:
+                return base
+            for p in prefixes:
+                cand = p + base
+                if cand in repo_nodes:
+                    return cand
+            if ":" in base:
+                base2 = base.split(":", 1)[1]
+                if base2 in repo_nodes:
+                    return base2
+                for p in prefixes:
+                    cand = p + base2
+                    if cand in repo_nodes:
+                        return cand
+
+        return None
+
+    def _canonicalize_anchors(self, anchors: Any, info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Normalize/repair anchor ids so expand can resolve them in repo_graph."""
+        if not anchors:
+            return []
+        out: List[Dict[str, Any]] = []
+        rewrites: List[Dict[str, str]] = []
+        dropped: List[str] = []
+
+        for a in anchors:
+            if isinstance(a, dict) and isinstance(a.get("id"), str):
+                raw_id = a["id"]
+                cid = self._canonicalize_node_id(raw_id)
+                if cid:
+                    if cid != raw_id:
+                        rewrites.append({"from": raw_id, "to": cid})
+                    out.append({"id": cid})
+                else:
+                    dropped.append(raw_id)
+            elif isinstance(a, dict):
+                # keep non-id anchors (kind/text) as-is
+                out.append(a)
+            elif isinstance(a, str):
+                cid = self._canonicalize_node_id(a)
+                if cid:
+                    rewrites.append({"from": a, "to": cid})
+                    out.append({"id": cid})
+                else:
+                    dropped.append(a)
+
+        if rewrites:
+            info["anchor_id_rewrite"] = rewrites
+        if dropped:
+            info["anchor_id_dropped"] = dropped
+
+        return out
+
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
         """
         实现 ExploreAction 的两个子操作：
@@ -569,6 +667,15 @@ class PlannerEnv:
         if not self.repo_graph:
             info["error"] = "missing-repo-graph"
             return info
+
+        # Repair/normalize anchors so that ids produced by the model (which may
+        # omit the node-type prefix like 'func:') can still resolve.
+        anchors = self._canonicalize_anchors(anchors, info=info)
+        # If anchors were provided but could not be resolved, fall back to the
+        # latest frontier anchor (typically the top-1 candidate from the last find).
+        if not anchors and getattr(self, "frontier_anchor_id", None):
+            anchors = [{"id": str(getattr(self, "frontier_anchor_id"))}]
+            info["anchors_fallback_to_frontier"] = True
 
         # 数量预算：兼容旧字段 limit，同时支持 total_limit/max_per_anchor/dir_diversity_k
         total_limit = _safe_int(getattr(act, "total_limit", None) or act.limit or 32, 32)
@@ -621,6 +728,15 @@ class PlannerEnv:
             # Expose candidates to the agent, but do NOT mutate working_subgraph.
             # The planner should explicitly select an anchor via explore_expand.
             self.last_candidates = candidates
+            # Remember the top-1 candidate as frontier, so a later expand can
+            # fall back to it when the model provides an unresolved anchor id.
+            try:
+                if candidates and isinstance(candidates[0], dict) and isinstance(candidates[0].get("id"), str):
+                    self.frontier_anchor_id = candidates[0]["id"]
+                    info["frontier_anchor_id"] = self.frontier_anchor_id
+            except Exception:
+                pass
+
             info["candidates"] = candidates
 
             # Mark which already-present working nodes are in the last candidate set.
@@ -674,13 +790,30 @@ class PlannerEnv:
                 dir_diversity_k=dir_diversity_k,
             )
             self.last_candidates = candidates
-            info["candidates"] = candidates
+            try:
+                if candidates and isinstance(candidates[0], dict) and isinstance(candidates[0].get("id"), str):
+                    self.frontier_anchor_id = candidates[0]["id"]
+                    info["frontier_anchor_id"] = self.frontier_anchor_id
+            except Exception:
+                pass
 
+            info["candidates"] = candidates
             node_ids: List[str] = []
+            # include anchor nodes themselves (not only neighbors)
+            for a in (anchors or []):
+                if isinstance(a, dict) and isinstance(a.get("id"), str):
+                    node_ids.append(a["id"])
             for c in candidates:
                 nid = c.get("id")
                 if isinstance(nid, str):
                     node_ids.append(nid)
+
+            # dedupe (preserve order)
+            try:
+                seen = set()
+                node_ids = [x for x in node_ids if (x not in seen and not seen.add(x))]
+            except Exception:
+                pass
 
             self._merge_repo_nodes_into_working(node_ids, status="explored")
 
