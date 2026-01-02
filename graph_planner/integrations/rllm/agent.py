@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from pydantic import BaseModel
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ...core.actions import ActionUnion
@@ -394,11 +393,6 @@ class _StepState:
     model_response: str | None = None
     action: Dict[str, Any] | None = None
 
-class ActionResult(BaseModel):
-    """Wrapper returned to rLLM so the engine can access `.action`."""
-    action: ActionUnion
-
-
 
 class GraphPlannerRLLMAgent(BaseAgent):
     """GraphPlanner decision agent for rLLM."""
@@ -487,12 +481,67 @@ class GraphPlannerRLLMAgent(BaseAgent):
             prefix = f"[gp-agent] step={len(self._steps)-1} update_from_env"
             print(prefix, "reward=", reward, "done=", done, "kind=", info.get("kind"), "op=", info.get("op"))
 
+            # Extra step-level visibility for debugging: show candidate hits from
+            # the last find, and a compact view of W/M.
+            try:
+                obs = observation
+                if isinstance(obs, str):
+                    obs = json.loads(obs)
+                if isinstance(obs, dict):
+                    last_info = obs.get("last_info") or {}
+                    cands = last_info.get("candidates")
+                    if isinstance(cands, list) and cands:
+                        top = []
+                        for c in cands[:8]:
+                            if not isinstance(c, dict):
+                                continue
+                            cid = str(c.get("id") or "").strip()
+                            if not cid:
+                                continue
+                            top.append(cid)
+                        if top:
+                            print("[gp-agent]  candidates:", ", ".join(top))
+
+                    def _sub_nodes(obj: Any) -> list[dict]:
+                        if not isinstance(obj, dict):
+                            return []
+                        nodes = obj.get("nodes")
+                        if isinstance(nodes, list):
+                            return [n for n in nodes if isinstance(n, dict)]
+                        # tolerate dict[id->node]
+                        if isinstance(nodes, dict):
+                            return [n for n in nodes.values() if isinstance(n, dict)]
+                        return []
+
+                    w = obs.get("working_subgraph") or obs.get("w") or obs.get("subgraph") or {}
+                    m = obs.get("memory_subgraph") or obs.get("m") or {}
+                    w_nodes = _sub_nodes(w)
+                    m_nodes = _sub_nodes(m)
+                    w_mem = sum(1 for n in w_nodes if bool(n.get("memorized")))
+                    print(f"[gp-agent]  W(n={len(w_nodes)}, memorized={w_mem})  M(n={len(m_nodes)}, e={len((m or {}).get('edges') or [])})")
+
+                    # Print a short list of working node ids so you can see the
+                    # working set evolving.
+                    if w_nodes:
+                        shown = []
+                        for n in w_nodes[:20]:
+                            nid = str(n.get("id") or "").strip()
+                            if not nid:
+                                continue
+                            tag = "[M]" if bool(n.get("memorized")) else ""
+                            shown.append(f"{nid}{tag}")
+                        if shown:
+                            print("[gp-agent]  W.nodes:", ", ".join(shown))
+            except Exception:
+                # Never let debug printing break a run.
+                pass
+
     @property
     def chat_completions(self) -> List[Dict[str, str]]:
         """Full dialogue history for the engine (OpenAI chat format)."""
         return list(self._messages)
 
-    def update_from_model(self, model_response: str) -> ActionResult:
+    def update_from_model(self, model_response: str) -> ActionUnion:
         # Record model response.
         if self._steps:
             self._steps[-1].model_response = model_response
@@ -566,7 +615,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
             print("[gp-agent] parsed_action=", _truncate(_safe_json(action), 1200))
 
         telemetry_mod.emit_event("planner_action", {"action": action})
-        return ActionResult(action=action)
+        return ActionUnion(action=action)
 
     def get_current_state(self) -> Optional[_StepState]:
         return self._steps[-1] if self._steps else None
@@ -619,20 +668,6 @@ try:  # pragma: no cover
             try:
                 return await super().run_agent_trajectory_async(idx, application_id, seed=seed, mode=mode, **kwargs)
             finally:
-                # Best-effort resource cleanup: always close the env bound to this runner.
-                # This ensures remote containers are stopped even if the trajectory crashes.
-                try:
-                    envs = getattr(self, "envs", None) or getattr(self, "environments", None)
-                    env = None
-                    if isinstance(envs, (list, tuple)) and 0 <= int(idx) < len(envs):
-                        env = envs[int(idx)]
-                    else:
-                        env = getattr(self, "env", None)
-                    close = getattr(env, "close", None) if env is not None else None
-                    if callable(close):
-                        close()
-                except Exception:
-                    pass
                 _CURRENT_AGENT.reset(token)
 
         async def _get_openai_async(self, prompt, _, **kwargs):
