@@ -1590,6 +1590,10 @@ def main() -> None:
             sampling_params=sampling_params,
             rollout_engine_args=rollout_args,
             n_parallel_agents=args.parallel,
+            # IMPORTANT: rLLM engine has its own max_steps limit (default=5)
+            # that is independent of the environment. Always pass through the
+            # CLI/config value so trajectories do not get cut early.
+            max_steps=args.max_steps,
             max_response_length=args.max_response_tokens,
             max_prompt_length=args.max_prompt_tokens,
             trajectory_timeout=trajectory_timeout,
