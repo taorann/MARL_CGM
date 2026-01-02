@@ -161,64 +161,6 @@ def _instance_roundtrip(
     return resp
 
 
-
-
-def _instance_roundtrip_on_runner(
-    aq: ApptainerQueueRuntime,
-    *,
-    runner_id: int,
-    op_type: str,  # instance_start | instance_exec | instance_stop
-    run_id: str,
-    image: Optional[str],
-    cmd: Optional[str],
-    timeout: float,
-    env: Optional[Dict[str, str]] = None,
-    cwd: Optional[Path] = None,
-) -> QueueResponse:
-    """Send an instance request to a specific runner_id (bypasses choose_runner).
-
-    This is used for pool cleanup where we want to stop whatever a given runner is holding
-    regardless of the current run_id mapping.
-    """
-    sif_path: Optional[Path] = None
-    if image:
-        sif_path = aq._image_to_sif(image)  # type: ignore[attr-defined]
-
-    cmd_list: List[str]
-    if cmd is None:
-        cmd_list = []
-    else:
-        cmd_list = ["bash", "-lc", cmd]
-
-    workdir = cwd or Path("/testbed")
-
-    req = {
-        "req_id": aq._new_req_id(),  # type: ignore[attr-defined]
-        "runner_id": int(runner_id),
-        "run_id": run_id,
-        "type": op_type,
-        "image": image,
-        "sif_path": str(sif_path) if sif_path is not None else None,
-        "cmd": cmd_list,
-        "cwd": str(workdir),
-        "env": dict(env or {}),
-        "timeout_sec": float(timeout or aq.default_timeout_sec),
-        "src": None,
-        "dst": None,
-        "meta": {},
-    }
-
-    _dbg(f"roundtrip op={op_type} run_id={run_id} runner={runner_id} timeout={timeout} cwd={workdir}")
-    t0 = time.perf_counter()
-    resp = aq._roundtrip(QueueRequest(**req))  # type: ignore[attr-defined]
-    dt = time.perf_counter() - t0
-    _dbg(
-        f"roundtrip done op={op_type} run_id={run_id} ok={getattr(resp, 'ok', None)!r} "
-        f"rc={getattr(resp, 'returncode', None)!r} dt={dt:.2f}s"
-    )
-    return resp
-
-
 def main() -> int:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -264,71 +206,64 @@ def main() -> int:
 
     _dbg(f"recv op={op!r} run_id={run_id!r} image={image!r} cwd={str(cwd)!r} queue_root={str(queue_root)!r} sif_dir={str(sif_dir)!r} num_runners={num_runners}")
 
+
     try:
+        # ---------- pool cleanup ----------
+        if op == "cleanup_pool":
+            # Best-effort: stop any lingering instances on each runner to free slots.
+            per_stop_timeout = float(os.environ.get("GP_CLEANUP_STOP_TIMEOUT", "30") or 30.0)
+            per_stop_timeout = max(1.0, min(per_stop_timeout, float(timeout or 30.0)))
+            results = []
+            for rid in range(max(int(num_runners), 1)):
+                hb = None
+                try:
+                    hb = aq._read_heartbeat(int(rid))  # type: ignore[attr-defined]
+                except Exception:
+                    hb = None
+                cur_run = ""
+                try:
+                    if isinstance(hb, dict):
+                        cur_run = str(hb.get("current_run_id") or "")
+                except Exception:
+                    cur_run = ""
+                stop_run_id = cur_run or (str(run_id) if run_id else f"cleanup-{rid}")
+                try:
+                    r = aq.stop_instance_on_runner(
+                        runner_id=int(rid),
+                        run_id=stop_run_id,
+                        cwd=cwd,
+                        env=env,
+                        timeout_sec=per_stop_timeout,
+                        meta={"cleanup_pool": "1", "prev_run_id": cur_run or ""},
+                    )
+                    results.append(
+                        {
+                            "runner_id": int(rid),
+                            "prev_run_id": cur_run,
+                            "ok": bool(getattr(r, "ok", True)),
+                            "returncode": int(getattr(r, "returncode", 0) or 0),
+                            "stderr": str(getattr(r, "stderr", "") or ""),
+                        }
+                    )
+                except Exception as e:
+                    results.append(
+                        {
+                            "runner_id": int(rid),
+                            "prev_run_id": cur_run,
+                            "ok": False,
+                            "returncode": 1,
+                            "stderr": f"{type(e).__name__}: {e}",
+                        }
+                    )
+            print(json.dumps({"ok": True, "results": results}, ensure_ascii=False))
+            return 0
+
         # ---------- instance mode ----------
-        if op in {"start", "exec", "stop", "build_graph", "build_repo_graph", "cleanup_pool"}:
+
+        if op in {"start", "exec", "stop", "build_graph", "build_repo_graph"}:
             if op in {"start", "exec", "build_graph", "build_repo_graph"} and not image:
                 print(json.dumps({"ok": False, "error": f"image is required for op={op}"}))
                 return 1
-
-
-            if op == "cleanup_pool":
-                # Strategy A: free stale instances occupying runner slots before starting a new run.
-                # We intentionally route stop requests to specific runner_ids (bypassing choose_runner)
-                # to avoid getting stuck behind "busy" routing.
-                try:
-                    target_n = int(payload.get("num_runners") or num_runners)
-                except Exception:
-                    target_n = num_runners
-                force = bool(payload.get("force") or False)
-                per_timeout = float(payload.get("timeout") or timeout or 600.0)
-                per_timeout = max(5.0, min(per_timeout, 3600.0))
-
-                results: List[Dict[str, Any]] = []
-                all_ok = True
-                for rid in range(int(target_n)):
-                    hb = aq._read_heartbeat(rid)  # type: ignore[attr-defined]
-                    if hb is None:
-                        continue
-                    try:
-                        alive = aq._runner_is_alive(hb)  # type: ignore[attr-defined]
-                    except Exception:
-                        alive = True
-                    if not alive:
-                        continue
-                    cur = (hb or {}).get("current_run_id")
-                    if (cur is None or str(cur).strip() == "") and (not force):
-                        continue
-                    run_to_stop = str(cur or "__cleanup__")
-                    try:
-                        r = _instance_roundtrip_on_runner(
-                            aq,
-                            runner_id=int(rid),
-                            op_type="instance_stop",
-                            run_id=run_to_stop,
-                            image=None,
-                            cmd=None,
-                            timeout=float(per_timeout),
-                            env=env,
-                            cwd=cwd,
-                        )
-                        results.append(
-                            {
-                                "runner_id": int(rid),
-                                "run_id": run_to_stop,
-                                "ok": bool(getattr(r, "ok", False)),
-                                "returncode": getattr(r, "returncode", None),
-                                "stderr": getattr(r, "stderr", "") or "",
-                            }
-                        )
-                        if not getattr(r, "ok", False):
-                            all_ok = False
-                    except Exception as e:
-                        all_ok = False
-                        results.append({"runner_id": int(rid), "run_id": run_to_stop, "ok": False, "error": repr(e)})
-
-                print(json.dumps({"ok": all_ok, "results": results}, ensure_ascii=False))
-                return 0 if all_ok else 1
 
             if op == "start":
                 resp = _instance_roundtrip(
