@@ -97,4 +97,38 @@ def normalize_explore_query_and_anchors(
             {"from": 0, "to": 1, "source": "frontier_anchor_id"},
         )
 
+    # If the model provided an "anchor" id that is *likely* missing the canonical
+    # type prefix (e.g. it emits `path/to/file.py:Foo.bar:123` instead of
+    # `func:path/to/file.py:Foo.bar:123`), we can safely upgrade it to the
+    # canonical frontier anchor when they refer to the same underlying node.
+    if op in ("expand", "read") and a_list and frontier_anchor_id:
+        try:
+            aid = a_list[0].get("id")
+            fid = frontier_anchor_id
+            if isinstance(aid, str) and isinstance(fid, str):
+                aid_s = aid.strip()
+                fid_s = fid.strip()
+                # canonical ids start with a short type prefix like "func:", "class:", ...
+                canonical_prefixes = {
+                    "func",
+                    "class",
+                    "file",
+                    "dir",
+                    "var",
+                    "test",
+                    "issue",
+                    "doc",
+                }
+                head = aid_s.split(":", 1)[0] if aid_s else ""
+                is_canonical = head in canonical_prefixes
+                # If not canonical but matches the suffix of frontier id, upgrade.
+                if (not is_canonical) and fid_s.endswith(aid_s) and fid_s != aid_s:
+                    trimmed.setdefault(
+                        "anchors",
+                        {"from": 1, "to": 1, "source": "frontier_anchor_id", "reason": "missing_prefix"},
+                    )
+                    a_list[0]["id"] = fid_s
+        except Exception:
+            pass
+
     return query_str, a_list, trimmed
