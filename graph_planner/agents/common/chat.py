@@ -68,6 +68,8 @@ def summarise_observation(
     working_list_limit: int = 120,
     memory_list_limit: int = 30,
     text_memory_k: int = 8,
+    working_snippet_k: int = 2,
+    working_snippet_lines: int = 12,
     working_max_lines: int = 80,
     working_max_chars: int = 6000,
 ) -> Tuple[str, Dict[str, Any]]:
@@ -238,10 +240,13 @@ def summarise_observation(
             out.append(f"- ... (+{len(cands)-max(1, working_top_k)} more)")
         out.append("")
 
-    # Working nodes list (IDs only), then top-k snippets
+    # Working nodes list (IDs only), then snippets
     if nodes_sorted:
         out.append(f"## Working subgraph (W) — {len(nodes_sorted)} nodes")
-        out.append(f"(List truncated to {working_list_limit}; snippets shown for top {working_top_k} nodes.)")
+        out.append(
+            f"(List truncated to {working_list_limit}; snippets include candidate previews, memorized nodes, "
+            f"and recently touched working nodes.)"
+        )
         for n in nodes_sorted[:working_list_limit]:
             out.append(_node_line(n))
         if len(nodes_sorted) > working_list_limit:
@@ -274,16 +279,35 @@ def summarise_observation(
                 entries.append((nid, snip))
                 seen.add(nid)
 
+        # 3) recently touched working nodes (even if not memorized)
+        # This makes sure the planner can see the code it just explored.
+        max_snippets = max(working_top_k, working_snippet_k)
+        if working_snippet_k > 0:
+            for n in nodes_sorted:
+                nid = str(n.get("id") or "").strip()
+                if not nid or nid in seen:
+                    continue
+                # Avoid file nodes (they are summaries, not code bodies)
+                if str(n.get("kind") or "").lower() == "file":
+                    continue
+                snip = _snippet_text(n)
+                if snip:
+                    entries.append((nid, snip))
+                    seen.add(nid)
+                if len(entries) >= max_snippets:
+                    break
+
         # Limit total snippets we show
-        entries = entries[:working_top_k]
+        entries = entries[:max_snippets]
 
         used = 0
         chars = 0
         for nid, snip in entries:
             # clamp lines/chars per snippet
             sn_lines = snip.splitlines()
-            if working_max_lines and len(sn_lines) > working_max_lines:
-                sn_lines = sn_lines[:working_max_lines] + ["..."]
+            line_cap = working_snippet_lines if working_snippet_lines > 0 else working_max_lines
+            if line_cap and len(sn_lines) > line_cap:
+                sn_lines = sn_lines[:line_cap] + ["..."]
             snip2 = "\n".join(sn_lines)
             if working_max_chars and len(snip2) > working_max_chars:
                 snip2 = snip2[:working_max_chars] + "..."
