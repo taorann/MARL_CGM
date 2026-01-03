@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -174,10 +175,56 @@ def summarise_observation(
 
     # Compose summary
     out: List[str] = []
-    if include_issue and isinstance(issue, str) and issue.strip():
-        out.append("## Issue")
-        out.append(compact_issue_text(issue, target_tokens=issue_target_tokens))
-        out.append("")
+
+    def _issue_to_title_body(v: Any) -> Tuple[str, str]:
+        """Coerce env-provided issue payload into (title, body) strings.
+
+        SWE-bench tasks often provide a dict with keys like `problem_statement`.
+        We intentionally **ignore** any potential solution fields (e.g., `patch`,
+        `test_patch`) if present in the payload.
+        """
+        if v is None:
+            return "", ""
+        if isinstance(v, str):
+            return "", v.strip()
+        if not isinstance(v, dict):
+            return "", str(v).strip()
+
+        instance_id = str(v.get("instance_id") or v.get("id") or v.get("issue_id") or "").strip()
+        repo = str(v.get("repo") or v.get("repo_id") or "").strip()
+        title = str(v.get("title") or "").strip()
+
+        body = (
+            v.get("problem_statement")
+            or v.get("body")
+            or v.get("description")
+            or v.get("text")
+            or ""
+        )
+        body = str(body).strip()
+
+        if not title and body:
+            for line in body.splitlines():
+                line = line.strip()
+                if line:
+                    title = line[:120]
+                    break
+
+        header_lines: List[str] = []
+        if instance_id:
+            header_lines.append(f"Instance: {instance_id}")
+        if repo:
+            header_lines.append(f"Repo: {repo}")
+        header = ("\n".join(header_lines) + "\n\n") if header_lines else ""
+
+        return title, (header + body).strip()
+
+    if include_issue:
+        issue_title, issue_body = _issue_to_title_body(issue)
+        if issue_title or issue_body:
+            out.append("## Issue")
+            out.append(compact_issue_text(issue_title, issue_body, target_tokens=issue_target_tokens))
+            out.append("")
 
     if steps:
         out.append("## Recent steps")
@@ -288,6 +335,47 @@ def summarise_observation(
     # Working nodes list (IDs only), then snippets
     if nodes_sorted:
         out.append(f"## Working subgraph (W) — {len(nodes_sorted)} nodes")
+
+        # High-signal snapshot so humans (and the planner) can quickly see what W contains.
+        # Keep this extremely compact to avoid blowing the prompt budget.
+        try:
+            w_edges = None
+            if isinstance(working_subgraph, dict):
+                es = working_subgraph.get("edges")
+                if isinstance(es, list):
+                    w_edges = len(es)
+            if isinstance(last_info, dict):
+                st = last_info.get("subgraph_stats")
+                if isinstance(st, dict) and isinstance(st.get("n_edges"), int):
+                    w_edges = int(st.get("n_edges"))
+
+            file_counts: Counter[str] = Counter()
+            kind_counts: Counter[str] = Counter()
+            for n in nodes_sorted:
+                if not isinstance(n, dict):
+                    continue
+                k = str(n.get("kind") or "").lower().strip() or "?"
+                kind_counts[k] += 1
+                p = str(n.get("path") or "").strip()
+                if p:
+                    file_counts[p] += 1
+
+            mem_n = sum(1 for n in nodes_sorted if isinstance(n, dict) and bool(n.get("memorized")))
+            top_files = ", ".join(
+                f"{p}({c})" for p, c in file_counts.most_common(5)
+            )
+            top_kinds = ", ".join(
+                f"{k}({c})" for k, c in kind_counts.most_common(6)
+            )
+            w_edge_s = f"/{w_edges} edges" if isinstance(w_edges, int) else ""
+            out.append(f"- W: {len(nodes_sorted)} nodes{w_edge_s}; M: {mem_n} nodes; files: {len(file_counts)}")
+            if top_files:
+                out.append(f"- top files: {top_files}")
+            if top_kinds:
+                out.append(f"- kinds: {top_kinds}")
+        except Exception:
+            pass
+
         out.append(
             f"(List truncated to {working_list_limit}; snippets include candidate previews, memorized nodes, "
             f"and recently touched working nodes.)"
