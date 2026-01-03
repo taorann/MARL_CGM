@@ -76,8 +76,19 @@ class GraphHandle:
         self.nodes[node["id"]] = node
 
     def add_edge(self, src: str, dst: str, etype: str):
-        self.adj[src].append((dst, etype))
-        self.rev[dst].append((src, etype))
+        # Normalize edge types to improve downstream heuristics.
+        # Remote builders are not consistent (e.g., "CONTAINS" vs "contains").
+        et = str(etype or "edge").strip()
+        et = et.lower()
+        # Light synonym mapping used by expansion heuristics.
+        if et in {"contain", "contains", "contained_in", "contains_def", "contains_decl"}:
+            et = "contains"
+        elif et in {"import", "imports", "imported"}:
+            et = "imports"
+        elif et in {"call", "calls", "called"}:
+            et = "calls"
+        self.adj[src].append((dst, et))
+        self.rev[dst].append((src, et))
 
     def get(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(node_id)
@@ -178,6 +189,21 @@ def connect_from_nodes_edges(nodes: Any, edges: Any, root: Optional[str] = None)
         if not isinstance(nid, str) or not nid:
             continue
         nn = dict(n)
+        # Robust path normalization: different builders may emit file/filepath.
+        if "path" not in nn or not nn.get("path"):
+            for k in ("file", "filepath", "filename"):
+                if nn.get(k):
+                    nn["path"] = nn.get(k)
+                    break
+        # Fallback: infer path from common id patterns: "kind:relpath:..."
+        if ("path" not in nn or not nn.get("path")) and isinstance(nid, str) and ":" in nid:
+            try:
+                parts = nid.split(":")
+                # e.g. func:pkg/mod.py:Symbol:123  -> take parts[1]
+                if len(parts) >= 2 and "/" in parts[1]:
+                    nn["path"] = parts[1]
+            except Exception:
+                pass
         if "path" in nn:
             nn["path"] = _norm_posix(nn.get("path"))
         if isinstance(nn.get("kind"), str):
@@ -355,9 +381,12 @@ def _one_hop_expand(graph: GraphHandle,
         if not path:
             continue
         file_node_id = _file_node_id(path)
+        saw_contains = False
         for dst, et in graph.neighbors(file_node_id):
-            if et != "contains":
+            # etypes are normalized in GraphHandle.add_edge but keep this robust.
+            if str(et).lower() != "contains":
                 continue
+            saw_contains = True
             if dst in seen:
                 continue
             node = graph.get(dst)
@@ -367,6 +396,26 @@ def _one_hop_expand(graph: GraphHandle,
             seen.add(dst)
             if len(results) >= max_nodes:
                 return results
+
+        # Fallback: some repo graphs (esp. remote builders) do not include
+        # file nodes / contains edges. In that case, approximate "same-file"
+        # expansion by scanning nodes with the same path.
+        if not saw_contains:
+            for nn in graph.nodes.values():
+                try:
+                    if _norm_posix(nn.get("path")) != path:
+                        continue
+                    if nn.get("id") in seen or nn.get("id") == n.get("id"):
+                        continue
+                    # Skip generic file nodes if present; keep symbols/functions/classes.
+                    if str(nn.get("kind") or "").lower() == "file":
+                        continue
+                    results.append(nn)
+                    seen.add(nn["id"])
+                    if len(results) >= max_nodes:
+                        return results
+                except Exception:
+                    continue
 
     # 3) 同目录下其它文件（轻度）
     for n in anchor_nodes:
