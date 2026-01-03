@@ -192,6 +192,9 @@ class PlannerEnv:
         self.last_candidates: List[Dict[str, Any]] = []
         self.last_reads: List[Dict[str, Any]] = []
 
+        # Last selected anchor id (used as default for explore_expand when the model omits anchors)
+        self.frontier_anchor_id: Optional[str] = None
+
     # ------------------------------------------------------------
     # 兼容接口：env.subgraph → working_subgraph
     # ------------------------------------------------------------
@@ -543,6 +546,56 @@ class PlannerEnv:
             return -0.1
         return -0.01
 
+
+    def _canonicalize_anchor_id(self, raw_id: str) -> str:
+        """Best-effort canonicalization of anchor/node ids.
+
+        The repo_graph typically stores ids with a type prefix, e.g.:
+          - func:pkg/mod.py:Class.method:123
+          - file:pkg/mod.py
+
+        Some planner outputs (or prompt formatting) may drop the prefix and only keep
+        the tail (path/name/lineno). This helper upgrades such ids back to the canonical
+        form so expansion works.
+        """
+        if not raw_id or not isinstance(raw_id, str):
+            return raw_id
+        rid = raw_id.strip()
+        if not rid:
+            return rid
+        if rid.startswith(("func:", "cls:", "file:", "test:", "node:")):
+            return rid
+        if ".py" in rid:
+            # path.py:Symbol:123  -> func:path.py:Symbol:123
+            if rid.count(":") >= 2:
+                return "func:" + rid
+            # path.py -> file:path.py
+            if rid.endswith(".py") or rid.count(":") == 0:
+                return "file:" + rid
+        return rid
+
+    def _canonicalize_anchors(self, anchors: List[Dict[str, Any]], info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        changes: List[Dict[str, str]] = []
+        for a in anchors or []:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("id")
+            if not isinstance(aid, str):
+                out.append(a)
+                continue
+            cid = self._canonicalize_anchor_id(aid)
+            if cid != aid:
+                aa = dict(a)
+                aa["id"] = cid
+                out.append(aa)
+                changes.append({"from": aid, "to": cid})
+            else:
+                out.append(a)
+        if changes:
+            info["anchors_canonicalized"] = changes
+        return out
+
     # ------------------------------------------------------------------
     # Explore / Memory
     # ------------------------------------------------------------------
@@ -566,6 +619,9 @@ class PlannerEnv:
         if trimmed:
             info["trimmed"] = trimmed
 
+        # Canonicalize anchor ids (accept planner outputs without 'func:'/'file:' prefix).
+        anchors = self._canonicalize_anchors(anchors, info)
+
         if not self.repo_graph:
             info["error"] = "missing-repo-graph"
             return info
@@ -574,12 +630,6 @@ class PlannerEnv:
         total_limit = _safe_int(getattr(act, "total_limit", None) or act.limit or 32, 32)
         max_per_anchor = _safe_int(getattr(act, "max_per_anchor", None) or total_limit, total_limit)
         dir_diversity_k = _safe_int(getattr(act, "dir_diversity_k", None) or 4, 4)
-        # Clamp expand size to keep prompts/snippets manageable.
-        if act.op == "expand":
-            _cap = _safe_int(os.environ.get("GP_EXPAND_TOTAL_LIMIT", "20"), 20)
-            if _cap > 0:
-                total_limit = min(total_limit, _cap)
-                max_per_anchor = min(max_per_anchor, _cap)
         # Keep the raw query string intact for the query DSL (symbol:/path:/+/-/quotes).
         # We still compute tokenized terms only for debugging/telemetry.
         query_terms = mem_candidates.extract_query_terms(query_value)
@@ -623,11 +673,38 @@ class PlannerEnv:
                     )
                 else:
                     candidates = []
-
-            # Expose candidates to the agent, but do NOT mutate working_subgraph.
-            # The planner should explicitly select an anchor via explore_expand.
+            # Expose candidates to the agent.
             self.last_candidates = candidates
             info["candidates"] = candidates
+
+            # Remember the top candidate as the "frontier" anchor for the next expand,
+            # so that explore_expand can omit anchors and still be well-defined.
+            try:
+                if candidates:
+                    _best = candidates[0]
+                    _bid = _best.get("id") if isinstance(_best, dict) else None
+                    if isinstance(_bid, str) and _bid.strip():
+                        self.frontier_anchor_id = _bid.strip()
+                        info["frontier_anchor_id"] = self.frontier_anchor_id
+            except Exception:
+                pass
+
+            # IMPORTANT: seed the working subgraph with top-k candidates (default k=1).
+            # This makes W non-empty and lets the planner see concrete nodes immediately,
+            # avoiding the "find/expand loop with empty W" failure mode.
+            try:
+                topk = _safe_int(os.environ.get("GP_FIND_ADD_TO_WORKING_TOPK", "1"), default=1)
+                if topk > 0 and candidates:
+                    seed_ids: List[str] = []
+                    for c in candidates[:topk]:
+                        nid = c.get("id") if isinstance(c, dict) else None
+                        if isinstance(nid, str) and nid.strip():
+                            seed_ids.append(nid.strip())
+                    if seed_ids:
+                        self._merge_repo_nodes_into_working(seed_ids, status="found")
+                        info["seeded_working_ids"] = seed_ids
+            except Exception:
+                pass
 
             # Mark which already-present working nodes are in the last candidate set.
             cand_ids: List[str] = []
@@ -1156,6 +1233,7 @@ class PlannerEnv:
         working_stats = subgraph_store.stats(self.working_subgraph)
         working_json = self.working_subgraph.to_json_obj()
         memory_stats = subgraph_store.stats(self.memory_subgraph)
+        memory_json = self.memory_subgraph.to_json_obj()
         obs_pack = self._observation_pack(mem_stats=memory_stats, query_stats=None)
 
         return {
@@ -1165,6 +1243,12 @@ class PlannerEnv:
             "last_info": self.last_info,
             # LLM 看到的是“当前工作图”，里面节点已经带 status/tags（explored/remembered）
             "subgraph": working_json,
+            # Backward/forward compatible aliases expected by various rLLM prompts/loggers
+            "w": working_json,
+            "working_subgraph": working_json,
+            "m": memory_json,
+            "memory_subgraph": memory_json,
+            "frontier_anchor_id": getattr(self, "frontier_anchor_id", None),
             "subgraph_stats": working_stats,
             # 记忆图的统计信息（可选）
             "memory_stats": memory_stats,
