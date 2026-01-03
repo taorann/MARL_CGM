@@ -463,6 +463,8 @@ class GraphPlannerRLLMAgent(BaseAgent):
             working_list_limit = _safe_int(os.environ.get("GP_WORKING_LIST_LIMIT"), default=120)
             memory_list_limit = _safe_int(os.environ.get("GP_MEMORY_LIST_LIMIT"), default=30)
             text_memory_k = _safe_int(os.environ.get("GP_TEXT_MEMORY_K"), default=8)
+            working_snippet_k = _safe_int(os.environ.get("GP_WORKING_SNIPPET_K"), default=2)
+            working_snippet_lines = _safe_int(os.environ.get("GP_WORKING_SNIPPET_LINES"), default=12)
             max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_LINES"), default=80)
             max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=6000)
             try:
@@ -478,6 +480,8 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     working_list_limit=working_list_limit,
                     memory_list_limit=memory_list_limit,
                     text_memory_k=text_memory_k,
+                    working_snippet_k=working_snippet_k,
+                    working_snippet_lines=working_snippet_lines,
                     working_max_lines=max_lines,
                     working_max_chars=max_chars,
                 )
@@ -624,7 +628,6 @@ class GraphPlannerRLLMAgent(BaseAgent):
                 raise
 
 
-
         # --- Anti-loop guard: rewrite repeated identical find(query) into expand(frontier_anchor_id) ---
         try:
             if os.environ.get("GP_AVOID_REPEAT_FIND", "1").strip().lower() not in {"0", "false", "no", "off"}:
@@ -641,14 +644,25 @@ class GraphPlannerRLLMAgent(BaseAgent):
                                     if pq == q:
                                         obs = self._steps[-1].observation if self._steps else None
                                         frontier = None
+                                        # Prefer explicit frontier id if available
                                         if isinstance(obs, dict):
                                             frontier = obs.get("frontier_anchor_id")
                                             if not frontier:
                                                 li = obs.get("last_info")
                                                 if isinstance(li, dict):
                                                     frontier = li.get("frontier_anchor_id")
+                                            # Fallback to last candidate id
                                             if not frontier:
-                                                ws = obs.get("working_subgraph") or obs.get("subgraph") or obs.get("w") or {}
+                                                li = obs.get("last_info")
+                                                if isinstance(li, dict):
+                                                    cands = li.get("candidates")
+                                                    if isinstance(cands, list) and cands:
+                                                        c0 = cands[0]
+                                                        if isinstance(c0, dict):
+                                                            frontier = c0.get("id")
+                                            # Fallback to last node in working subgraph
+                                            if not frontier:
+                                                ws = obs.get("working_subgraph") or obs.get("w") or obs.get("subgraph") or {}
                                                 if isinstance(ws, dict):
                                                     nodes = ws.get("nodes") or []
                                                     if isinstance(nodes, list) and nodes:
@@ -664,6 +678,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
                                                 print("[gp-agent] auto_rewrite repeated_find->expand", {"query": q, "anchor": frontier})
         except Exception:
             pass
+
         if self._steps:
             self._steps[-1].action = action
 
