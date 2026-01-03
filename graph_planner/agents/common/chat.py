@@ -196,6 +196,42 @@ def summarise_observation(
                 out.append(f"- {s.strip()}")
         out.append("")
 
+    # A small, high-signal summary of the last env result.
+    if isinstance(last_info, dict) and last_info:
+        out.append("## Last result")
+        kind = str(last_info.get("kind") or last_info.get("type") or "").strip()
+        op = str(last_info.get("op") or last_info.get("intent") or "").strip()
+        if kind or op:
+            out.append(f"- kind/op: {kind or '-'} / {op or '-'}")
+        frontier = last_info.get("frontier_anchor_id")
+        if isinstance(frontier, str) and frontier.strip():
+            out.append(f"- frontier_anchor_id: {frontier.strip()}")
+
+        # Deltas are injected by the env step wrapper (so the planner can detect no-progress loops).
+        def _d(k: str) -> str:
+            v = last_info.get(k)
+            if isinstance(v, (int, float)):
+                return str(int(v))
+            return "?"
+
+        if any(k in last_info for k in ("delta_working_nodes", "delta_working_edges", "delta_memory_nodes", "delta_memory_edges")):
+            out.append(
+                f"- ΔW(nodes/edges): {_d('delta_working_nodes')}/{_d('delta_working_edges')} | "
+                f"ΔM(nodes/edges): {_d('delta_memory_nodes')}/{_d('delta_memory_edges')}"
+            )
+
+        # Quick hints for exploration effectiveness.
+        c = last_info.get("candidates")
+        if isinstance(c, list):
+            out.append(f"- candidates: {len(c)}")
+        seeded = last_info.get("seeded_working_ids")
+        if isinstance(seeded, list) and seeded:
+            out.append(f"- seeded_into_W: {len(seeded)}")
+        pruned = last_info.get("pruned_working")
+        if isinstance(pruned, list) and pruned:
+            out.append(f"- pruned_from_W: {len(pruned)}")
+        out.append("")
+
     # Memorized nodes are a high-signal subset of W, but we do not show a separate
     # M section to avoid duplication. Memorized nodes are marked with [M] inside W.
     mem_nodes = [n for n in nodes_sorted if bool(n.get("memorized"))]
@@ -212,20 +248,21 @@ def summarise_observation(
             out.append("- Memory (M) is empty. Commit 1–3 high-signal nodes now via memory_commit(select_ids=[...]).")
         out.append("")
 
-    # Candidates (from the most recent find). We show these explicitly because
-    # find no longer auto-merges candidates into W.
-
-    cands = last_info.get("candidates")
+    # Candidates (from the most recent find). Always guard against missing
+    # candidates to avoid crashing and falling back to raw JSON prompts.
+    cands = last_info.get("candidates") if isinstance(last_info, dict) else None
     if isinstance(cands, list):
-        q = str(last_info.get("query") or "").strip()
+        q = str(last_info.get("query") or "").strip()  # type: ignore[union-attr]
         out.append(f"## Candidates — {len(cands)}")
         if q:
             out.append(f"- query: `{q}`")
         if not cands:
-            out.append("_No candidates matched. Do **not** repeat the same query; broaden it (e.g., drop `symbol:` / split terms) or change the anchor._")
+            out.append(
+                "_No candidates matched. Do **not** repeat the same query; broaden it (e.g., drop `symbol:` / split terms) or change the anchor._"
+            )
             out.append("")
         else:
-            for c in cands[:max(1, working_top_k)]:
+            for c in cands[: max(1, working_top_k)]:
                 if not isinstance(c, dict):
                     continue
                 nid = str(c.get("id") or "").strip()
@@ -245,31 +282,8 @@ def summarise_observation(
                 else:
                     out.append(f"- {nid} ({kind}) {path}")
             if len(cands) > max(1, working_top_k):
-                out.append(f"- ... (+{len(cands)-max(1, working_top_k)} more)")
+                out.append(f"- ... (+{len(cands) - max(1, working_top_k)} more)")
             out.append("")
-    else:
-        for c in cands[:max(1, working_top_k)]:
-            if not isinstance(c, dict):
-                continue
-            nid = str(c.get("id") or "").strip()
-            if not nid:
-                continue
-            kind = str(c.get("kind") or "")
-            path = str(c.get("path") or "")
-            span = c.get("span")
-            if isinstance(span, dict):
-                s = span.get("start")
-                e = span.get("end")
-                if s is not None and e is not None:
-                    path = f"{path}:{s}-{e}"
-            score = c.get("score")
-            if isinstance(score, (int, float)):
-                out.append(f"- {nid} ({kind}) {path}  score={float(score):.3f}")
-            else:
-                out.append(f"- {nid} ({kind}) {path}")
-        if len(cands) > max(1, working_top_k):
-            out.append(f"- ... (+{len(cands)-max(1, working_top_k)} more)")
-        out.append("")
 
     # Working nodes list (IDs only), then snippets
     if nodes_sorted:
