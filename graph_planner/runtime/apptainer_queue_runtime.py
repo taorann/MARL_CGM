@@ -200,6 +200,45 @@ class ApptainerQueueRuntime:
         return self._resp_to_exec_result(last or resp)  # type: ignore[arg-type]
 
     # ----------------------
+    # Runner-targeted helpers (for proxy-side pool cleanup)
+    # ----------------------
+    def stop_instance_on_runner(
+        self,
+        *,
+        runner_id: int,
+        run_id: str,
+        cwd: Path,
+        env: Optional[Mapping[str, str]] = None,
+        timeout_sec: Optional[float] = None,
+        meta: Optional[Dict[str, str]] = None,
+    ) -> ExecResult:
+        """Send an instance_stop request to a *specific* runner.
+
+        This is primarily used by `hpc/swe_proxy.py` for `cleanup_pool`, where
+        we want to force free slots even if we cannot resolve (run_id -> runner)
+        mapping (e.g., after client crash / restart).
+
+        Note: runner-side `instance_stop` always targets the fixed instance name
+        (gp-00/gp-01/...), so the provided `run_id` is only used for logging.
+        """
+
+        req = QueueRequest(
+            req_id=self._new_req_id(),
+            runner_id=int(runner_id),
+            run_id=str(run_id),
+            type="instance_stop",
+            image="",
+            sif_path="",
+            cmd=[],
+            cwd=str(cwd),
+            env=dict(env or {}),
+            timeout_sec=float(timeout_sec or self.default_timeout_sec),
+            meta=meta or {},
+        )
+        resp = self._roundtrip(req)
+        return self._resp_to_exec_result(resp)
+
+    # ----------------------
     # ----------------------
     # 文件 put/get & cleanup（原有逻辑）
     # ----------------------
