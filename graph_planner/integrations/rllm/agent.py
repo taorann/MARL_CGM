@@ -461,13 +461,15 @@ class GraphPlannerRLLMAgent(BaseAgent):
         else:
             issue_tokens = _safe_int(os.environ.get("GP_ISSUE_TOKENS"), default=320)
             working_top_k = _safe_int(os.environ.get("GP_WORKING_TOP_K"), default=8)
-            working_list_limit = _safe_int(os.environ.get("GP_WORKING_LIST_LIMIT"), default=120)
+            # Keep observation text compact; very large W dumps quickly trigger
+            # multi-step token-budget truncation in rllm rollouts.
+            working_list_limit = _safe_int(os.environ.get("GP_WORKING_LIST_LIMIT"), default=80)
             memory_list_limit = _safe_int(os.environ.get("GP_MEMORY_LIST_LIMIT"), default=30)
             text_memory_k = _safe_int(os.environ.get("GP_TEXT_MEMORY_K"), default=8)
             working_snippet_k = _safe_int(os.environ.get("GP_WORKING_SNIPPET_K"), default=2)
             working_snippet_lines = _safe_int(os.environ.get("GP_WORKING_SNIPPET_LINES"), default=12)
             max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_LINES"), default=80)
-            max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=6000)
+            max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=5000)
             try:
                 obs_text, _meta = summarise_observation(
                     observation,
