@@ -369,6 +369,15 @@ class PlannerEnv:
         """单步：接受一个 action 字典，返回 (obs, reward, done, info)。"""
         self.steps += 1
         _t0 = time.perf_counter()
+        # Track per-step progress so the planner can detect no-progress loops.
+        try:
+            _w_before = subgraph_store.stats(getattr(self, "working_subgraph", None))
+        except Exception:
+            _w_before = {"n_nodes": 0, "n_edges": 0}
+        try:
+            _m_before = subgraph_store.stats(getattr(self, "memory_subgraph", None))
+        except Exception:
+            _m_before = {"n_nodes": 0, "n_edges": 0}
         try:
             self.telemetry.set_step(self.steps)
         except Exception:
@@ -421,6 +430,30 @@ class PlannerEnv:
 
         # NOTE: text memory is handled only via explicit memory actions (target="observation").
         self.last_info = info
+
+        # Inject delta stats into last_info for both debugging and model feedback.
+        try:
+            _w_after = subgraph_store.stats(getattr(self, "working_subgraph", None))
+        except Exception:
+            _w_after = {"n_nodes": 0, "n_edges": 0}
+        try:
+            _m_after = subgraph_store.stats(getattr(self, "memory_subgraph", None))
+        except Exception:
+            _m_after = {"n_nodes": 0, "n_edges": 0}
+
+        def _iv(d: Dict[str, Any], k: str) -> int:
+            try:
+                return int(d.get(k) or 0)
+            except Exception:
+                return 0
+
+        info.setdefault("subgraph_stats", _w_after)
+        info.setdefault("memory_stats", _m_after)
+        info["delta_working_nodes"] = _iv(_w_after, "n_nodes") - _iv(_w_before, "n_nodes")
+        info["delta_working_edges"] = _iv(_w_after, "n_edges") - _iv(_w_before, "n_edges")
+        info["delta_memory_nodes"] = _iv(_m_after, "n_nodes") - _iv(_m_before, "n_nodes")
+        info["delta_memory_edges"] = _iv(_m_after, "n_edges") - _iv(_m_before, "n_edges")
+
         reward = self._compute_reward(info)
         done = bool(info.get("done"))
         # Global stop: enforce max_steps budget (used by eval_engine/datasets).
@@ -432,6 +465,28 @@ class PlannerEnv:
 
         obs = self._obs()
         self._log_step_graphs()
+
+        # Optional: print a one-line summary for easier debugging.
+        try:
+            if os.environ.get("GP_PRINT_STEP_SUMMARY", "1").strip().lower() in {"1", "true", "yes", "y"}:
+                k = str(info.get("kind") or "")
+                op = str(info.get("op") or info.get("intent") or "")
+                q = str(info.get("query") or "").strip()
+                frontier = str(info.get("frontier_anchor_id") or "").strip()
+                dw = info.get("delta_working_nodes")
+                dm = info.get("delta_memory_nodes")
+                cand_n = len(info.get("candidates") or []) if isinstance(info.get("candidates"), list) else None
+                extra = []
+                if cand_n is not None:
+                    extra.append(f"cands={cand_n}")
+                if frontier:
+                    extra.append(f"frontier={frontier}")
+                if q:
+                    extra.append(f"q={q[:64] + ('...' if len(q) > 64 else '')}")
+                extra_s = (" | " + ", ".join(extra)) if extra else ""
+                print(f"[gp-env] step={self.steps} {k}/{op} ΔW={dw} ΔM={dm}{extra_s}")
+        except Exception:
+            pass
         return obs, reward, done, info
 
     # ------------------------------------------------------------------
