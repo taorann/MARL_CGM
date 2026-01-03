@@ -19,11 +19,17 @@ Protocol notes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Set
 
 import copy
 import json
 import os
+
+# Optional typing for downstream CGM formatting.
+try:
+    from .types import DocChunk  # type: ignore
+except Exception:  # pragma: no cover
+    DocChunk = Dict[str, Any]  # type: ignore
 
 
 Node = Dict[str, Any]
@@ -575,3 +581,113 @@ def load(path: str) -> Subgraph:
     with open(path, "r", encoding="utf-8") as f:
         obj = json.load(f)
     return wrap(obj)
+
+
+def _span_from_node(n: Mapping[str, Any]) -> Tuple[int, int]:
+    """Best-effort (start,end) line span for a node."""
+    span = n.get("span") if isinstance(n.get("span"), dict) else None
+    if span:
+        s = int(span.get("start") or 0)
+        e = int(span.get("end") or 0)
+        if s > 0 and e >= s:
+            return s, e
+    # fallback keys
+    s = int(n.get("start_line") or 0)
+    e = int(n.get("end_line") or 0)
+    if s > 0 and e >= s:
+        return s, e
+    return 0, 0
+
+
+def _text_from_node(n: Mapping[str, Any], *, max_lines: int = 200) -> str:
+    """Extract code text from a node.
+
+    We rely on `snippet_lines` embedded during graph build / exploration.
+    We intentionally do **not** read files here, since CGM formatting may run
+    on the host while code lives inside a remote sandbox.
+    """
+    snip = n.get("snippet_lines")
+    if isinstance(snip, list):
+        lines = [str(x) for x in snip]
+    else:
+        s = n.get("snippet")
+        if isinstance(s, str):
+            lines = s.splitlines()
+        elif isinstance(s, list):
+            lines = [str(x) for x in s]
+        else:
+            lines = []
+    if not lines:
+        return ""
+    if max_lines > 0:
+        lines = lines[:max_lines]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def linearize(
+    subgraph: Any,
+    *,
+    max_nodes: int = 80,
+    max_lines_per_node: int = 200,
+    include_kinds: Optional[Sequence[str]] = None,
+) -> List[DocChunk]:
+    """Convert a (memory) subgraph into a list of code chunks for CGM.
+
+    The CGM prompt builder expects contextual evidence chunks with code.
+    We emit one chunk per node, with lightweight metadata and embedded code.
+
+    Args:
+        subgraph: Subgraph / WorkingSubgraph / MemorySubgraph / dict-like JSON.
+        max_nodes: hard cap to keep CGM prompt bounded.
+        max_lines_per_node: clip node code for safety.
+        include_kinds: if provided, only emit these kinds (e.g., ["function","class"]).
+    """
+
+    # Accept both objects and json-ish dicts.
+    nodes_obj = getattr(subgraph, "nodes", None)
+    if isinstance(nodes_obj, dict):
+        nodes: Dict[str, Node] = nodes_obj
+    elif isinstance(subgraph, dict) and isinstance(subgraph.get("nodes"), list):
+        nodes = {str(n.get("id")): n for n in subgraph.get("nodes") if isinstance(n, dict) and n.get("id")}
+    else:
+        nodes = {}
+
+    order = list(getattr(subgraph, "node_ids", []) or [])
+    if not order:
+        order = list(nodes.keys())
+
+    seen: Set[Tuple[str, int, int]] = set()
+    chunks: List[DocChunk] = []
+
+    for nid in order:
+        if len(chunks) >= max_nodes:
+            break
+        n = nodes.get(nid)
+        if not isinstance(n, dict):
+            continue
+        kind = str(n.get("kind") or n.get("type") or "")
+        if include_kinds and kind not in set(include_kinds):
+            continue
+        path = str(n.get("path") or "")
+        if not path:
+            continue
+        start, end = _span_from_node(n)
+        text = _text_from_node(n, max_lines=max_lines_per_node)
+        if not text:
+            continue
+        key = (path, start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        chunks.append(
+            {
+                "path": path,
+                "start": start,
+                "end": end,
+                "node_id": nid,
+                "kind": kind,
+                "text": text,
+            }
+        )
+
+    return chunks
