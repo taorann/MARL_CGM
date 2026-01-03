@@ -228,14 +228,47 @@ def main() -> int:
                     cur_run = ""
                 stop_run_id = cur_run or (str(run_id) if run_id else f"cleanup-{rid}")
                 try:
-                    r = aq.stop_instance_on_runner(
-                        runner_id=int(rid),
-                        run_id=stop_run_id,
-                        cwd=cwd,
-                        env=env,
-                        timeout_sec=per_stop_timeout,
-                        meta={"cleanup_pool": "1", "prev_run_id": cur_run or ""},
-                    )
+                    # Prefer runner-targeted stop if available; otherwise fall back to a private
+                    # roundtrip (older runtime versions may not have stop_instance_on_runner yet).
+                    if hasattr(aq, "stop_instance_on_runner"):
+                        r = aq.stop_instance_on_runner(  # type: ignore[attr-defined]
+                            runner_id=int(rid),
+                            run_id=stop_run_id,
+                            cwd=cwd,
+                            env=env,
+                            timeout_sec=per_stop_timeout,
+                            meta={"cleanup_pool": "1", "prev_run_id": cur_run or ""},
+                        )
+                    else:
+                        from graph_planner.runtime.queue_protocol import QueueRequest
+
+                        req = QueueRequest(
+                            req_id=aq._new_req_id(),  # type: ignore[attr-defined]
+                            runner_id=int(rid),
+                            run_id=str(stop_run_id),
+                            type="instance_stop",
+                            image="",
+                            sif_path="",
+                            cmd=[],
+                            cwd=str(cwd),
+                            env=dict(env or {}),
+                            timeout_sec=float(per_stop_timeout),
+                            meta={"cleanup_pool": "1", "prev_run_id": cur_run or ""},
+                        )
+                        resp = aq._roundtrip(req)  # type: ignore[attr-defined]
+                        r = aq._resp_to_exec_result(resp)  # type: ignore[attr-defined]
+
+                    # Wait briefly for heartbeat to reflect the freed slot.
+                    try:
+                        deadline = time.time() + float(os.environ.get("GP_CLEANUP_WAIT_IDLE_SEC", "6") or 6.0)
+                        while time.time() < deadline:
+                            hb2 = aq._read_heartbeat(int(rid))  # type: ignore[attr-defined]
+                            if getattr(aq, "_runner_is_idle")(hb2):  # type: ignore[misc]
+                                break
+                            time.sleep(0.5)
+                    except Exception:
+                        pass
+
                     results.append(
                         {
                             "runner_id": int(rid),
