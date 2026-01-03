@@ -198,6 +198,18 @@ def summarise_observation(
     # M section to avoid duplication. Memorized nodes are marked with [M] inside W.
     mem_nodes = [n for n in nodes_sorted if bool(n.get("memorized"))]
 
+    # Guidance: keep expands small and populate memory early so CGM has signal.
+    if nodes_sorted and not mem_nodes:
+        suggest_ids = [str(n.get("id") or "").strip() for n in nodes_sorted[:3]]
+        suggest_ids = [x for x in suggest_ids if x]
+        out.append("## Guidance")
+        out.append("- Expand is capped (default 20). Prefer multiple focused expands.")
+        if suggest_ids:
+            out.append(f"- Memory (M) is empty. Commit 1–3 high-signal nodes now, e.g. memory_commit(select_ids={suggest_ids}).")
+        else:
+            out.append("- Memory (M) is empty. Commit 1–3 high-signal nodes now via memory_commit(select_ids=[...]).")
+        out.append("")
+
     # Candidates (from the most recent find). We show these explicitly because
     # find no longer auto-merges candidates into W.
     cands = last_info.get("candidates")
