@@ -136,6 +136,7 @@ Tools (preferred):
        "exact phrase"  => strong phrase
 2) explore_expand(anchor)
    - HARD RULE: provide exactly ONE anchor id (from candidates or W).
+   - Keep expansions small. Prefer multiple focused expands over one huge expand.
 3) memory_commit(select_ids?, keep_ids?, note?, tag?)
    - Marks select_ids as memorized (M ⊂ W). keep_ids means "keep memorized".
    - note/tag are optional; note writes into T (planner-only).
@@ -265,6 +266,15 @@ def parse_action_block(text: str) -> Dict[str, Any]:
 
     stripped = text.strip()
 
+    # 0) If the model emitted a JSON *string* (e.g. "{...}"), unquote once.
+    if stripped.startswith('"') and stripped.endswith('"'):
+        try:
+            _inner = json.loads(stripped)
+            if isinstance(_inner, str):
+                stripped = _inner.strip()
+        except Exception:
+            pass
+
     # 0) Fenced JSON fallback (```json ... ```)
     m_fenced = _FENCED_JSON_RE.search(stripped)
     if m_fenced:
@@ -292,6 +302,11 @@ def parse_action_block(text: str) -> Dict[str, Any]:
 
     matches = list(_BLOCK_RE.finditer(text))
     if not matches:
+        # If tool-calling is enabled, some backends/models may still respond with
+        # plain text (or partial JSON) instead of a <function=...> block.
+        # To keep trajectories running, we can degrade to a noop.
+        if os.environ.get("GP_NOOP_ON_MISSING_FUNCTION_TAG", "1").strip().lower() not in {"0", "false", "no", "off"}:
+            return {"name": "noop", "params": {"type": "noop", "reason": "missing-function-tag"}}
         raise ProtocolError(PlannerErrorCode.MISSING_FUNCTION_TAG.value, "response does not contain <function=...>")
     if len(matches) > 1:
         raise ProtocolError(PlannerErrorCode.INVALID_MULTI_BLOCK.value, "response must contain exactly one function block")
