@@ -1014,7 +1014,15 @@ class PlannerEnv:
                 continue
             if n.get("snippet_lines"):
                 continue
-            r = self.repo_graph.get(nid)
+            r = None
+
+            if hasattr(self, "_repo_nodes_by_id"):
+
+                r = self._repo_nodes_by_id.get(str(nid))
+
+            if r is None and getattr(self, "repo_graph", None) is not None:
+
+                r = self.repo_graph.get_node(nid)
             if isinstance(r, dict) and r.get("snippet_lines"):
                 n["snippet_lines"] = r.get("snippet_lines")
                 if r.get("sig"):
