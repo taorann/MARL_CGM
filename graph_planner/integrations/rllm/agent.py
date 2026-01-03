@@ -90,7 +90,7 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "explore_find",
-            "description": "Search the repository graph to surface a small set of high-signal candidate nodes. This does NOT change the working subgraph; you must call explore_expand(anchor) to expand/merge.",
+            "description": "Search the repository graph and return a ranked list of candidates. The env sets frontier_anchor_id to the top candidate and may seed the top-k candidates into working_subgraph (W) for visibility. Do NOT repeat the exact same find(query) if the target already appears in candidates/W; instead expand or commit memory.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -108,7 +108,7 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "explore_expand",
-            "description": "Expand candidates around the current/selected anchor; merge into working_subgraph.",
+            "description": "Expand around the selected anchor (prefer frontier_anchor_id or a node id from W); merge expanded nodes into working_subgraph. Keep expansions small (env cap is typically 20).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -623,6 +623,47 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     pass
                 raise
 
+
+
+        # --- Anti-loop guard: rewrite repeated identical find(query) into expand(frontier_anchor_id) ---
+        try:
+            if os.environ.get("GP_AVOID_REPEAT_FIND", "1").strip().lower() not in {"0", "false", "no", "off"}:
+                if action.get("name") == "explore":
+                    params = action.get("params") or {}
+                    if isinstance(params, dict) and params.get("op") == "find":
+                        q = str(params.get("query") or "").strip()
+                        if q and len(self._steps) >= 2:
+                            prev = self._steps[-2].action or {}
+                            if isinstance(prev, dict) and prev.get("name") == "explore":
+                                pparams = prev.get("params") or {}
+                                if isinstance(pparams, dict) and pparams.get("op") == "find":
+                                    pq = str(pparams.get("query") or "").strip()
+                                    if pq == q:
+                                        obs = self._steps[-1].observation if self._steps else None
+                                        frontier = None
+                                        if isinstance(obs, dict):
+                                            frontier = obs.get("frontier_anchor_id")
+                                            if not frontier:
+                                                li = obs.get("last_info")
+                                                if isinstance(li, dict):
+                                                    frontier = li.get("frontier_anchor_id")
+                                            if not frontier:
+                                                ws = obs.get("working_subgraph") or obs.get("subgraph") or obs.get("w") or {}
+                                                if isinstance(ws, dict):
+                                                    nodes = ws.get("nodes") or []
+                                                    if isinstance(nodes, list) and nodes:
+                                                        lastn = nodes[-1]
+                                                        if isinstance(lastn, dict):
+                                                            frontier = lastn.get("id")
+                                                        else:
+                                                            frontier = str(lastn)
+                                        if frontier:
+                                            rewritten = {"name": "explore", "params": {"op": "expand", "anchors": [{"id": str(frontier)}]}}
+                                            action = validate_planner_action(rewritten)
+                                            if bool(os.environ.get("DEBUG_ACTION_RESULT")):
+                                                print("[gp-agent] auto_rewrite repeated_find->expand", {"query": q, "anchor": frontier})
+        except Exception:
+            pass
         if self._steps:
             self._steps[-1].action = action
 
