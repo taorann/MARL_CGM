@@ -214,9 +214,40 @@ def summarise_observation(
 
     # Candidates (from the most recent find). We show these explicitly because
     # find no longer auto-merges candidates into W.
+
     cands = last_info.get("candidates")
-    if isinstance(cands, list) and cands:
+    if isinstance(cands, list):
+        q = str(last_info.get("query") or "").strip()
         out.append(f"## Candidates — {len(cands)}")
+        if q:
+            out.append(f"- query: `{q}`")
+        if not cands:
+            out.append("_No candidates matched. Do **not** repeat the same query; broaden it (e.g., drop `symbol:` / split terms) or change the anchor._")
+            out.append("")
+        else:
+            for c in cands[:max(1, working_top_k)]:
+                if not isinstance(c, dict):
+                    continue
+                nid = str(c.get("id") or "").strip()
+                if not nid:
+                    continue
+                kind = str(c.get("kind") or "")
+                path = str(c.get("path") or "")
+                span = c.get("span")
+                if isinstance(span, dict):
+                    s = span.get("start")
+                    e = span.get("end")
+                    if s is not None and e is not None:
+                        path = f"{path}:{s}-{e}"
+                score = c.get("score")
+                if isinstance(score, (int, float)):
+                    out.append(f"- {nid} ({kind}) {path}  score={float(score):.3f}")
+                else:
+                    out.append(f"- {nid} ({kind}) {path}")
+            if len(cands) > max(1, working_top_k):
+                out.append(f"- ... (+{len(cands)-max(1, working_top_k)} more)")
+            out.append("")
+    else:
         for c in cands[:max(1, working_top_k)]:
             if not isinstance(c, dict):
                 continue
