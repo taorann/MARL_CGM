@@ -600,11 +600,27 @@ class GraphPlannerRLLMAgent(BaseAgent):
                 parsed_block = parse_action_block(model_response)
                 action = validate_planner_action(parsed_block)
         except ProtocolError as exc:
-            # Optional rule-fallback (very conservative).
-            if self.use_rule_fallback:
+            # NOTE: When tool-calling is enabled we still sometimes see the model
+            # emit plain text (no tool_calls, no <function=...> block). In that
+            # case `parse_action_block` raises `missing-function-tag`.
+            #
+            # We must not crash the whole trajectory: instead fall back to a
+            # conservative noop (with a short excerpt for debugging).
+            code = str(getattr(exc, "code", ""))
+            if ("missing-function-tag" in code) or ("MISSING_FUNCTION_TAG" in code):
+                excerpt = _truncate(str(model_response or ""), 240)
+                fallback = {"name": "noop", "params": {"reason": "missing_function_tag", "excerpt": excerpt}}
+                action = validate_planner_action(fallback)
+            elif self.use_rule_fallback:
                 fallback = {"name": "noop", "params": {"reason": f"protocol_error:{exc.code}"}}
                 action = validate_planner_action(fallback)
             else:
+                # Best-effort diagnostics to help spot prompt/protocol issues.
+                try:
+                    print("[gp-agent] protocol_error:", code)
+                    print("[gp-agent] raw_model_excerpt=", _truncate(str(model_response or ""), 400))
+                except Exception:
+                    pass
                 raise
 
         if self._steps:
