@@ -476,7 +476,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     reward=float(reward),
                     done=bool(done),
                     info=info or {},
-                    include_issue=True,
+                    include_issue=(len(self._steps) <= 1) or bool(os.environ.get("GP_ALWAYS_INCLUDE_ISSUE")),
                     issue_target_tokens=issue_tokens,
                     steps_target=_safe_int(os.environ.get("GP_STEPS_TARGET"), default=0),
                     working_top_k=working_top_k,
@@ -530,6 +530,39 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     else:
                         m_ids.add(str(n))
 
+                # Optional: richer snapshot (files/kinds) for debugging why the planner repeats.
+                _detail = os.environ.get("GP_PRINT_STATE_DETAIL", "1").strip().lower()
+                detail_on = _detail not in {"0", "false", "no", "off"}
+                extra_state = ""
+                if detail_on:
+                    try:
+                        from collections import Counter
+
+                        file_counts: Counter[str] = Counter()
+                        kind_counts: Counter[str] = Counter()
+                        mem_n = 0
+                        for wn in w_nodes:
+                            if not isinstance(wn, dict):
+                                continue
+                            k = str(wn.get("kind") or "").lower().strip() or "?"
+                            kind_counts[k] += 1
+                            p = str(wn.get("path") or "").strip()
+                            if p:
+                                file_counts[p] += 1
+                            if bool(wn.get("memorized")):
+                                mem_n += 1
+
+                        top_files = ", ".join(f"{p}({c})" for p, c in file_counts.most_common(4))
+                        top_kinds = ", ".join(f"{k}({c})" for k, c in kind_counts.most_common(5))
+                        extra_parts = [f"files={len(file_counts)}", f"mem={mem_n}"]
+                        if top_files:
+                            extra_parts.append(f"top_files={top_files}")
+                        if top_kinds:
+                            extra_parts.append(f"kinds={top_kinds}")
+                        extra_state = " | " + "; ".join(extra_parts)
+                    except Exception:
+                        extra_state = ""
+
                 # Print a tail slice to keep logs manageable.
                 tail = w_nodes[-12:] if len(w_nodes) > 12 else w_nodes
                 out = []
@@ -555,7 +588,11 @@ class GraphPlannerRLLMAgent(BaseAgent):
                         frontier = obs.get("frontier_anchor_id")
                 except Exception:
                     pass
-                print(f"[gp-agent] W(n={len(w_nodes)}) M(n={len(m_nodes)}) frontier={frontier} last_op={last_op} cand={cand_count} W.tail=" + ", ".join(out))
+                print(
+                    f"[gp-agent] W(n={len(w_nodes)}) M(n={len(m_nodes)}) frontier={frontier} "
+                    f"last_op={last_op} cand={cand_count}{extra_state} W.tail="
+                    + ", ".join(out)
+                )
             except Exception:
                 pass
 
