@@ -728,6 +728,29 @@ class PlannerEnv:
                     )
                 else:
                     candidates = []
+
+            # Fallback: if a strict query DSL yields no candidates, retry with a relaxed keyword query.
+            # This helps when the model uses unsupported operators or over-constrains the query.
+            if (not candidates) and query:
+                try:
+                    relaxed_terms = mem_candidates.extract_query_terms(query)
+                    relaxed = " ".join(relaxed_terms).strip()
+                except Exception:
+                    relaxed = ""
+                if relaxed and relaxed != query:
+                    try:
+                        candidates2 = mem_candidates.search_repo_candidates_by_query(
+                            repo_graph=self.repo_graph,
+                            query=relaxed,
+                            total_limit=total_limit,
+                            dir_diversity_k=dir_diversity_k,
+                        )
+                    except Exception:
+                        candidates2 = []
+                    if candidates2:
+                        info["query_relaxed"] = {"from": str(query), "to": relaxed, "cands": len(candidates2)}
+                        candidates = candidates2
+                        query = relaxed
             # Expose candidates to the agent.
             self.last_candidates = candidates
             info["candidates"] = candidates
