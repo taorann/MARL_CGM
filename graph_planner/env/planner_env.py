@@ -715,7 +715,9 @@ class PlannerEnv:
             cand_set = set(cand_ids)
             if cand_set:
                 try:
-                    for n in (self.working_subgraph.nodes or []):
+                    wn = getattr(self.working_subgraph, "nodes", {}) or {}
+                    it = wn.values() if isinstance(wn, dict) else (wn if isinstance(wn, list) else [])
+                    for n in it:
                         if isinstance(n, dict) and isinstance(n.get("id"), str):
                             n["in_last_candidates"] = n.get("id") in cand_set
                 except Exception:
@@ -1582,7 +1584,15 @@ class PlannerEnv:
             for nid in node_ids:
                 if not isinstance(nid, str) or not nid:
                     continue
+
+                # Primary index (fast) + safe fallback for cases where the repo
+                # graph stores nodes differently from our local index.
                 repo_node = self._repo_nodes_by_id.get(nid)
+                if repo_node is None:
+                    try:
+                        repo_node = self.repo_graph.get_node(nid)
+                    except Exception:
+                        repo_node = None
                 if not isinstance(repo_node, dict):
                     continue
 
