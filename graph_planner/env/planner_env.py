@@ -1610,6 +1610,23 @@ class PlannerEnv:
                 tags.add(status)
                 node_copy["tags"] = sorted(tags)
 
+                # Ensure explored nodes carry code snippets.
+                # - We do NOT want file nodes to embed the whole file.
+                # - For symbol-level nodes (func/class/...) we prefer embedded `snippet_lines`.
+                # - If missing, we lazily read a bounded snippet from the sandbox.
+                try:
+                    kind = str(node_copy.get("kind") or node_copy.get("type") or "").lower()
+                    has_snip = bool(node_copy.get("snippet_lines") or node_copy.get("snippet"))
+                    if not has_snip and kind and kind not in {"file", "dir", "directory"}:
+                        sn = self._read_node_snippet(nid)
+                        if isinstance(sn, dict) and sn.get("snippet_lines"):
+                            node_copy["snippet_lines"] = sn.get("snippet_lines")
+                            node_copy["snippet"] = sn.get("snippet")
+                            if sn.get("sig"):
+                                node_copy.setdefault("sig", sn.get("sig"))
+                except Exception:
+                    pass
+
                 working_nodes_by_id[nid] = node_copy
                 working_ids.add(nid)
 
