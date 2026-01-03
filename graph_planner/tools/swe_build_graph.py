@@ -25,6 +25,7 @@ import io
 import json
 import os
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -119,8 +120,13 @@ def _truncate_doc(doc: Optional[str], max_chars: int = 240) -> str:
 def _file_summary_snippet(file_lines: Sequence[str], tree: Optional[ast.AST], *, max_lines: int) -> List[str]:
     """Make a high-signal file-level snippet without embedding child bodies.
 
-    We include a short module header (docstring/imports/comments) and an index
-    of top-level def/class symbols with line numbers.
+    We include:
+      - a tiny module docstring (truncated),
+      - a compact index of top-level def/class symbols (sig @ line).
+
+    NOTE: We intentionally do **NOT** include raw file header code. The full
+    code is pushed down to child nodes (func/class) to avoid a single file node
+    exploding the prompt/context.
     """
     if not file_lines:
         return []
@@ -128,36 +134,104 @@ def _file_summary_snippet(file_lines: Sequence[str], tree: Optional[ast.AST], *,
     if max_lines <= 0:
         return []
 
-    header: List[str] = []
-    # Stop at the first top-level decorator/def/class.
-    for ln in file_lines:
-        s = str(ln)
-        if s.startswith("def ") or s.startswith("class ") or s.startswith("async def ") or s.startswith("@"):
-            break
-        header.append(s.rstrip("\n"))
-        if len(header) >= min(max_lines, 60):
-            break
+    out: List[str] = []
 
+    # 1) Minimal docstring (if any)
+    try:
+        doc = (ast.get_docstring(tree) or "").strip() if tree is not None else ""
+    except Exception:
+        doc = ""
+    if doc:
+        out.append("# Module docstring (truncated):")
+        wrapped = textwrap.wrap(" ".join(doc.split()), width=110)
+        # keep it small; docstring is not the code context we care about
+        for ln in wrapped[: min(6, max_lines - 1)]:
+            out.append(f"# {ln}")
+
+    # 2) Symbol index (sig @ line)
     symbols: List[str] = []
     try:
         body = getattr(tree, "body", []) if tree is not None else []
         for n in body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                symbols.append(f"def {n.name} @ {getattr(n, 'lineno', '?')}")
+                lineno = int(getattr(n, "lineno", 0) or 0)
+                sig = ""
+                if 1 <= lineno <= len(file_lines):
+                    sig = str(file_lines[lineno - 1]).strip()
+                if not sig:
+                    sig = f"def {n.name}(...)"
+                if len(sig) > 160:
+                    sig = sig[:157] + "..."
+                symbols.append(f"{sig}  # L{lineno if lineno else '?'}")
             elif isinstance(n, ast.ClassDef):
-                symbols.append(f"class {n.name} @ {getattr(n, 'lineno', '?')}")
+                lineno = int(getattr(n, "lineno", 0) or 0)
+                sig = ""
+                if 1 <= lineno <= len(file_lines):
+                    sig = str(file_lines[lineno - 1]).strip()
+                if not sig:
+                    sig = f"class {n.name}(...)"
+                if len(sig) > 160:
+                    sig = sig[:157] + "..."
+                symbols.append(f"{sig}  # L{lineno if lineno else '?'}")
     except Exception:
         symbols = []
 
-    out = header[:]
     if symbols and len(out) < max_lines:
         if out and out[-1] != "":
             out.append("")
-        out.append("# Top-level symbols (name @ line):")
+        out.append("# Top-level symbols (sig @ line):")
         for sym in symbols:
             if len(out) >= max_lines:
                 break
             out.append(sym)
+
+    # Clip final
+    return out[:max_lines]
+
+
+def _class_summary_snippet(file_lines: Sequence[str], cls: ast.ClassDef, *, max_lines: int) -> List[str]:
+    """Compact class-level snippet (avoid embedding the whole class body).
+
+    The goal is to keep the class node lightweight, and push real code into
+    method/function child nodes.
+    """
+    if max_lines <= 0 or not file_lines:
+        return []
+
+    out: List[str] = []
+    # Signature line
+    try:
+        sig = file_lines[int(cls.lineno) - 1].rstrip("\n")
+        out.append(sig)
+    except Exception:
+        out.append(f"class {cls.name}:")
+
+    # Docstring (as comments)
+    doc = ast.get_docstring(cls) or ""
+    if doc:
+        out.append("# Docstring (truncated):")
+        for line in textwrap.wrap(doc, width=100)[: min(6, max_lines - len(out))]:
+            out.append(f"# {line}")
+
+    # Method index
+    methods: List[Tuple[int, str]] = []
+    for stmt in cls.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods.append((int(getattr(stmt, "lineno", 0) or 0), getattr(stmt, "name", "")))
+    if methods and len(out) < max_lines:
+        out.append("# Methods:")
+        for ln, name in methods[: min(20, max_lines - len(out))]:
+            if ln <= 0:
+                out.append(f"- {name}()")
+            else:
+                try:
+                    line = file_lines[ln - 1].strip()
+                except Exception:
+                    line = f"def {name}(...):"
+                if len(line) > 200:
+                    line = line[:200] + "…"
+                out.append(f"- {line}  # L{ln}")
+
     return out[:max_lines]
 
 
@@ -170,6 +244,7 @@ class GraphBuilder(ast.NodeVisitor):
         file_lines: Optional[Sequence[str]] = None,
         embed_snippets: bool = True,
         max_snippet_lines: int = 120,
+        max_class_snippet_lines: int = 32,
     ) -> None:
         self.file_rel = file_rel
         self.file_node_id = file_node_id
@@ -178,6 +253,7 @@ class GraphBuilder(ast.NodeVisitor):
         self._file_lines = list(file_lines or [])
         self._embed_snippets = bool(embed_snippets)
         self._max_snippet_lines = int(max_snippet_lines)
+        self._max_class_snippet_lines = int(max_class_snippet_lines)
         # stack of container node ids (file/class/function)
         self.container_stack: List[str] = [file_node_id]
         # stack of names for qualname
@@ -249,7 +325,8 @@ class GraphBuilder(ast.NodeVisitor):
         }
         snip: List[str] = []
         if self._embed_snippets and self._file_lines:
-            snip = _clip_snippet_lines(self._file_lines, start, end, max_lines=self._max_snippet_lines)
+            # IMPORTANT: keep class nodes compact; method/function bodies are separate nodes.
+            snip = _class_summary_snippet(self._file_lines, node, max_lines=self._max_class_snippet_lines)
             if snip:
                 payload["snippet_lines"] = snip
         payload["sig"] = _extract_sig_from_snippet(snip) or f"class {qn}"
@@ -315,9 +392,19 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
     #   - File nodes: keep a compact module header + symbol index (avoid noisy code).
     #   - Def nodes (func/class): allow a larger embedded snippet to support CGM.
     # Backward-compat: GP_MAX_SNIPPET_LINES still works as a global fallback.
-    max_snippet_lines = int(os.environ.get("GP_MAX_SNIPPET_LINES", "120") or 120)
-    max_file_snippet_lines = int(os.environ.get("GP_MAX_FILE_SNIPPET_LINES", "0") or 0) or max_snippet_lines
-    max_def_snippet_lines = int(os.environ.get("GP_MAX_DEF_SNIPPET_LINES", "0") or 0) or max_snippet_lines
+    # Keep defaults conservative to avoid prompt explosion.
+    # You can override per-node budgets with:
+    #   - GP_MAX_FILE_SNIPPET_LINES (file node summary)
+    #   - GP_MAX_DEF_SNIPPET_LINES  (func/class node code)
+    max_snippet_lines = int(os.environ.get("GP_MAX_SNIPPET_LINES", "80") or 80)
+    max_file_snippet_lines = int(os.environ.get("GP_MAX_FILE_SNIPPET_LINES", "40") or 40)
+    max_def_snippet_lines = int(os.environ.get("GP_MAX_DEF_SNIPPET_LINES", "80") or 80)
+    max_class_snippet_lines = int(os.environ.get("GP_MAX_CLASS_SNIPPET_LINES", "32") or 32)
+    # Back-compat: if a budget is set to 0, fall back to the global.
+    if max_file_snippet_lines <= 0:
+        max_file_snippet_lines = max_snippet_lines
+    if max_def_snippet_lines <= 0:
+        max_def_snippet_lines = max_snippet_lines
 
     for fp in iter_python_files(repo):
         rel = _rel_posix(fp, repo)
@@ -359,6 +446,7 @@ def build_repo_graph(repo: Path) -> Dict[str, Any]:
             file_lines=file_lines,
             embed_snippets=embed_snippets,
             max_snippet_lines=max_def_snippet_lines,
+            max_class_snippet_lines=max_class_snippet_lines,
         )
         gb.visit(tree)
 
