@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -537,7 +538,22 @@ class GraphPlannerRLLMAgent(BaseAgent):
                         nid = str(n)
                     mark = "[M]" if nid in m_ids else "[-]"
                     out.append(f"{mark}{nid}")
-                print(f"[gp-agent] W(n={len(w_nodes)}) M(n={len(m_nodes)}) W.tail=" + ", ".join(out))
+                last_info = obs.get("last_info") if isinstance(obs, dict) else None
+                cand_count = None
+                last_op = None
+                frontier = None
+                try:
+                    if isinstance(last_info, dict):
+                        c = last_info.get("candidates")
+                        if isinstance(c, list):
+                            cand_count = len(c)
+                        last_op = last_info.get("op")
+                        frontier = last_info.get("frontier_anchor_id")
+                    if isinstance(obs, dict) and obs.get("frontier_anchor_id"):
+                        frontier = obs.get("frontier_anchor_id")
+                except Exception:
+                    pass
+                print(f"[gp-agent] W(n={len(w_nodes)}) M(n={len(m_nodes)}) frontier={frontier} last_op={last_op} cand={cand_count} W.tail=" + ", ".join(out))
             except Exception:
                 pass
 
@@ -627,55 +643,100 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     pass
                 raise
 
-
-        # --- Anti-loop guard: rewrite repeated identical find(query) into expand(frontier_anchor_id) ---
+        # --- Anti-loop guard: prevent looping on identical explore/find ---
         try:
-            if os.environ.get("GP_AVOID_REPEAT_FIND", "1").strip().lower() not in {"0", "false", "no", "off"}:
-                if action.get("name") == "explore":
-                    params = action.get("params") or {}
-                    if isinstance(params, dict) and params.get("op") == "find":
-                        q = str(params.get("query") or "").strip()
-                        if q and len(self._steps) >= 2:
-                            prev = self._steps[-2].action or {}
-                            if isinstance(prev, dict) and prev.get("name") == "explore":
-                                pparams = prev.get("params") or {}
-                                if isinstance(pparams, dict) and pparams.get("op") == "find":
-                                    pq = str(pparams.get("query") or "").strip()
-                                    if pq == q:
-                                        obs = self._steps[-1].observation if self._steps else None
-                                        frontier = None
-                                        # Prefer explicit frontier id if available
-                                        if isinstance(obs, dict):
-                                            frontier = obs.get("frontier_anchor_id")
-                                            if not frontier:
-                                                li = obs.get("last_info")
-                                                if isinstance(li, dict):
-                                                    frontier = li.get("frontier_anchor_id")
-                                            # Fallback to last candidate id
-                                            if not frontier:
-                                                li = obs.get("last_info")
-                                                if isinstance(li, dict):
-                                                    cands = li.get("candidates")
-                                                    if isinstance(cands, list) and cands:
-                                                        c0 = cands[0]
-                                                        if isinstance(c0, dict):
-                                                            frontier = c0.get("id")
-                                            # Fallback to last node in working subgraph
-                                            if not frontier:
-                                                ws = obs.get("working_subgraph") or obs.get("w") or obs.get("subgraph") or {}
-                                                if isinstance(ws, dict):
-                                                    nodes = ws.get("nodes") or []
-                                                    if isinstance(nodes, list) and nodes:
-                                                        lastn = nodes[-1]
-                                                        if isinstance(lastn, dict):
-                                                            frontier = lastn.get("id")
-                                                        else:
-                                                            frontier = str(lastn)
-                                        if frontier:
-                                            rewritten = {"name": "explore", "params": {"op": "expand", "anchors": [{"id": str(frontier)}]}}
-                                            action = validate_planner_action(rewritten)
-                                            if bool(os.environ.get("DEBUG_ACTION_RESULT")):
-                                                print("[gp-agent] auto_rewrite repeated_find->expand", {"query": q, "anchor": frontier})
+            if os.environ.get("GP_AVOID_REPEAT_FIND", "1").strip().lower() not in {"0", "false", "no", "off"} and len(self._steps) >= 2:
+                def _is_explore_find(a: Any) -> bool:
+                    try:
+                        if a is None:
+                            return False
+                        if isinstance(a, Mapping):
+                            if a.get("name") == "explore":
+                                p = a.get("params") or {}
+                                return isinstance(p, dict) and str(p.get("op") or "").lower() == "find"
+                            return str(a.get("type") or "").lower() == "explore" and str(a.get("op") or "").lower() == "find"
+                        return str(getattr(a, "type", "")).lower() == "explore" and str(getattr(a, "op", "")).lower() == "find"
+                    except Exception:
+                        return False
+
+                def _get_query(a: Any) -> str:
+                    if a is None:
+                        return ""
+                    if isinstance(a, Mapping):
+                        if a.get("name") == "explore":
+                            p = a.get("params") or {}
+                            if isinstance(p, dict):
+                                return str(p.get("query") or "").strip()
+                        return str(a.get("query") or "").strip()
+                    return str(getattr(a, "query", "") or "").strip()
+
+                def _get_anchors(a: Any) -> Any:
+                    if a is None:
+                        return []
+                    if isinstance(a, Mapping):
+                        if a.get("name") == "explore":
+                            p = a.get("params") or {}
+                            if isinstance(p, dict):
+                                return p.get("anchors") or []
+                        return a.get("anchors") or []
+                    return getattr(a, "anchors", []) or []
+
+                prev_action = self._steps[-2].action
+                if _is_explore_find(action) and _is_explore_find(prev_action):
+                    q = _get_query(action)
+                    pq = _get_query(prev_action)
+                    if q and pq and q == pq and _get_anchors(action) == _get_anchors(prev_action):
+                        obs = (self._steps[-1].observation or {}) if self._steps else {}
+                        last_info = obs.get("last_info") or {}
+                        frontier = obs.get("frontier_anchor_id") or last_info.get("frontier_anchor_id") or None
+
+                        # A) If a frontier anchor exists, expand it instead of repeating the find.
+                        if isinstance(frontier, str) and frontier.strip():
+                            rewritten = {
+                                "name": "explore",
+                                "params": {
+                                    "op": "expand",
+                                    "anchors": [{"id": frontier}],
+                                    "hop": 1,
+                                    "limit": int(os.environ.get("GP_REPEAT_FIND_EXPAND_LIMIT", "20") or 20),
+                                },
+                            }
+                            action = validate_planner_action(rewritten)
+                            if os.environ.get("GP_DEBUG_REPEAT_FIND", "0").strip().lower() in {"1", "true", "yes", "y"}:
+                                print(f"[gp-agent] anti-loop: repeated find({q!r}) -> expand({frontier})")
+                        else:
+                            # B) If the repeated find returned 0 candidates, broaden the query once.
+                            cands = last_info.get("candidates")
+                            if isinstance(cands, list) and len(cands) == 0:
+                                def _fallback_query(qs: str) -> str:
+                                    qs = str(qs or "").strip()
+                                    if not qs:
+                                        return ""
+                                    parts = []
+                                    for token in qs.split():
+                                        if ":" in token:
+                                            parts.append(token.split(":", 1)[1])
+                                        else:
+                                            parts.append(token)
+                                    qs = " ".join(parts).strip()
+                                    qs = re.sub(r"[\._/\-:]+", " ", qs)
+                                    qs = re.sub(r"\s+", " ", qs).strip()
+                                    return qs
+
+                                fb = _fallback_query(q)
+                                if fb and fb != q:
+                                    rewritten = {
+                                        "name": "explore",
+                                        "params": {
+                                            "op": "find",
+                                            "query": fb,
+                                            "hop": 1,
+                                            "limit": int(os.environ.get("GP_FIND_LIMIT", "50") or 50),
+                                        },
+                                    }
+                                    action = validate_planner_action(rewritten)
+                                    if os.environ.get("GP_DEBUG_REPEAT_FIND", "0").strip().lower() in {"1", "true", "yes", "y"}:
+                                        print(f"[gp-agent] anti-loop: repeated find({q!r}) w/0 candidates -> find({fb!r})")
         except Exception:
             pass
 
