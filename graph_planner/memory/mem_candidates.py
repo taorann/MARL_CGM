@@ -38,6 +38,42 @@ _QUERY_STOPWORDS = {
 }
 
 
+def _symbol_variants(sym: str) -> List[str]:
+    """Return symbol string variants to make `symbol:` queries robust.
+
+    Different repo-graph builders encode function/method nodes differently.
+    For example, a method may appear as `WCS.calc_footprint` or only
+    `calc_footprint`. The planner often emits qualified symbols, so we
+    generate a small set of progressively less-qualified variants.
+    """
+
+    s = (sym or "").strip()
+    if not s:
+        return []
+    out: List[str] = [s]
+    # Dot-qualified symbols: keep only the last part, and also Class.method.
+    if "." in s:
+        parts = [p for p in s.split(".") if p]
+        if parts:
+            out.append(parts[-1])
+        if len(parts) >= 2:
+            out.append(f"{parts[-2]}.{parts[-1]}")
+    # Colon-qualified (rare): also keep the last segment.
+    if ":" in s:
+        parts = [p for p in s.split(":") if p]
+        if parts:
+            out.append(parts[-1])
+    # De-duplicate while preserving order.
+    seen: Set[str] = set()
+    uniq: List[str] = []
+    for x in out:
+        xl = x.strip()
+        if xl and xl not in seen:
+            uniq.append(xl)
+            seen.add(xl)
+    return uniq
+
+
 def extract_query_terms(query: Any, max_terms: int = 16) -> List[str]:
     """Normalize an explore query to a small list of keyword-ish terms.
 
@@ -428,16 +464,32 @@ def search_repo_candidates_by_query(
         reasons: List[str] = []
 
         # Directives: symbol / path
+        # NOTE: `symbol:` queries must be robust to different graph encodings.
+        # We therefore match a small set of symbol variants, e.g.
+        #   `WCS.calc_footprint` -> {`WCS.calc_footprint`, `calc_footprint`, `WCS.calc_footprint`}.
         for sym in spec.symbol_terms:
-            sl = sym.lower()
-            if not sl:
+            variants = _symbol_variants(sym)
+            if not variants:
                 continue
-            if sl == (nid_s or "").lower() or sl == (name or "").lower():
-                score += 8.0
-                reasons.append("symbol_exact")
-            elif sl in (nid_s or "").lower() or sl in (name or "").lower():
-                score += 4.0
-                reasons.append("symbol")
+            nid_l = (nid_s or "").lower()
+            name_l = (name or "").lower()
+            matched = False
+            for v in variants:
+                vl = v.lower()
+                if not vl:
+                    continue
+                if vl == nid_l or vl == name_l:
+                    score += 8.0 if v == sym else 6.0
+                    reasons.append("symbol_exact")
+                    matched = True
+                    break
+                if vl in nid_l or vl in name_l:
+                    # Qualified match gets slightly higher score than relaxed match.
+                    score += 4.0 if v == sym else 2.5
+                    reasons.append("symbol")
+                    matched = True
+                    break
+            # If nothing matched, we leave score unchanged (will be filtered by score<=0).
 
         for pt in spec.path_terms:
             pl = pt.lower()
