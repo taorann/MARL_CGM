@@ -127,6 +127,8 @@ Concepts:
 Tools (preferred):
 1) explore_find(query)
    - HARD RULE: provide exactly ONE query string.
+   - Returns `candidates` and updates `frontier_anchor_id` to the top candidate.
+   - The environment may also seed the top-k candidates into the working_subgraph (W) for visibility.
    - Query is a single string that may contain multiple keywords.
    - Query supports a lightweight DSL:
        +term   => strong (must match)
@@ -134,9 +136,11 @@ Tools (preferred):
        symbol:Foo  => strong symbol constraint
        path:pkg/mod.py  => path constraint
        "exact phrase"  => strong phrase
+   - IMPORTANT: Do NOT repeat the exact same find(query) if the target already appears in Candidates or W.
+     If it appears, move on to explore_expand(anchor) and then memory_commit(...).
 2) explore_expand(anchor)
    - HARD RULE: provide exactly ONE anchor id (from candidates or W).
-   - Keep expansions small. Prefer multiple focused expands over one huge expand.
+   - Keep expansions small (env cap is typically 20). Prefer multiple focused expands over one huge expand.
 3) memory_commit(select_ids?, keep_ids?, note?, tag?)
    - Marks select_ids as memorized (M ⊂ W). keep_ids means "keep memorized".
    - note/tag are optional; note writes into T (planner-only).
