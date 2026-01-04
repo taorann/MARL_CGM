@@ -47,7 +47,8 @@ class RepairAction(BaseModel):
     type: Literal["repair"] = "repair"
     apply: bool
     issue: Dict[str, Any]
-    plan: Optional[str] = None  # 仅 apply=True 时需要，用于 Collater→CGM
+    # Plan can be a list of short steps (preferred) or a single string (legacy).
+    plan: Optional[Union[List[str], str]] = None  # 仅 apply=True 时需要，用于 Collater→CGM
     plan_targets: List[Dict[str, Any]] = Field(default_factory=list)
     patch: Optional[Dict[str, Any]] = None
     schema_version: int = 1
