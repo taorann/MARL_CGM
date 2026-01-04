@@ -359,7 +359,8 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
             selector["tag"] = tag
         return {
             "name": "memory",
-            "params": {"intent": "commit", "target": "note", "selector": selector},
+            # Text memory lives in observation, not graph memory.
+            "params": {"intent": "commit", "target": "observation", "selector": selector},
         }
 
     # direct tools that match internal action names
@@ -423,6 +424,15 @@ class GraphPlannerRLLMAgent(BaseAgent):
         self.system_prompt = system_prompt or PLANNER_CONTRACT.SYSTEM_PROMPT
         self.use_rule_fallback = bool(use_rule_fallback)
 
+        # Diagnostics: explicitly log whether a custom system prompt is used.
+        try:
+            src = "override" if system_prompt is not None else "default"
+            head = (self.system_prompt or "").strip().splitlines()[0][:160] if self.system_prompt else ""
+            print(f"[gp-agent] system_prompt_source={src} chars={len(self.system_prompt or '')} head={head!r}")
+        except Exception:
+            pass
+
+
         # Tool-use knobs.
         #  - required: backend enforces at least one tool call per turn (preferred)
         #  - auto: model may choose tool or text
@@ -469,7 +479,8 @@ class GraphPlannerRLLMAgent(BaseAgent):
             working_snippet_k = _safe_int(os.environ.get("GP_WORKING_SNIPPET_K"), default=2)
             working_snippet_lines = _safe_int(os.environ.get("GP_WORKING_SNIPPET_LINES"), default=12)
             max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_LINES"), default=80)
-            max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=5000)
+            max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=20000)
+            full_working = bool(int(os.environ.get("GP_FULL_W", "1")))
             try:
                 obs_text, _meta = summarise_observation(
                     observation,
@@ -487,6 +498,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     working_snippet_lines=working_snippet_lines,
                     working_max_lines=max_lines,
                     working_max_chars=max_chars,
+                    full_working=full_working,
                 )
             except Exception:
                 obs_text = _safe_json(observation)
@@ -653,6 +665,21 @@ class GraphPlannerRLLMAgent(BaseAgent):
                 if not isinstance(args, dict):
                     args = {}
                 internal = _tool_call_to_internal_action(str(name or ""), args)
+                # Tool-call repair lacks issue/apply in args; fill from latest observation.
+                if isinstance(internal, dict) and internal.get("name") == "repair":
+                    try:
+                        internal_params = dict(internal.get("params") or {})
+                        # Tool-call semantics: asking for repair means apply=True by default.
+                        internal_params.setdefault("apply", True)
+                        if "issue" not in internal_params:
+                            obs = self._steps[-1].observation if self._steps else {}
+                            if isinstance(obs, dict) and isinstance(obs.get("issue"), dict):
+                                internal_params["issue"] = obs.get("issue")
+                            else:
+                                internal_params["issue"] = {}
+                        internal["params"] = internal_params
+                    except Exception:
+                        pass
                 action = validate_planner_action(internal)
             else:
                 # 2) Legacy text protocol (<function=...> blocks or bare JSON).
@@ -776,6 +803,77 @@ class GraphPlannerRLLMAgent(BaseAgent):
                                     action = validate_planner_action(rewritten)
                                     if os.environ.get("GP_DEBUG_REPEAT_FIND", "0").strip().lower() in {"1", "true", "yes", "y"}:
                                         print(f"[gp-agent] anti-loop: repeated find({q!r}) w/0 candidates -> find({fb!r})")
+
+                # C) Oscillation guard: find(q)->expand(frontier)->find(q)->... can bypass the
+                #    consecutive-find check above. If we detect this pattern and the expand
+                #    produced no new nodes (ΔW=0), force a memory_commit on the frontier to
+                #    unlock repair, or diversify the anchor.
+                if _is_explore_find(action) and len(self._steps) >= 3:
+                    q = _get_query(action)
+                    prev_action = self._steps[-2].action
+                    prevprev_action = self._steps[-3].action
+
+                    def _is_explore_expand(a: Any) -> bool:
+                        try:
+                            if a is None:
+                                return False
+                            if isinstance(a, Mapping):
+                                if a.get("name") == "explore":
+                                    p = a.get("params") or {}
+                                    return isinstance(p, dict) and str(p.get("op") or "").lower() == "expand"
+                                return str(a.get("type") or "").lower() == "explore" and str(a.get("op") or "").lower() == "expand"
+                            return str(getattr(a, "type", "")).lower() == "explore" and str(getattr(a, "op", "")).lower() == "expand"
+                        except Exception:
+                            return False
+
+                    # Pattern: previous step was expand, and two steps ago was the same find query.
+                    if q and _is_explore_expand(prev_action) and _is_explore_find(prevprev_action) and _get_query(prevprev_action) == q:
+                        obs = (self._steps[-1].observation or {}) if self._steps else {}
+                        last_info = obs.get("last_info") or {}
+                        frontier = obs.get("frontier_anchor_id") or last_info.get("frontier_anchor_id") or None
+                        delta_w = last_info.get("delta_working_nodes")
+                        mem_stats = obs.get("memory_stats") or {}
+                        mem_n = 0
+                        try:
+                            mem_n = int(mem_stats.get("n_nodes") or 0)
+                        except Exception:
+                            mem_n = 0
+
+                        # Only intervene if expand didn't grow the working subgraph.
+                        if (delta_w is not None) and (int(delta_w) == 0) and isinstance(frontier, str) and frontier.strip():
+                            # Prefer committing frontier to graph memory if memory is empty.
+                            if mem_n == 0:
+                                rewritten = {
+                                    "name": "memory",
+                                    "params": {
+                                        "intent": "commit",
+                                        "target": "explore",
+                                        "selector": {
+                                            "select_ids": [frontier],
+                                            "note": f"auto-commit frontier to break find/expand loop on query: {q}",
+                                        },
+                                    },
+                                }
+                                action = validate_planner_action(rewritten)
+                                if os.environ.get("GP_DEBUG_REPEAT_FIND", "0").strip().lower() in {"1", "true", "yes", "y"}:
+                                    print(f"[gp-agent] anti-loop: oscillation find/expand on {q!r} (ΔW=0) -> memory_commit({frontier})")
+                            else:
+                                # Memory already has evidence; encourage diversification by expanding a different candidate.
+                                cands = last_info.get("candidates")
+                                alt = None
+                                if isinstance(cands, list):
+                                    for c in cands:
+                                        if isinstance(c, dict) and c.get("id") and str(c.get("id")) != frontier:
+                                            alt = str(c.get("id"))
+                                            break
+                                if alt:
+                                    rewritten = {
+                                        "name": "explore",
+                                        "params": {"op": "expand", "anchors": [{"id": alt}], "hop": 1, "limit": 30},
+                                    }
+                                    action = validate_planner_action(rewritten)
+                                    if os.environ.get("GP_DEBUG_REPEAT_FIND", "0").strip().lower() in {"1", "true", "yes", "y"}:
+                                        print(f"[gp-agent] anti-loop: oscillation (ΔW=0) -> expand(alt={alt})")
         except Exception:
             pass
 
