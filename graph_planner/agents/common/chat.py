@@ -73,6 +73,7 @@ def summarise_observation(
     working_snippet_lines: int = 12,
     working_max_lines: int = 80,
     working_max_chars: int = 6000,
+    full_working: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     """Convert an env observation into a compact prompt string + metadata.
 
@@ -375,6 +376,33 @@ def summarise_observation(
                 out.append(f"- kinds: {top_kinds}")
         except Exception:
             pass
+
+        # Optionally include a compact *full* index of W so the planner can make decisions based on the
+        # entire working set (not only the top-K preview). This is intentionally snippet-free.
+        if full_working:
+            try:
+                import os as _os
+                full_limit = int(_os.environ.get("GP_FULL_W_LIMIT", "800"))
+            except Exception:
+                full_limit = 800
+            out.append("### Working index (full, compact)")
+            out.append(f"(Up to {full_limit} nodes; fields: [M]=memorized, kind, path, name, id)")
+            shown = 0
+            for n in nodes_sorted:
+                if shown >= full_limit:
+                    break
+                nid = str(n.get("id") or "")
+                kind = str(n.get("kind") or n.get("type") or "")
+                name = str(n.get("name") or n.get("symbol") or "")
+                path = str(n.get("path") or n.get("file") or n.get("filepath") or "")
+                mem = "[M]" if bool(n.get("memorized")) else "   "
+                # Keep each line short and stable.
+                line = f"- {mem} {kind[:18]:18} {path[:64]:64} {name[:40]:40} {nid[:32]}"
+                out.append(line.rstrip())
+                shown += 1
+            if len(nodes_sorted) > shown:
+                out.append(f"- ... (+{len(nodes_sorted)-shown} more)")
+            out.append("")
 
         out.append(
             f"(List truncated to {working_list_limit}; snippets include candidate previews, memorized nodes, "
