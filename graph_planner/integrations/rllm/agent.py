@@ -476,7 +476,7 @@ class GraphPlannerRLLMAgent(BaseAgent):
             working_list_limit = _safe_int(os.environ.get("GP_WORKING_LIST_LIMIT"), default=80)
             memory_list_limit = _safe_int(os.environ.get("GP_MEMORY_LIST_LIMIT"), default=30)
             text_memory_k = _safe_int(os.environ.get("GP_TEXT_MEMORY_K"), default=8)
-            working_snippet_k = _safe_int(os.environ.get("GP_WORKING_SNIPPET_K"), default=2)
+            working_snippet_k = _safe_int(os.environ.get("GP_WORKING_SNIPPET_K"), default=8)
             working_snippet_lines = _safe_int(os.environ.get("GP_WORKING_SNIPPET_LINES"), default=12)
             max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_LINES"), default=80)
             max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=20000)
@@ -589,6 +589,8 @@ class GraphPlannerRLLMAgent(BaseAgent):
                 cand_count = None
                 last_op = None
                 frontier = None
+                candidates_preview = ""
+                new_nodes_preview = ""
                 try:
                     if isinstance(last_info, dict):
                         c = last_info.get("candidates")
@@ -598,6 +600,51 @@ class GraphPlannerRLLMAgent(BaseAgent):
                         frontier = last_info.get("frontier_anchor_id")
                     if isinstance(obs, dict) and obs.get("frontier_anchor_id"):
                         frontier = obs.get("frontier_anchor_id")
+                    if isinstance(last_info, dict) and isinstance(last_info.get("candidates"), list):
+                        cand_items = []
+                        for cand in last_info.get("candidates")[:5]:
+                            if not isinstance(cand, dict):
+                                continue
+                            cid = str(cand.get("id") or "").strip()
+                            ckind = str(cand.get("kind") or "").strip()
+                            cpath = str(cand.get("path") or "").strip()
+                            cname = str(cand.get("name") or cand.get("symbol") or "").strip()
+                            label_parts = [p for p in (cid, ckind, cpath, cname) if p]
+                            if label_parts:
+                                cand_items.append("/".join(label_parts))
+                        if cand_items:
+                            candidates_preview = ", ".join(cand_items)
+                    if len(self._steps) >= 2:
+                        prev_obs = self._steps[-2].observation
+                        prev_ws = prev_obs.get("working_subgraph") if isinstance(prev_obs, dict) else None
+                        prev_nodes = []
+                        if isinstance(prev_ws, dict):
+                            prev_nodes = prev_ws.get("nodes") or []
+                        elif isinstance(prev_ws, list):
+                            prev_nodes = prev_ws
+                        prev_ids = set()
+                        for pn in prev_nodes:
+                            if isinstance(pn, dict):
+                                prev_ids.add(str(pn.get("id") or ""))
+                            else:
+                                prev_ids.add(str(pn))
+                        new_items = []
+                        for wn in w_nodes:
+                            nid = str(wn.get("id") or "") if isinstance(wn, dict) else str(wn)
+                            if not nid or nid in prev_ids:
+                                continue
+                            if isinstance(wn, dict):
+                                nkind = str(wn.get("kind") or "").strip()
+                                npath = str(wn.get("path") or "").strip()
+                                nname = str(wn.get("name") or wn.get("symbol") or "").strip()
+                                label_parts = [p for p in (nid, nkind, npath, nname) if p]
+                                new_items.append("/".join(label_parts))
+                            else:
+                                new_items.append(nid)
+                            if len(new_items) >= 6:
+                                break
+                        if new_items:
+                            new_nodes_preview = ", ".join(new_items)
                 except Exception:
                     pass
                 print(
@@ -605,6 +652,10 @@ class GraphPlannerRLLMAgent(BaseAgent):
                     f"last_op={last_op} cand={cand_count}{extra_state} W.tail="
                     + ", ".join(out)
                 )
+                if new_nodes_preview:
+                    print(f"[gp-agent] W.new: {new_nodes_preview}")
+                if candidates_preview:
+                    print(f"[gp-agent] candidates.top: {candidates_preview}")
             except Exception:
                 pass
 

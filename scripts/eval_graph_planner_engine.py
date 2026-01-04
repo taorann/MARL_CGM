@@ -1085,6 +1085,14 @@ def _parse_args() -> argparse.Namespace:
     except Exception:
         # Be conservative: do not fail parsing due to this heuristic.
         pass
+    try:
+        LOGGER.info(
+            "Token caps resolved: per-step max_output_tokens=%s | episode max_response_tokens=%s",
+            getattr(args, "max_output_tokens", None),
+            getattr(args, "max_response_tokens", None),
+        )
+    except Exception:
+        pass
 
     config_path: Path | None = None
     if args.config is not None:
@@ -1688,4 +1696,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

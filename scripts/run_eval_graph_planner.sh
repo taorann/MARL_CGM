@@ -69,6 +69,7 @@ if [[ $NEED_REMOTE_SWE -eq 1 ]]; then
   fi
 fi
 
+set -x
 PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
 TOKENIZERS_PARALLELISM="false" \
 python "${ROOT_DIR}/scripts/eval_graph_planner_engine.py" \
