@@ -917,7 +917,27 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
-    parser.add_argument("--max-response-tokens", "--max_output_tokens", dest="max_response_tokens", type=int, default=4096)
+
+    # Token budgets:
+    # - max_output_tokens: per-step completion cap (recommended knob)
+    # - max_response_tokens: episode-level cumulative cap used by rLLM's AgentExecutionEngine.
+    #   Set this very large to effectively disable trajectory-level truncation while
+    #   still keeping per-step output bounded.
+    parser.add_argument(
+        "--max-response-tokens",
+        dest="max_response_tokens",
+        type=int,
+        default=200000,
+        help="Episode-level cumulative response budget (rLLM). Set large to avoid TRUNCATION.",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        "--max_output_tokens",
+        dest="max_output_tokens",
+        type=int,
+        default=1024,
+        help="Per-step completion cap for the planner model.",
+    )
     parser.add_argument("--max-steps", type=int, default=8, help="Upper bound on planner interactions per task")
     parser.add_argument("--parallel", type=int, default=4, help="Number of parallel agent/environment pairs")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on the number of tasks to evaluate")
@@ -1042,6 +1062,30 @@ def _parse_args() -> argparse.Namespace:
     if args.config is None:
         args.config = config_args.config
 
+    # Backward compatibility: older configs/CLI used --max-response-tokens (max_response_tokens)
+    # as a per-step completion cap. Starting from v8 we separate:
+    #   - max_output_tokens (per-step)
+    #   - max_response_tokens (episode cumulative)
+    # If a small max_response_tokens is set while max_output_tokens remains default,
+    # treat it as the intended per-step cap and relax the episode budget.
+    try:
+        if (
+            getattr(args, "max_output_tokens", None) == 1024
+            and getattr(args, "max_response_tokens", None) is not None
+            and int(args.max_response_tokens) != 200000
+            and int(args.max_response_tokens) <= 32768
+        ):
+            LOGGER.info(
+                "Interpreting max_response_tokens=%s as per-step cap (legacy). Setting max_output_tokens=%s and max_response_tokens=200000.",
+                args.max_response_tokens,
+                args.max_response_tokens,
+            )
+            args.max_output_tokens = int(args.max_response_tokens)
+            args.max_response_tokens = 200000
+    except Exception:
+        # Be conservative: do not fail parsing due to this heuristic.
+        pass
+
     config_path: Path | None = None
     if args.config is not None:
         config_path = Path(args.config).resolve()
@@ -1162,7 +1206,8 @@ def _configure_runtime_env(
     os.environ["PLANNER_MODEL_MODEL"] = str(args.planner_model)
     os.environ["PLANNER_MODEL_TEMPERATURE"] = str(args.planner_temperature)
     os.environ["PLANNER_MODEL_TOP_P"] = str(args.planner_top_p)
-    os.environ["PLANNER_MODEL_MAX_TOKENS"] = str(args.max_response_tokens)
+    # The planner model's per-step completion cap.
+    os.environ["PLANNER_MODEL_MAX_TOKENS"] = str(getattr(args, "max_output_tokens", args.max_response_tokens))
     os.environ["PLANNER_MODEL_TIMEOUT_S"] = str(int(args.planner_timeout))
     if args.planner_tokenizer:
         os.environ["PLANNER_MODEL_TOKENIZER_PATH"] = str(args.planner_tokenizer)
@@ -1559,6 +1604,22 @@ def main() -> None:
     if system_prompt_override is not None:
         agent_args["system_prompt"] = system_prompt_override
 
+    # Diagnostics: make it explicit which system prompt is used.
+    try:
+        prompt_source = "default"
+        prompt_detail = ""
+        if system_prompt_override is not None:
+            prompt_source = "override"
+            if args.agent_system_prompt_path:
+                prompt_detail = f"path={args.agent_system_prompt_path}"
+            else:
+                prompt_detail = "inline"
+        cfg_display = str(args.config) if args.config is not None else "(none)"
+        LOGGER.info("GraphPlanner eval config: %s", cfg_display)
+        LOGGER.info("Agent system prompt source: %s %s", prompt_source, prompt_detail)
+    except Exception:
+        pass
+
     env_args: Dict[str, Any] = {"max_steps": args.max_steps}
     if args.reward_scale is not None:
         env_args["reward_scale"] = args.reward_scale
@@ -1595,6 +1656,7 @@ def main() -> None:
             # CLI/config value so trajectories do not get cut early.
             max_steps=args.max_steps,
             max_response_length=args.max_response_tokens,
+            max_tokens_per_step=args.max_output_tokens,
             max_prompt_length=args.max_prompt_tokens,
             trajectory_timeout=trajectory_timeout,
             gamma=args.gamma,
