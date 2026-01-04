@@ -155,6 +155,11 @@ Recommended workflow:
     (a) memory_commit the key node(s) so CGM can see the code, OR
     (b) expand a newly discovered relevant node.
 - Avoid repeating the same explore_find query multiple times if it already returned candidates or the node is already in W.
+
+- You will be shown a compact FULL index of the working subgraph W (no snippets). Use it to pick select_ids.
+- If you have relevant code in W but are unsure which ids to commit, you may call memory_commit() with no ids; the env will auto-select a small top-k set.
+- When you notice you are about to repeat the same explore_find intent, prefer: (1) explore_expand on a new anchor, or (2) memory_commit the best evidence, then proceed to repair.
+
   Instead, expand or commit memory.
 
 Always obey HARD RULES.
@@ -670,9 +675,16 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         return _attach_meta(MemoryAction(target=target, intent=intent, selector=selector), meta)
 
     if action_name == "repair":
-        apply_flag = bool(payload.get("apply", False))
-        plan_raw = payload.get("plan", [])
-        subplan_raw = payload.get("subplan", None)
+        # Tool-call semantics: requesting a repair means "apply" by default.
+        apply_flag = bool(params.get("apply", True))
+
+        issue_obj = params.get("issue")
+        if not isinstance(issue_obj, dict):
+            issue_obj = {}
+
+        plan_raw = params.get("plan", [])
+        subplan_raw = params.get("subplan", None)
+
         def _to_steps(x):
             if x is None:
                 return []
@@ -688,20 +700,27 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
                             out.append(s)
                 return out
             return []
+
         plan_steps = _to_steps(plan_raw)
         for s in _to_steps(subplan_raw):
             if s not in plan_steps:
                 plan_steps.append(s)
         if (not plan_steps) and apply_flag:
             meta.setdefault("warnings", []).append("missing-plan")
-        plan_targets = payload.get("plan_targets", [])
+
+        plan_targets = params.get("plan_targets", [])
+        if isinstance(plan_targets, str):
+            plan_targets = [plan_targets]
         if not isinstance(plan_targets, list):
             plan_targets = []
-        patch = payload.get("patch", None)
+        plan_targets = [str(x) for x in plan_targets if x is not None and str(x).strip()]
+
+        patch = params.get("patch", None)
         if patch is not None and not isinstance(patch, dict):
             patch = None
+
         return _attach_meta(
-            RepairAction(apply=apply_flag, issue=issue, plan=plan_steps, plan_targets=plan_targets, patch=patch),
+            RepairAction(apply=apply_flag, issue=issue_obj, plan=plan_steps, plan_targets=plan_targets, patch=patch),
             meta,
         )
 
