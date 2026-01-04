@@ -107,6 +107,8 @@ def summarise_observation(
     issue = obs.get("issue")
     steps = obs.get("steps")
     last_info = obs.get("last_info")
+    subgraph_stats = obs.get("subgraph_stats") or {}
+    memory_stats = obs.get("memory_stats") or {}
     text_memory = obs.get("text_memory") or {}
     working_subgraph = obs.get("working_subgraph") or {}
 
@@ -254,6 +256,23 @@ def summarise_observation(
         frontier = last_info.get("frontier_anchor_id")
         if isinstance(frontier, str) and frontier.strip():
             out.append(f"- frontier_anchor_id: {frontier.strip()}")
+
+        def _stats_line(label: str, stats: Any) -> str | None:
+            if not isinstance(stats, dict):
+                return None
+            try:
+                nodes = int(stats.get("n_nodes") or 0)
+                edges = int(stats.get("n_edges") or 0)
+            except Exception:
+                return None
+            return f"- {label}: {nodes}/{edges}"
+
+        w_line = _stats_line("W(nodes/edges)", subgraph_stats)
+        m_line = _stats_line("M(nodes/edges)", memory_stats)
+        if w_line:
+            out.append(w_line)
+        if m_line:
+            out.append(m_line)
 
         # Deltas are injected by the env step wrapper (so the planner can detect no-progress loops).
         def _d(k: str) -> str:

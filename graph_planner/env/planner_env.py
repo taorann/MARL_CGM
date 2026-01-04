@@ -475,6 +475,18 @@ class PlannerEnv:
                 frontier = str(info.get("frontier_anchor_id") or "").strip()
                 dw = info.get("delta_working_nodes")
                 dm = info.get("delta_memory_nodes")
+                w_stats = info.get("subgraph_stats") or {}
+                m_stats = info.get("memory_stats") or {}
+                try:
+                    w_nodes = int(w_stats.get("n_nodes") or 0)
+                    w_edges = int(w_stats.get("n_edges") or 0)
+                except Exception:
+                    w_nodes, w_edges = 0, 0
+                try:
+                    m_nodes = int(m_stats.get("n_nodes") or 0)
+                    m_edges = int(m_stats.get("n_edges") or 0)
+                except Exception:
+                    m_nodes, m_edges = 0, 0
                 cand_n = len(info.get("candidates") or []) if isinstance(info.get("candidates"), list) else None
                 extra = []
                 if cand_n is not None:
@@ -484,7 +496,10 @@ class PlannerEnv:
                 if q:
                     extra.append(f"q={q[:64] + ('...' if len(q) > 64 else '')}")
                 extra_s = (" | " + ", ".join(extra)) if extra else ""
-                print(f"[gp-env] step={self.steps} {k}/{op} ΔW={dw} ΔM={dm}{extra_s}")
+                print(
+                    f"[gp-env] step={self.steps} {k}/{op} "
+                    f"W={w_nodes}/{w_edges} M={m_nodes}/{m_edges} ΔW={dw} ΔM={dm}{extra_s}"
+                )
         except Exception:
             pass
         return obs, reward, done, info
@@ -1322,7 +1337,11 @@ class PlannerEnv:
         working_json = self.working_subgraph.to_json_obj()
         memory_stats = subgraph_store.stats(self.memory_subgraph)
         memory_json = self.memory_subgraph.to_json_obj()
-        obs_pack = self._observation_pack(mem_stats=memory_stats, query_stats=None)
+        obs_pack = self._observation_pack(
+            mem_stats=memory_stats,
+            query_stats=None,
+            working_stats=working_stats,
+        )
 
         return {
             "runner_id": getattr(self, "runner_id", 0),
@@ -1369,9 +1388,17 @@ class PlannerEnv:
         self,
         mem_stats: Optional[Dict[str, Any]] = None,
         query_stats: Optional[Dict[str, Any]] = None,
+        working_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         # 记忆子图的统计信息（默认直接从 memory_subgraph 算）
         mem_stats = mem_stats or subgraph_store.stats(self.memory_subgraph)
+        working_stats = working_stats or subgraph_store.stats(self.working_subgraph)
+        try:
+            mem_nodes = int(mem_stats.get("n_nodes") or 0) if isinstance(mem_stats, dict) else 0
+        except Exception:
+            mem_nodes = 0
+        if mem_nodes == 0 and isinstance(working_stats, dict):
+            mem_stats = working_stats
         failure = self.issue.get("failure_frame") or {}
         issue_text = " ".join(
             str(x)
@@ -1828,5 +1855,3 @@ class PlannerEnv:
         self.memory_subgraph.nodes = mem_nodes
         self.memory_subgraph.edges = mem_edges
         self.memory_subgraph.node_ids = list(mem_nodes.keys())
-
-

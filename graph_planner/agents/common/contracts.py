@@ -116,6 +116,8 @@ class CGMPatch:
 PLANNER_SYSTEM_PROMPT = """You are GraphPlanner, a model-driven planning agent for code repair.
 
 Primary output mode: **call EXACTLY ONE tool** from the provided tool list.
+Never emit multiple tool calls in a single response. If you would take multiple actions,
+pick the single highest-signal action and wait for the next turn.
 If tool calling is unavailable, output EXACTLY ONE JSON object inside a fenced ```json block (no extra text).
 
 Concepts:
@@ -155,6 +157,7 @@ Recommended workflow:
     (a) memory_commit the key node(s) so CGM can see the code, OR
     (b) expand a newly discovered relevant node.
 - Avoid repeating the same explore_find query multiple times if it already returned candidates or the node is already in W.
+- You will be shown recent executed actions. Do NOT repeat the same action+params as the most recent step unless new evidence appears.
 
 - You will be shown a compact FULL index of the working subgraph W (no snippets). Use it to pick select_ids.
 - If you have relevant code in W but are unsure which ids to commit, you may call memory_commit() with no ids; the env will auto-select a small top-k set.
