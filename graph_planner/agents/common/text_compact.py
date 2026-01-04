@@ -102,7 +102,40 @@ def compact_issue(issue: Dict[str, Any], cfg: Optional[CompactIssueConfig] = Non
     if len(prose) > cfg.prose_chars:
         prose_part += "\n\n... [PROSE TRUNCATED] ..."
 
-    kept: List[str] = []
+    
+    # If the prose is truncated, preserve a small set of high-signal lines (errors, tracebacks, assertions)
+    # from the *full* prose to keep the problem statement actionable.
+    if len(prose) > cfg.prose_chars:
+        KEYWORDS = (
+            "traceback",
+            "error",
+            "exception",
+            "assert",
+            "fail",
+            "cannot",
+            "unable",
+            "regression",
+            "expected",
+            "got",
+            "warning",
+        )
+        key_lines: List[str] = []
+        for raw_line in prose.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if any(k in low for k in KEYWORDS):
+                # Keep line length bounded.
+                if len(line) > 220:
+                    line = line[:217] + "..."
+                if line not in key_lines:
+                    key_lines.append(line)
+            if len(key_lines) >= 18:
+                break
+        if key_lines:
+            prose_part += "\n\n[KEY LINES]\n" + "\n".join(f"- {l}" for l in key_lines)
+kept: List[str] = []
     if title:
         kept.append(title)
         kept.append("")  # blank line
