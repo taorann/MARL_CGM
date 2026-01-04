@@ -135,7 +135,7 @@ def compact_issue(issue: Dict[str, Any], cfg: Optional[CompactIssueConfig] = Non
                 break
         if key_lines:
             prose_part += "\n\n[KEY LINES]\n" + "\n".join(f"- {l}" for l in key_lines)
-kept: List[str] = []
+    kept: List[str] = []
     if title:
         kept.append(title)
         kept.append("")  # blank line
