@@ -114,6 +114,11 @@ class SandboxRuntime:
         elif self._mode == "remote_swe":
             _dbg(f"init remote_swe: run_id={self.run_id} ssh_target={self.cfg.ssh_target} remote_repo={self.cfg.remote_repo} image={self.cfg.docker_image}")
             self._init_remote_swe_backend()
+            # Ensure pytest is available inside remote_swe containers for test runs.
+            try:
+                self._exec("python -m pip -q install pytest >/dev/null 2>&1 || true", timeout=300)
+            except Exception:
+                pass
         else:
             self._init_docker_backend()
         self._exposed_ports: List[Dict[str, Any]] = getattr(self, "_exposed_ports", [])
@@ -752,9 +757,24 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         cmd = f"python -m pytest -q {sel}".strip()
         _dbg(f"pytest cmd: {cmd}")
         start = time.time()
-        out, rc = self._exec(cmd, timeout=timeout)
+        err = ""
+        if self._mode == "remote_swe":
+            assert self._remote is not None, "remote_swe backend not initialized"
+            start_timeout = max(float(timeout), 300.0)
+            self._ensure_remote_started(timeout=start_timeout)
+            resp = self._remote.exec(
+                cmd,
+                timeout=float(timeout),
+                env=self.cfg.env,
+                cwd=self.workdir,
+            )
+            out = resp.get("stdout") or ""
+            err = resp.get("stderr") or ""
+            rc = _safe_int(resp.get("returncode", 0), 0)
+        else:
+            out, rc = self._exec(cmd, timeout=timeout)
         duration = time.time() - start
-        result = {"mode": "pytest", "passed": rc == 0, "rc": rc, "stdout": out}
+        result = {"mode": "pytest", "passed": rc == 0, "rc": rc, "stdout": out, "stderr": err}
         return self._finalize_test_result(
             result,
             command=cmd,
