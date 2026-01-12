@@ -17,6 +17,8 @@ class ExploreAction(BaseModel):
     anchors: List[Dict[str, Any]] = Field(default_factory=list)
     nodes: List[str] = Field(default_factory=list)
     query: Optional[Union[str, List[str]]] = None
+    find_type: Optional[str] = None
+    expand_mode: Optional[str] = None
 
     # 图扩展半径 & 数量预算
     hop: conint(ge=0, le=2) = 1
@@ -62,8 +64,27 @@ class NoopAction(BaseModel):
     type: Literal["noop"] = "noop"
     schema_version: int = 1
 
+class ReadAction(BaseModel):
+    type: Literal["read"] = "read"
+    node_id: str
+    view: str
+    schema_version: int = 1
 
-ActionUnion = Union[ExploreAction, MemoryAction, RepairAction, SubmitAction, NoopAction]
+
+class RunFailedTestAction(BaseModel):
+    type: Literal["run_failed_test"] = "run_failed_test"
+    schema_version: int = 1
+
+
+ActionUnion = Union[
+    ExploreAction,
+    MemoryAction,
+    RepairAction,
+    SubmitAction,
+    NoopAction,
+    ReadAction,
+    RunFailedTestAction,
+]
 
 
 class _ActionSchema(RootModel[ActionUnion]):

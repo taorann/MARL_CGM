@@ -13,8 +13,10 @@ Why the engine subclass?
 
 Protocol mapping
   We expose fine-grained tools to the planner model:
-    - explore_find(query, anchor?)
-    - explore_expand(anchor?)
+    - run_failed_test()
+    - explore_find(query, find_type)
+    - explore_expand(anchor, expand_mode)
+    - read(node_id, view)
     - memory_commit(select_ids, keep_ids, note, tag)
     - memory_delete(delete_ids, note, tag)
     - memory_commit_note(note, tag)
@@ -90,6 +92,19 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_failed_test",
+            "description": "Run the default test command and return failure signals (failed_tests, error_signature, top_frame) for targeted queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "explore_find",
             "description": "Search the repository graph and return a ranked list of candidates. The env sets frontier_anchor_id to the top candidate and may seed the top-k candidates into working_subgraph (W) for visibility. Do NOT repeat the exact same find(query) if the target already appears in candidates/W; instead expand or commit memory.",
             "parameters": {
@@ -98,9 +113,14 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                     "query": {
                         "type": "string",
                         "description": "A SINGLE query string (do not split into arrays). You may use a lightweight DSL: symbol:<term> (prefer id/name matches), path:<term> (prefer path matches), +term (must include), -term (must NOT include), and quoted phrases (\"...\"). Keep it short (about 6-12 tokens) and include 1-2 strong identifier-like terms when possible.",
-                    }
+                    },
+                    "find_type": {
+                        "type": "string",
+                        "enum": ["file", "class", "func", "method", "test"],
+                        "description": "Optional type filter for find results.",
+                    },
                 },
-                "required": ["query"],
+                "required": ["query", "find_type"],
                 "additionalProperties": False,
             },
         },
@@ -116,9 +136,36 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                     "anchor": {
                         "type": "string",
                         "description": "Anchor id to expand (exactly ONE).",
-                    }
+                    },
+                    "expand_mode": {
+                        "type": "string",
+                        "enum": ["callers", "callees", "imports", "tests"],
+                        "description": "Required expansion mode to constrain edge traversal.",
+                    },
                 },
-                "required": ["anchor"],
+                "required": ["anchor", "expand_mode"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a small code window for a node already in working_subgraph.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Node id to read (must be in working_subgraph).",
+                    },
+                    "view": {
+                        "type": "string",
+                        "description": "View mode: header, body, or around_line:<int>.",
+                    },
+                },
+                "required": ["node_id", "view"],
                 "additionalProperties": False,
             },
         },
@@ -318,12 +365,18 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         if isinstance(query, (list, tuple)):
             query = " ".join([str(x) for x in query if x is not None]).strip()
         params: Dict[str, Any] = {"op": "find", "query": query, "anchors": []}
+        find_type = args.get("find_type")
+        if isinstance(find_type, str) and find_type.strip():
+            params["find_type"] = find_type.strip()
         return {"name": "explore", "params": params}
 
     if tool == "explore_expand":
         anchor = args.get("anchor")
         anchors = _norm_anchors(anchor)
         params = {"op": "expand", "anchors": anchors}
+        expand_mode = args.get("expand_mode")
+        if isinstance(expand_mode, str) and expand_mode.strip():
+            params["expand_mode"] = expand_mode.strip()
         return {"name": "explore", "params": params}
 
     # memory
@@ -364,7 +417,7 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         }
 
     # direct tools that match internal action names
-    if tool in {"repair", "submit", "noop"}:
+    if tool in {"repair", "submit", "noop", "read", "run_failed_test"}:
         return {"name": tool, "params": args}
 
     # Unknown tool: fall back to noop.
@@ -484,6 +537,12 @@ class GraphPlannerRLLMAgent(BaseAgent):
                         op = params.get("op") or params.get("action")
                         if op:
                             parts.append(f"op={op}")
+                        find_type = params.get("find_type")
+                        if isinstance(find_type, str) and find_type.strip():
+                            parts.append(f"find_type={find_type.strip()}")
+                        expand_mode = params.get("expand_mode")
+                        if isinstance(expand_mode, str) and expand_mode.strip():
+                            parts.append(f"expand_mode={expand_mode.strip()}")
                         q = params.get("query")
                         if isinstance(q, str) and q.strip():
                             parts.append(f"query={q.strip()}")
@@ -507,6 +566,15 @@ class GraphPlannerRLLMAgent(BaseAgent):
                         reason = params.get("reason") if isinstance(params, Mapping) else None
                         if reason:
                             parts.append(f"reason={reason}")
+                    elif name == "read":
+                        node_id = params.get("node_id") if isinstance(params, Mapping) else None
+                        view = params.get("view") if isinstance(params, Mapping) else None
+                        if node_id:
+                            parts.append(f"node_id={node_id}")
+                        if view:
+                            parts.append(f"view={view}")
+                    elif name == "run_failed_test":
+                        pass
                     if not name:
                         return None
                     detail = ", ".join(parts)

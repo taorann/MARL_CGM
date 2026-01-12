@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -59,7 +60,9 @@ from ..core.actions import (
     ExploreAction,
     MemoryAction,
     NoopAction,
+    ReadAction,
     RepairAction,
+    RunFailedTestAction,
     SubmitAction,
 )
 
@@ -421,6 +424,10 @@ class PlannerEnv:
             info = self._handle_memory(action_obj)
         elif isinstance(action_obj, RepairAction):
             info = self._handle_repair(action_obj)
+        elif isinstance(action_obj, ReadAction):
+            info = self._handle_read(action_obj)
+        elif isinstance(action_obj, RunFailedTestAction):
+            info = self._handle_run_failed_test()
         elif isinstance(action_obj, SubmitAction):
             info = self._handle_submit()
         elif isinstance(action_obj, NoopAction):
@@ -604,6 +611,10 @@ class PlannerEnv:
             return SubmitAction(**payload)
         if action_type == "noop":
             return NoopAction(**payload)
+        if action_type == "read":
+            return ReadAction(**payload)
+        if action_type == "run_failed_test":
+            return RunFailedTestAction(**payload)
         raise ProtocolError("unknown-action", f"unknown action type: {action_type}")
 
     def _compute_reward(self, info: Dict[str, Any]) -> float:
@@ -669,6 +680,84 @@ class PlannerEnv:
     # ------------------------------------------------------------------
     # Explore / Memory
     # ------------------------------------------------------------------
+    def _normalize_find_type(self, find_type: Optional[str]) -> Optional[str]:
+        if not isinstance(find_type, str):
+            return None
+        ft = find_type.strip().lower()
+        if not ft:
+            return None
+        mapping = {
+            "func": "function",
+            "method": "function",
+            "function": "function",
+            "class": "class",
+            "file": "file",
+            "test": "t-file",
+            "t-file": "t-file",
+        }
+        return mapping.get(ft, ft)
+
+    def _candidate_kind_match(self, candidate: Mapping[str, Any], find_type: str) -> bool:
+        kind = str(candidate.get("kind") or "").lower()
+        if not kind:
+            return False
+        if find_type == "t-file":
+            path = str(candidate.get("path") or "")
+            return kind == "t-file" or ("test" in path.lower())
+        return kind == find_type
+
+    def _expand_by_mode(
+        self,
+        anchors: List[Dict[str, Any]],
+        expand_mode: str,
+        *,
+        max_per_anchor: int,
+        total_limit: int,
+    ) -> List[Dict[str, Any]]:
+        mode = (expand_mode or "").strip().lower()
+        if not mode:
+            return []
+        req = getattr(graph_adapter, "_require_handle", None)
+        if not callable(req):
+            return []
+        gh = req()
+        results: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for anchor in anchors:
+            aid = anchor.get("id") if isinstance(anchor, dict) else None
+            if not isinstance(aid, str) or not aid:
+                continue
+            per_anchor = 0
+            if mode == "callers":
+                neighbors = [(src, et) for src, et in gh.rev.get(aid, []) if et == "calls"]
+            elif mode == "callees":
+                neighbors = [(dst, et) for dst, et in gh.adj.get(aid, []) if et == "calls"]
+            elif mode == "imports":
+                neighbors = [(dst, et) for dst, et in gh.adj.get(aid, []) if et == "imports"]
+            elif mode == "tests":
+                neighbors = gh.neighbors_undirected(aid)
+            else:
+                neighbors = []
+            for nid, _et in neighbors:
+                if nid in seen:
+                    continue
+                node = gh.get(nid)
+                if not node:
+                    continue
+                if mode == "tests":
+                    kind = str(node.get("kind") or "").lower()
+                    path = str(node.get("path") or "")
+                    if kind != "t-file" and "test" not in path.lower():
+                        continue
+                results.append(dict(node))
+                seen.add(nid)
+                per_anchor += 1
+                if per_anchor >= max_per_anchor:
+                    break
+            if len(results) >= total_limit:
+                break
+        return results[:total_limit]
+
     def _handle_explore(self, act: ExploreAction) -> Dict[str, Any]:
         """
         实现 ExploreAction 的两个子操作：
@@ -708,6 +797,13 @@ class PlannerEnv:
         raw_query = (query_value or "").strip() if isinstance(query_value, str) else " ".join(query_terms).strip()
         query = raw_query
 
+
+        find_type = self._normalize_find_type(getattr(act, "find_type", None))
+        if find_type:
+            info["find_type"] = find_type
+        expand_mode = getattr(act, "expand_mode", None)
+        if isinstance(expand_mode, str) and expand_mode.strip():
+            info["expand_mode"] = expand_mode.strip().lower()
 
         # -------- op = find --------
         if act.op == "find":
@@ -766,6 +862,9 @@ class PlannerEnv:
                         info["query_relaxed"] = {"from": str(query), "to": relaxed, "cands": len(candidates2)}
                         candidates = candidates2
                         query = relaxed
+            if find_type:
+                candidates = [c for c in candidates if self._candidate_kind_match(c, find_type)]
+
             # Expose candidates to the agent.
             self.last_candidates = candidates
             info["candidates"] = candidates
@@ -844,19 +943,37 @@ class PlannerEnv:
 
         # -------- op = expand --------
         if act.op == "expand":
-            candidates = mem_candidates.build_mem_candidates(
-                subgraph=self.repo_graph,
-                anchors=anchors,
-                max_nodes_per_anchor=max_per_anchor,
-                total_limit=total_limit,
-                dir_diversity_k=dir_diversity_k,
-            )
+            missing = []
+            for a in anchors or []:
+                aid = a.get("id") if isinstance(a, dict) else None
+                if isinstance(aid, str) and aid.strip():
+                    if not self.working_subgraph.contains(aid):
+                        missing.append(aid)
+            if missing:
+                info["error"] = "expand-anchor-not-in-working"
+                info["missing_anchors"] = missing[:3]
+                return info
+            if isinstance(expand_mode, str) and expand_mode.strip():
+                candidates = self._expand_by_mode(
+                    anchors,
+                    expand_mode,
+                    max_per_anchor=max_per_anchor,
+                    total_limit=total_limit,
+                )
+            else:
+                candidates = mem_candidates.build_mem_candidates(
+                    subgraph=self.repo_graph,
+                    anchors=anchors,
+                    max_nodes_per_anchor=max_per_anchor,
+                    total_limit=total_limit,
+                    dir_diversity_k=dir_diversity_k,
+                )
             self.last_candidates = candidates
             info["candidates"] = candidates
 
             node_ids: List[str] = []
             for c in candidates:
-                nid = c.get("id")
+                nid = c.get("id") if isinstance(c, dict) else None
                 if isinstance(nid, str):
                     node_ids.append(nid)
 
@@ -874,6 +991,200 @@ class PlannerEnv:
             return info
 
         info["error"] = f"unknown-explore-op:{act.op}"
+        return info
+
+    def _read_file_lines(self, raw_path: str, start_line: int, end_line: int) -> Optional[Dict[str, Any]]:
+        if not raw_path:
+            return None
+        repo_root = str(self.repo_root or self.box.workdir or ".").rstrip("/")
+
+        def _resolve_abs(p: str) -> str:
+            if p.startswith("/"):
+                if repo_root and p.startswith(repo_root + "/"):
+                    return p
+                p = p.lstrip("/")
+            return os.path.join(repo_root, p)
+
+        abs_path = _resolve_abs(raw_path)
+        if raw_path.startswith(repo_root + "/"):
+            path = raw_path[len(repo_root) + 1 :]
+        else:
+            path = raw_path.lstrip("/")
+
+        if getattr(self.box, "_mode", None) == "remote_swe":
+            repo_root = getattr(self.box, "workdir", None) or os.environ.get("GP_REMOTE_REPO_ROOT", "/testbed")
+            abs_path = os.path.join(str(repo_root), path)
+
+        reader = getattr(self.box, "read_file_lines", None)
+        if callable(reader):
+            snippet_lines, rc = reader(abs_path, start_line, end_line, timeout=60)
+            if int(rc) == 0:
+                snippet_lines = list(snippet_lines or [])
+                return {
+                    "path": path,
+                    "start": start_line,
+                    "end": end_line,
+                    "snippet_lines": snippet_lines,
+                }
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+            snippet_lines = lines[start_line - 1 : end_line]
+            return {
+                "path": path,
+                "start": start_line,
+                "end": end_line,
+                "snippet_lines": snippet_lines,
+            }
+        except Exception:
+            return None
+
+    def _handle_read(self, act: ReadAction) -> Dict[str, Any]:
+        info: Dict[str, Any] = {"kind": "read"}
+        node_id = str(act.node_id or "").strip()
+        view = str(act.view or "").strip()
+        if not node_id:
+            info["error"] = "missing-node-id"
+            return info
+        if not self.working_subgraph.contains(node_id):
+            info["error"] = "node-not-in-working"
+            info["node_id"] = node_id
+            return info
+
+        node = self.working_subgraph.get_node(node_id) or {}
+        raw_path = str(node.get("path") or "").strip()
+        if not raw_path:
+            info["error"] = "missing-node-path"
+            info["node_id"] = node_id
+            return info
+
+        max_lines = _safe_int(os.environ.get("GP_READ_MAX_LINES", "80"), 80)
+        if view == "header":
+            snippet = self._read_node_snippet(node_id)
+            if not snippet:
+                info["error"] = "read-failed"
+                info["node_id"] = node_id
+                return info
+            lines = list(snippet.get("snippet_lines") or [])
+            header_lines = lines[: min(5, max_lines)]
+            info["read"] = {
+                "node_id": node_id,
+                "path": snippet.get("path"),
+                "start": snippet.get("start"),
+                "end": snippet.get("start"),
+                "view": "header",
+                "text": "\n".join(header_lines),
+            }
+            return info
+
+        if view.startswith("around_line"):
+            line_no = None
+            if ":" in view:
+                try:
+                    line_no = int(view.split(":", 1)[1].strip())
+                except Exception:
+                    line_no = None
+            if line_no is None:
+                info["error"] = "invalid-around-line"
+                info["view"] = view
+                return info
+            half = max(1, max_lines // 2)
+            start_line = max(1, line_no - half)
+            end_line = line_no + half
+            snippet = self._read_file_lines(raw_path, start_line, end_line)
+            if not snippet:
+                info["error"] = "read-failed"
+                info["node_id"] = node_id
+                return info
+            lines = list(snippet.get("snippet_lines") or [])[:max_lines]
+            info["read"] = {
+                "node_id": node_id,
+                "path": snippet.get("path"),
+                "start": snippet.get("start"),
+                "end": snippet.get("end"),
+                "view": view,
+                "text": "\n".join(lines),
+            }
+            return info
+
+        if view == "body":
+            snippet = self._read_node_snippet(node_id)
+            if not snippet:
+                info["error"] = "read-failed"
+                info["node_id"] = node_id
+                return info
+            lines = list(snippet.get("snippet_lines") or [])[:max_lines]
+            info["read"] = {
+                "node_id": node_id,
+                "path": snippet.get("path"),
+                "start": snippet.get("start"),
+                "end": snippet.get("end"),
+                "view": "body",
+                "text": "\n".join(lines),
+            }
+            return info
+
+        info["error"] = "unknown-view"
+        info["view"] = view
+        return info
+
+    def _handle_run_failed_test(self) -> Dict[str, Any]:
+        info: Dict[str, Any] = {"kind": "run_failed_test"}
+        try:
+            tests_report = self.box.test()
+        except Exception as exc:
+            info["error"] = f"test-run-failed:{exc}"
+            return info
+        info["tests"] = tests_report
+        stdout = tests_report.get("stdout", "") if isinstance(tests_report, dict) else str(tests_report)
+        lines = stdout.splitlines()
+
+        failed_tests: List[str] = []
+        for line in lines:
+            m = re.match(r"^(FAILED|ERROR)\s+([^\s]+::[^\s]+)", line.strip())
+            if m:
+                failed_tests.append(m.group(2))
+        if failed_tests:
+            info["failed_tests"] = failed_tests[:3]
+
+        error_sig = ""
+        for line in reversed(lines):
+            if re.search(r"(AssertionError|Exception|Error):", line):
+                error_sig = line.strip()
+                break
+            if re.search(r"(AssertionError|Exception|Error)\b", line):
+                error_sig = line.strip()
+                break
+        if error_sig:
+            info["error_signature"] = error_sig
+
+        top_frame = None
+        repo_root = str(self.repo_root_in_container or "").rstrip("/")
+        for line in reversed(lines):
+            m = re.search(r'File "([^"]+)", line (\d+), in ([^\s]+)', line)
+            if m:
+                path = m.group(1)
+                if "site-packages" in path or "dist-packages" in path:
+                    continue
+                rel_path = path
+                if repo_root and path.startswith(repo_root + "/"):
+                    rel_path = path[len(repo_root) + 1 :]
+                top_frame = {"path": rel_path, "line": int(m.group(2)), "func": m.group(3)}
+                break
+            m = re.search(r"([A-Za-z0-9_./-]+\.py):(\d+)(?::\s*in\s*([A-Za-z0-9_<>]+))?", line)
+            if m:
+                path = m.group(1)
+                if "site-packages" in path or "dist-packages" in path:
+                    continue
+                top_frame = {"path": path, "line": int(m.group(2)), "func": m.group(3) or ""}
+                break
+        if top_frame:
+            info["top_frame"] = top_frame
+
+        tail_lines = _safe_int(os.environ.get("GP_TEST_RAW_TAIL_LINES", "40"), 40)
+        if tail_lines > 0 and lines:
+            info["raw_tail"] = "\n".join(lines[-tail_lines:])
+
         return info
 
 
