@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -13,7 +14,9 @@ from ...core.actions import (
     ExploreAction,
     MemoryAction,
     NoopAction,
+    ReadAction,
     RepairAction,
+    RunFailedTestAction,
     SubmitAction,
 )
 
@@ -116,6 +119,8 @@ class CGMPatch:
 PLANNER_SYSTEM_PROMPT = """You are GraphPlanner, a model-driven planning agent for code repair.
 
 Primary output mode: **call EXACTLY ONE tool** from the provided tool list.
+Never emit multiple tool calls in a single response. If you would take multiple actions,
+pick the single highest-signal action and wait for the next turn.
 If tool calling is unavailable, output EXACTLY ONE JSON object inside a fenced ```json block (no extra text).
 
 Concepts:
@@ -125,8 +130,12 @@ Concepts:
 - text_memory (T): your notes (planner-only). CGM does NOT read it.
 
 Tools (preferred):
-1) explore_find(query)
+1) run_failed_test()
+   - Run the default test suite to capture failure signatures.
+   - Use this only when you need fresh failure context for targeted search queries.
+2) explore_find(query, find_type)
    - HARD RULE: provide exactly ONE query string.
+   - HARD RULE: provide exactly ONE find_type.
    - Query is a single string that may contain multiple keywords.
    - Query supports a lightweight DSL:
        +term   => strong (must match)
@@ -134,20 +143,23 @@ Tools (preferred):
        symbol:Foo  => strong symbol constraint
        path:pkg/mod.py  => path constraint
        "exact phrase"  => strong phrase
-2) explore_expand(anchor)
+3) explore_expand(anchor, expand_mode)
    - HARD RULE: provide exactly ONE anchor id (from candidates or W).
+   - HARD RULE: provide exactly ONE expand_mode.
    - Keep expansions small. Prefer multiple focused expands over one huge expand.
-3) memory_commit(select_ids?, keep_ids?, note?, tag?)
+4) read(node_id, view)
+   - Read a small code window for a node already in W.
+5) memory_commit(select_ids?, keep_ids?, note?, tag?)
    - Marks select_ids as memorized (M ⊂ W). keep_ids means "keep memorized".
    - note/tag are optional; note writes into T (planner-only).
-4) memory_delete(delete_ids?, keep_ids?, note?, tag?)
+6) memory_delete(delete_ids?, keep_ids?, note?, tag?)
    - Unmarks memorized nodes.
-5) memory_commit_note(note, tag?)
+7) memory_commit_note(note, tag?)
    - Writes into T only; W and M unchanged.
-6) repair(plan?)
+8) repair(plan?)
    - HARD RULE: only call repair if you have memorized at least one node.
-7) submit()
-8) noop(reason?)
+9) submit()
+10) noop(reason?)
 
 Recommended workflow:
 - Use explore_find to locate symbol-level nodes (func/class/method). Then use explore_expand on the best candidate.
@@ -155,6 +167,7 @@ Recommended workflow:
     (a) memory_commit the key node(s) so CGM can see the code, OR
     (b) expand a newly discovered relevant node.
 - Avoid repeating the same explore_find query multiple times if it already returned candidates or the node is already in W.
+- You will be shown recent executed actions. Do NOT repeat the same action+params as the most recent step unless new evidence appears.
 
 - You will be shown a compact FULL index of the working subgraph W (no snippets). Use it to pick select_ids.
 - If you have relevant code in W but are unsure which ids to commit, you may call memory_commit() with no ids; the env will auto-select a small top-k set.
@@ -168,11 +181,25 @@ Always obey HARD RULES.
 
 PLANNER_CONTRACT = PlannerContract(
     SYSTEM_PROMPT=PLANNER_SYSTEM_PROMPT,
-    ACTIONS=("explore", "memory", "repair", "submit", "noop"),
+    ACTIONS=("explore", "memory", "repair", "submit", "noop", "read", "run_failed_test"),
     allowed_params={
         # New: prefer <param name="action">{JSON}</param>
         # Compat: accept legacy params (op/anchors/...) and older "k" wrapper if emitted by older prompts.
-        "explore": {"action", "k", "op", "anchors", "nodes", "query", "hop", "limit", "max_per_anchor", "total_limit", "dir_diversity_k"},
+        "explore": {
+            "action",
+            "k",
+            "op",
+            "anchors",
+            "nodes",
+            "query",
+            "find_type",
+            "expand_mode",
+            "hop",
+            "limit",
+            "max_per_anchor",
+            "total_limit",
+            "dir_diversity_k",
+        },
         "memory": {"action", "k", "target", "intent", "selector"},
         # v5 simplified: planner should only request a repair with a high-level plan.
         # The environment will always run CGM + apply edits; the planner must NOT propose patches.
@@ -180,11 +207,14 @@ PLANNER_CONTRACT = PlannerContract(
         "repair": {"action", "k", "plan", "subplan"},
         "submit": {"action", "k"},
         "noop": {"action", "k"},
+        "read": {"action", "k", "node_id", "view"},
+        "run_failed_test": {"action", "k"},
     },
     required_params={
         "repair": set(),
         "memory": {"intent"},
         "explore": set(),
+        "read": {"node_id", "view"},
     },
 )
 
@@ -560,6 +590,13 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
         if op == "expand" and not anchors and nodes:
             anchors = [{"id": nid} for nid in nodes if isinstance(nid, str) and nid.strip()]
 
+        find_type_raw = params.get("find_type")
+        expand_mode_raw = params.get("expand_mode")
+        try:
+            hop_val = int(params.get("hop", 1))
+        except Exception:
+            hop_val = 1
+
         # op 分支校验（不要再强制所有 explore 都带 anchors）
         if op == "expand":
             if not anchors:
@@ -567,11 +604,23 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
                     PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
                     "explore.expand requires anchors (or nodes convertible to anchors)",
                 )
+            if hop_val == 0 and (not isinstance(expand_mode_raw, str) or not expand_mode_raw.strip()):
+                expand_mode_raw = None
+            elif not isinstance(expand_mode_raw, str) or not expand_mode_raw.strip():
+                raise ProtocolError(
+                    PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                    "explore.expand requires expand_mode",
+                )
         elif op == "find":
             if not anchors and not query:
                 raise ProtocolError(
                     PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
                     "explore.find requires anchors or query",
+                )
+            if not isinstance(find_type_raw, str) or not find_type_raw.strip():
+                raise ProtocolError(
+                    PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                    "explore.find requires find_type",
                 )
         else:
             raise ProtocolError(PlannerErrorCode.UNKNOWN_ACTION.value, f"unknown explore op: {op}")
@@ -641,12 +690,17 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
             meta["capped"] = True
             meta["capped_fields"] = capped_fields
 
+        find_type = params.get("find_type")
+        expand_mode = params.get("expand_mode")
+
         return _attach_meta(
             ExploreAction(
                 op=op,
                 anchors=anchors,
                 nodes=nodes,
                 query=query,
+                find_type=str(find_type).strip() if isinstance(find_type, str) and find_type.strip() else None,
+                expand_mode=str(expand_mode).strip() if isinstance(expand_mode, str) and expand_mode.strip() else None,
                 hop=hop,
                 limit=limit,
                 max_per_anchor=max_per_anchor,
@@ -729,6 +783,19 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
 
     if action_name == "noop":
         return _attach_meta(NoopAction(), meta)
+
+    if action_name == "read":
+        node_id = str(params.get("node_id") or "").strip()
+        view = str(params.get("view") or "").strip()
+        if not node_id or not view:
+            raise ProtocolError(
+                PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
+                "read requires node_id and view",
+            )
+        return _attach_meta(ReadAction(node_id=node_id, view=view), meta)
+
+    if action_name == "run_failed_test":
+        return _attach_meta(RunFailedTestAction(), meta)
 
     raise ProtocolError(PlannerErrorCode.UNKNOWN_ACTION.value, f"unsupported action '{action_name}'")
 

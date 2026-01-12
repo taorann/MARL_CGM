@@ -13,8 +13,10 @@ Why the engine subclass?
 
 Protocol mapping
   We expose fine-grained tools to the planner model:
-    - explore_find(query, anchor?)
-    - explore_expand(anchor?)
+    - run_failed_test()
+    - explore_find(query, find_type)
+    - explore_expand(anchor, expand_mode)
+    - read(node_id, view)
     - memory_commit(select_ids, keep_ids, note, tag)
     - memory_delete(delete_ids, note, tag)
     - memory_commit_note(note, tag)
@@ -90,6 +92,19 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_failed_test",
+            "description": "Run the default test command and return failure signals (failed_tests, error_signature, top_frame) for targeted queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "explore_find",
             "description": "Search the repository graph and return a ranked list of candidates. The env sets frontier_anchor_id to the top candidate and may seed the top-k candidates into working_subgraph (W) for visibility. Do NOT repeat the exact same find(query) if the target already appears in candidates/W; instead expand or commit memory.",
             "parameters": {
@@ -98,9 +113,14 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                     "query": {
                         "type": "string",
                         "description": "A SINGLE query string (do not split into arrays). You may use a lightweight DSL: symbol:<term> (prefer id/name matches), path:<term> (prefer path matches), +term (must include), -term (must NOT include), and quoted phrases (\"...\"). Keep it short (about 6-12 tokens) and include 1-2 strong identifier-like terms when possible.",
-                    }
+                    },
+                    "find_type": {
+                        "type": "string",
+                        "enum": ["file", "class", "func", "method", "test"],
+                        "description": "Optional type filter for find results.",
+                    },
                 },
-                "required": ["query"],
+                "required": ["query", "find_type"],
                 "additionalProperties": False,
             },
         },
@@ -116,9 +136,36 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                     "anchor": {
                         "type": "string",
                         "description": "Anchor id to expand (exactly ONE).",
-                    }
+                    },
+                    "expand_mode": {
+                        "type": "string",
+                        "enum": ["callers", "callees", "imports", "tests"],
+                        "description": "Required expansion mode to constrain edge traversal.",
+                    },
                 },
-                "required": ["anchor"],
+                "required": ["anchor", "expand_mode"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a small code window for a node already in working_subgraph.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Node id to read (must be in working_subgraph).",
+                    },
+                    "view": {
+                        "type": "string",
+                        "description": "View mode: header, body, or around_line:<int>.",
+                    },
+                },
+                "required": ["node_id", "view"],
                 "additionalProperties": False,
             },
         },
@@ -318,12 +365,18 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         if isinstance(query, (list, tuple)):
             query = " ".join([str(x) for x in query if x is not None]).strip()
         params: Dict[str, Any] = {"op": "find", "query": query, "anchors": []}
+        find_type = args.get("find_type")
+        if isinstance(find_type, str) and find_type.strip():
+            params["find_type"] = find_type.strip()
         return {"name": "explore", "params": params}
 
     if tool == "explore_expand":
         anchor = args.get("anchor")
         anchors = _norm_anchors(anchor)
         params = {"op": "expand", "anchors": anchors}
+        expand_mode = args.get("expand_mode")
+        if isinstance(expand_mode, str) and expand_mode.strip():
+            params["expand_mode"] = expand_mode.strip()
         return {"name": "explore", "params": params}
 
     # memory
@@ -364,7 +417,7 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         }
 
     # direct tools that match internal action names
-    if tool in {"repair", "submit", "noop"}:
+    if tool in {"repair", "submit", "noop", "read", "run_failed_test"}:
         return {"name": tool, "params": args}
 
     # Unknown tool: fall back to noop.
@@ -391,6 +444,8 @@ def _maybe_parse_openai_tool_wrapper(model_response: str) -> Optional[Dict[str, 
     tool_calls = obj.get("tool_calls")
     if not isinstance(tool_calls, list) or not tool_calls:
         return None
+    if len(tool_calls) > 1:
+        print(f"[gp-agent] warning: multiple tool calls ({len(tool_calls)}); using first only")
     first = tool_calls[0]
     if not isinstance(first, dict):
         return None
@@ -469,6 +524,72 @@ class GraphPlannerRLLMAgent(BaseAgent):
         elif send_raw:
             obs_text = _safe_json(observation)
         else:
+            obs_payload = observation
+            if isinstance(observation, dict):
+                def _format_action(step: _StepState) -> Optional[str]:
+                    action = step.action
+                    if not isinstance(action, Mapping):
+                        return None
+                    name = str(action.get("name") or action.get("type") or "").strip()
+                    params = action.get("params") if isinstance(action.get("params"), Mapping) else {}
+                    parts: List[str] = []
+                    if name == "explore":
+                        op = params.get("op") or params.get("action")
+                        if op:
+                            parts.append(f"op={op}")
+                        find_type = params.get("find_type")
+                        if isinstance(find_type, str) and find_type.strip():
+                            parts.append(f"find_type={find_type.strip()}")
+                        expand_mode = params.get("expand_mode")
+                        if isinstance(expand_mode, str) and expand_mode.strip():
+                            parts.append(f"expand_mode={expand_mode.strip()}")
+                        q = params.get("query")
+                        if isinstance(q, str) and q.strip():
+                            parts.append(f"query={q.strip()}")
+                        anchors = params.get("anchors") if isinstance(params.get("anchors"), list) else []
+                        if anchors:
+                            ids = [str(a.get("id")) for a in anchors if isinstance(a, Mapping) and a.get("id")]
+                            if ids:
+                                parts.append(f"anchors={ids[:2]}")
+                    elif name == "memory":
+                        intent = params.get("intent")
+                        target = params.get("target")
+                        if intent:
+                            parts.append(f"intent={intent}")
+                        if target:
+                            parts.append(f"target={target}")
+                        selector = params.get("selector") if isinstance(params.get("selector"), Mapping) else {}
+                        ids = selector.get("select_ids") or selector.get("delete_ids") or selector.get("keep_ids")
+                        if isinstance(ids, list) and ids:
+                            parts.append(f"ids={list(ids)[:2]}")
+                    elif name in {"repair", "submit", "noop"}:
+                        reason = params.get("reason") if isinstance(params, Mapping) else None
+                        if reason:
+                            parts.append(f"reason={reason}")
+                    elif name == "read":
+                        node_id = params.get("node_id") if isinstance(params, Mapping) else None
+                        view = params.get("view") if isinstance(params, Mapping) else None
+                        if node_id:
+                            parts.append(f"node_id={node_id}")
+                        if view:
+                            parts.append(f"view={view}")
+                    elif name == "run_failed_test":
+                        pass
+                    if not name:
+                        return None
+                    detail = ", ".join(parts)
+                    return f"{name}({detail})" if detail else name
+
+                history: List[str] = []
+                for idx, step in enumerate(self._steps[:-1]):
+                    formatted = _format_action(step)
+                    if formatted:
+                        history.append(f"step {idx}: {formatted}")
+                obs_payload = dict(observation)
+                obs_payload["steps"] = history
+                obs_payload.pop("memory_subgraph", None)
+                obs_payload.pop("m", None)
+
             issue_tokens = _safe_int(os.environ.get("GP_ISSUE_TOKENS"), default=320)
             working_top_k = _safe_int(os.environ.get("GP_WORKING_TOP_K"), default=8)
             # Keep observation text compact; very large W dumps quickly trigger
@@ -481,15 +602,20 @@ class GraphPlannerRLLMAgent(BaseAgent):
             max_lines = _safe_int(os.environ.get("GP_WORKING_MAX_LINES"), default=80)
             max_chars = _safe_int(os.environ.get("GP_WORKING_MAX_CHARS"), default=20000)
             full_working = bool(int(os.environ.get("GP_FULL_W", "1")))
+            steps_target = _safe_int(os.environ.get("GP_STEPS_TARGET"), default=0)
+            if steps_target <= 0 and isinstance(obs_payload, dict):
+                steps_list = obs_payload.get("steps")
+                if isinstance(steps_list, list):
+                    steps_target = len(steps_list)
             try:
                 obs_text, _meta = summarise_observation(
-                    observation,
+                    obs_payload,
                     reward=float(reward),
                     done=bool(done),
                     info=info or {},
                     include_issue=(len(self._steps) <= 1) or bool(os.environ.get("GP_ALWAYS_INCLUDE_ISSUE")),
                     issue_target_tokens=issue_tokens,
-                    steps_target=_safe_int(os.environ.get("GP_STEPS_TARGET"), default=0),
+                    steps_target=steps_target,
                     working_top_k=working_top_k,
                     working_list_limit=working_list_limit,
                     memory_list_limit=memory_list_limit,
