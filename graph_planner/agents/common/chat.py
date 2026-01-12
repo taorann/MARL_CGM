@@ -15,7 +15,9 @@ from ...core.actions import (
     ExploreAction,
     MemoryAction,
     NoopAction,
+    ReadAction,
     RepairAction,
+    RunFailedTestAction,
     SubmitAction,
 )
 from .contracts import PLANNER_SYSTEM_PROMPT
@@ -107,6 +109,8 @@ def summarise_observation(
     issue = obs.get("issue")
     steps = obs.get("steps")
     last_info = obs.get("last_info")
+    subgraph_stats = obs.get("subgraph_stats") or {}
+    memory_stats = obs.get("memory_stats") or {}
     text_memory = obs.get("text_memory") or {}
     working_subgraph = obs.get("working_subgraph") or {}
 
@@ -254,6 +258,63 @@ def summarise_observation(
         frontier = last_info.get("frontier_anchor_id")
         if isinstance(frontier, str) and frontier.strip():
             out.append(f"- frontier_anchor_id: {frontier.strip()}")
+
+        failed_tests = last_info.get("failed_tests")
+        if isinstance(failed_tests, list) and failed_tests:
+            out.append(f"- failed_tests: {failed_tests[:3]}")
+        error_sig = last_info.get("error_signature")
+        if isinstance(error_sig, str) and error_sig.strip():
+            out.append(f"- error_signature: {error_sig.strip()}")
+        top_frame = last_info.get("top_frame")
+        if isinstance(top_frame, dict):
+            path = top_frame.get("path")
+            line = top_frame.get("line")
+            func = top_frame.get("func")
+            if path:
+                loc = f"{path}:{line}" if line else str(path)
+                if func:
+                    loc = f"{loc} ({func})"
+                out.append(f"- top_frame: {loc}")
+        raw_tail = last_info.get("raw_tail")
+        if isinstance(raw_tail, str) and raw_tail.strip():
+            out.append("- raw_tail:")
+            for line in raw_tail.splitlines()[:12]:
+                out.append(f"  {line}")
+
+        read_info = last_info.get("read")
+        if isinstance(read_info, dict):
+            path = read_info.get("path")
+            start = read_info.get("start")
+            end = read_info.get("end")
+            view = read_info.get("view")
+            if path:
+                loc = f"{path}:{start}-{end}" if start and end else str(path)
+                label = f"- read: {loc}"
+                if view:
+                    label += f" [{view}]"
+                out.append(label)
+            text = read_info.get("text")
+            if isinstance(text, str) and text.strip():
+                out.append("- read_text:")
+                for line in text.splitlines()[:12]:
+                    out.append(f"  {line}")
+
+        def _stats_line(label: str, stats: Any) -> str | None:
+            if not isinstance(stats, dict):
+                return None
+            try:
+                nodes = int(stats.get("n_nodes") or 0)
+                edges = int(stats.get("n_edges") or 0)
+            except Exception:
+                return None
+            return f"- {label}: {nodes}/{edges}"
+
+        w_line = _stats_line("W(nodes/edges)", subgraph_stats)
+        m_line = _stats_line("M(nodes/edges)", memory_stats)
+        if w_line:
+            out.append(w_line)
+        if m_line:
+            out.append(m_line)
 
         # Deltas are injected by the env step wrapper (so the planner can detect no-progress loops).
         def _d(k: str) -> str:
@@ -602,6 +663,13 @@ def action_from_payload(payload: Dict[str, Any] | None) -> ActionUnion | None:
         return SubmitAction()
     if type_name == "noop":
         return NoopAction()
+    if type_name == "read":
+        return ReadAction(
+            node_id=str(payload.get("node_id") or ""),
+            view=str(payload.get("view") or ""),
+        )
+    if type_name == "run_failed_test":
+        return RunFailedTestAction()
     return None
 
 
@@ -613,6 +681,8 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
             "anchors": (action.anchors[:1] if isinstance(action.anchors, list) and len(action.anchors)>1 else action.anchors),
             "nodes": action.nodes,
             "query": (action.query[0] if isinstance(action.query, list) and action.query else action.query),
+            "find_type": action.find_type,
+            "expand_mode": action.expand_mode,
             "hop": action.hop,
             "limit": action.limit,
         }
@@ -631,6 +701,10 @@ def action_to_payload(action: ActionUnion) -> Dict[str, Any]:
         }
     if isinstance(action, SubmitAction):
         return {"type": "submit"}
+    if isinstance(action, ReadAction):
+        return {"type": "read", "node_id": action.node_id, "view": action.view}
+    if isinstance(action, RunFailedTestAction):
+        return {"type": "run_failed_test"}
     return {"type": "noop"}
 
 
