@@ -637,6 +637,8 @@ def action_from_payload(payload: Dict[str, Any] | None) -> ActionUnion | None:
             anchors=list(payload.get("anchors") or []),
             nodes=list(payload.get("nodes") or []),
             query=payload.get("query"),
+            find_type=payload.get("find_type"),
+            expand_mode=payload.get("expand_mode"),
             hop=int(payload.get("hop", 1)),
             limit=int(payload.get("limit", 50)),
         )

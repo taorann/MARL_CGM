@@ -591,6 +591,10 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
 
         find_type_raw = params.get("find_type")
         expand_mode_raw = params.get("expand_mode")
+        try:
+            hop_val = int(params.get("hop", 1))
+        except Exception:
+            hop_val = 1
 
         # op 分支校验（不要再强制所有 explore 都带 anchors）
         if op == "expand":
@@ -599,7 +603,9 @@ def validate_planner_action(result: Mapping[str, Any]) -> ActionUnion:
                     PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
                     "explore.expand requires anchors (or nodes convertible to anchors)",
                 )
-            if not isinstance(expand_mode_raw, str) or not expand_mode_raw.strip():
+            if hop_val == 0 and (not isinstance(expand_mode_raw, str) or not expand_mode_raw.strip()):
+                expand_mode_raw = None
+            elif not isinstance(expand_mode_raw, str) or not expand_mode_raw.strip():
                 raise ProtocolError(
                     PlannerErrorCode.MISSING_REQUIRED_PARAM.value,
                     "explore.expand requires expand_mode",
