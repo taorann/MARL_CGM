@@ -36,6 +36,42 @@ from pathlib import Path
 from typing import Iterable, List
 
 
+_STALE_NFS_MARKERS = ("stale NFS file handle",)
+
+
+def _is_stale_nfs_error(output: str) -> bool:
+    haystack = output.lower()
+    return any(marker in haystack for marker in _STALE_NFS_MARKERS)
+
+
+def _run_with_retry(cmd: List[str], env: dict[str, str], retries: int) -> None:
+    attempt = 0
+    while True:
+        attempt += 1
+        result = subprocess.run(
+            cmd,
+            check=False,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="", flush=True)
+            return
+        combined = (result.stdout or "") + (result.stderr or "")
+        if _is_stale_nfs_error(combined) and attempt <= retries:
+            print(
+                f"[WARN] Detected stale NFS handle (attempt {attempt}/{retries}), retrying..."
+            )
+            continue
+        if combined:
+            print(combined, end="")
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
+
 def _iter_sif_paths(sif_dir: Path) -> List[Path]:
     return sorted(p for p in sif_dir.glob("*.sif") if p.is_file())
 
@@ -80,7 +116,7 @@ for name in pkgs:
         py,
         *pkg_list,
     ]
-    subprocess.run(cmd, check=False, env=env)
+    _run_with_retry(cmd, env, retries=0)
 
 
 def _install_wheels(
@@ -89,6 +125,7 @@ def _install_wheels(
     wheel_dir: Path,
     packages: Iterable[str],
     env: dict[str, str],
+    retries: int,
 ) -> None:
     pkg_list = list(packages)
     if not pkg_list:
@@ -107,7 +144,7 @@ def _install_wheels(
         "--find-links=/mnt/wheels",
         *pkg_list,
     ]
-    subprocess.run(cmd, check=True, env=env)
+    _run_with_retry(cmd, env, retries=retries)
 
 
 def _download_wheels(
@@ -128,7 +165,7 @@ def _download_wheels(
         str(wheel_dir),
         *pkg_list,
     ]
-    subprocess.run(cmd, check=True, env=env)
+    _run_with_retry(cmd, env, retries=0)
 
 
 def _build_sandbox(
@@ -136,9 +173,10 @@ def _build_sandbox(
     src_sif: Path,
     sandbox_dir: Path,
     env: dict[str, str],
+    retries: int,
 ) -> None:
     cmd = [apptainer_bin, "build", "--sandbox", str(sandbox_dir), str(src_sif)]
-    subprocess.run(cmd, check=True, env=env)
+    _run_with_retry(cmd, env, retries=retries)
 
 
 def _build_sif(
@@ -146,9 +184,10 @@ def _build_sif(
     src_sandbox: Path,
     out_sif: Path,
     env: dict[str, str],
+    retries: int,
 ) -> None:
     cmd = [apptainer_bin, "build", str(out_sif), str(src_sandbox)]
-    subprocess.run(cmd, check=True, env=env)
+    _run_with_retry(cmd, env, retries=retries)
 
 
 def main() -> None:
@@ -218,6 +257,12 @@ def main() -> None:
         type=int,
         default=0,
         help="Maximum number of .sif images to process (0 means all).",
+    )
+    parser.add_argument(
+        "--nfs-retries",
+        type=int,
+        default=2,
+        help="Retries per step when stale NFS handle is detected (default: 2).",
     )
     parser.add_argument(
         "--show-existing",
@@ -295,9 +340,16 @@ def main() -> None:
             shutil.rmtree(sandbox_dir)
 
         try:
-            _build_sandbox(args.apptainer_bin, sif_path, sandbox_dir, env)
-            _install_wheels(args.apptainer_bin, sandbox_dir, wheel_dir, packages, env)
-            _build_sif(args.apptainer_bin, sandbox_dir, temp_out_sif, env)
+            _build_sandbox(args.apptainer_bin, sif_path, sandbox_dir, env, args.nfs_retries)
+            _install_wheels(
+                args.apptainer_bin,
+                sandbox_dir,
+                wheel_dir,
+                packages,
+                env,
+                args.nfs_retries,
+            )
+            _build_sif(args.apptainer_bin, sandbox_dir, temp_out_sif, env, args.nfs_retries)
             if args.in_place and temp_out_sif != out_sif:
                 os.replace(temp_out_sif, out_sif)
 
