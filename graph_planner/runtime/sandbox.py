@@ -451,6 +451,8 @@ class SandboxRuntime:
                     "/testbed/wheels",
                     "/repo/whl",
                     "/repo/wheels",
+                    "/mnt/share/whl",
+                    "/mnt/share/wheels",
                 ]
                 for candidate in candidate_dirs:
                     resp = self._remote.exec(f"test -d {candidate}", timeout=30, cwd=self.workdir)
@@ -835,7 +837,8 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                     "pytest is not available in the remote_swe environment. "
                     "Set GP_PIP_WHEEL_DIR to a directory with pytest wheels, or "
                     "place wheels under /testbed/whl, /testbed/wheels, /repo/whl, "
-                    "or /repo/wheels, or provide a run_tests.sh script in the repo."
+                    "/repo/wheels, /mnt/share/whl, or /mnt/share/wheels, or provide "
+                    "a run_tests.sh script in the repo."
                 ),
             }
             return self._finalize_test_result(
