@@ -426,11 +426,19 @@ class SandboxRuntime:
         assert self._remote is not None, "remote_swe backend not initialized"
         try:
             _dbg("remote_swe bootstrap: installing pytest (best effort)")
-            self._remote.exec(
-                "python -m pip -q install pytest >/dev/null 2>&1 || true",
+            resp = self._remote.exec(
+                "python -m pip install pytest || true",
                 timeout=300,
                 cwd=self.workdir,
             )
+            stdout = (resp.get("stdout") or "").strip()
+            stderr = (resp.get("stderr") or "").strip()
+            if stdout or stderr:
+                _dbg(
+                    "remote_swe bootstrap output:"
+                    f"{' stdout=' + stdout if stdout else ''}"
+                    f"{' stderr=' + stderr if stderr else ''}"
+                )
         except Exception as exc:
             _dbg(f"remote_swe bootstrap failed: {exc!r}")
         self._remote_bootstrapped = True
