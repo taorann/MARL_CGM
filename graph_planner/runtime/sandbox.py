@@ -98,6 +98,7 @@ class SandboxRuntime:
         # (Multiple helpers call into _exec/build_repo_graph, which used to call start
         # every time and could race with SSH timeout.)
         self._remote_started: bool = False
+        self._remote_bootstrapped: bool = False
         self._remote_start_lock = threading.Lock()
 
         if self._mode == "repoenv":
@@ -409,11 +410,30 @@ class SandboxRuntime:
                     _dbg(f"remote_swe start got busy; adopting current_run_id={cur}")
                     self._remote.run_id = cur
                     self._remote_started = True
+                    if not self._remote_bootstrapped:
+                        self._bootstrap_remote_swe()
                     return
                 raise RuntimeError(
                     f"remote_swe start failed: rc={rc!r} error={err!r} stderr={stderr[:2000]!r}"
                 )
             self._remote_started = True
+            if not self._remote_bootstrapped:
+                self._bootstrap_remote_swe()
+
+    def _bootstrap_remote_swe(self) -> None:
+        if self._mode != "remote_swe":
+            return
+        assert self._remote is not None, "remote_swe backend not initialized"
+        try:
+            _dbg("remote_swe bootstrap: installing pytest (best effort)")
+            self._remote.exec(
+                "python -m pip -q install pytest >/dev/null 2>&1 || true",
+                timeout=300,
+                cwd=self.workdir,
+            )
+        except Exception as exc:
+            _dbg(f"remote_swe bootstrap failed: {exc!r}")
+        self._remote_bootstrapped = True
 
     def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
         if self._mode == "remote_swe":
