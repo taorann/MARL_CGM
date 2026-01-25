@@ -1,0 +1,14 @@
++ python /root/private_data/MARL_CGM/scripts/eval_graph_planner_engine.py --sandbox-remote-repo /appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM --sandbox-ssh-target chongbin_cls@login24 --config configs/eval/graph_planner_eval_defaults.yaml --no-auto-launch-planner-service --no-auto-launch-cgm-service --planner-base-url http://127.0.0.1:30000/v1 --planner-model models/Qwen3-14B --planner-tokenizer /root/private_data/luoshang/graph_planner_v2/models/Qwen3-14B --planner-api-key-env OPENAI_API_KEY --cgm-endpoint http://172.20.110.10:30001/generate --sandbox-backend remote_swe --max_output_tokens 8192 --parallel 1
+2026-01-25 14:47:28,330 - graph_planner.eval.engine - INFO - Token caps resolved: per-step max_output_tokens=8192 | episode max_response_tokens=16000
+[gp-agent] raw_model= Error processing content: Error code: 400 - {'error': {'message': "'max_tokens' or 'max_completion_tokens' is too large: 16000. This model's maximum context length is 18000 tokens and your request has 2421 input tokens (16000 > 18000 - 2421). None", 'type': 'BadRequestError', 'param': None, 'code': 400}}
+[gp-agent] parsed_action= NoopAction(type='noop', schema_version=1)
+[gp-env] step=1 noop/ W=0/0 M=0/0 ΔW=0 ΔM=0
+[gp-agent] raw_model= Error processing content: Error code: 400 - {'error': {'message': "'max_tokens' or 'max_completion_tokens' is too large: 15897. This model's maximum context length is 18000 tokens and your request has 2163 input tokens (15897 > 18000 - 2163). None", 'type': 'BadRequestError', 'param': None, 'code': 400}}
+[gp-agent] parsed_action= NoopAction(type='noop', schema_version=1)
+[gp-env] step=2 noop/ W=0/0 M=0/0 ΔW=0 ΔM=0
+[gp-agent] raw_model= {"content": "", "tool_calls": [{"name": "run_failed_test", "arguments": "{}"}]}
+[gp-agent] parsed_action= RunFailedTestAction(type='run_failed_test', schema_version=1)
+[sandbox] pytest cmd: python -m pytest -q
+[remote_swe_session][proxy_stderr]
+/home/chongbin_pkuhpc/chongbin_cls/miniconda3/bin/python: No module named pytest
+[gp-agent] raw_model= {"content": "", "tool_calls": [{"name": "noop", "arguments": "{\"reason\": \"The test runner is missing pytest. Need to install pytest first.\"}"}]}
