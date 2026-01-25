@@ -15,6 +15,7 @@ Example:
     python scripts/prepare_sif_with_wheels.py \
         --sif-dir $HOME/sif/sweb \
         --in-place \
+        --work-dir /local_scratch/$USER/sif_work \
         --wheel-dir /appsnew/home/chongbin_pkuhpc/chongbin_cls/wheels \
         --download-wheels \
         --packages pytest hypothesis \
@@ -50,6 +51,7 @@ def _check_existing_packages(
     apptainer_bin: str,
     sif_path: Path,
     packages: Iterable[str],
+    env: dict[str, str],
 ) -> None:
     pkg_list = list(packages)
     if not pkg_list:
@@ -75,7 +77,7 @@ for name in pkgs:
         py,
         *pkg_list,
     ]
-    subprocess.run(cmd, check=False)
+    subprocess.run(cmd, check=False, env=env)
 
 
 def _install_wheels(
@@ -83,6 +85,7 @@ def _install_wheels(
     sandbox_dir: Path,
     wheel_dir: Path,
     packages: Iterable[str],
+    env: dict[str, str],
 ) -> None:
     pkg_list = list(packages)
     if not pkg_list:
@@ -101,12 +104,13 @@ def _install_wheels(
         "--find-links=/mnt/wheels",
         *pkg_list,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 def _download_wheels(
     wheel_dir: Path,
     packages: Iterable[str],
+    env: dict[str, str],
 ) -> None:
     pkg_list = list(packages)
     if not pkg_list:
@@ -121,17 +125,27 @@ def _download_wheels(
         str(wheel_dir),
         *pkg_list,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
-def _build_sandbox(apptainer_bin: str, src_sif: Path, sandbox_dir: Path) -> None:
+def _build_sandbox(
+    apptainer_bin: str,
+    src_sif: Path,
+    sandbox_dir: Path,
+    env: dict[str, str],
+) -> None:
     cmd = [apptainer_bin, "build", "--sandbox", str(sandbox_dir), str(src_sif)]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
-def _build_sif(apptainer_bin: str, src_sandbox: Path, out_sif: Path) -> None:
+def _build_sif(
+    apptainer_bin: str,
+    src_sandbox: Path,
+    out_sif: Path,
+    env: dict[str, str],
+) -> None:
     cmd = [apptainer_bin, "build", str(out_sif), str(src_sandbox)]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 def main() -> None:
@@ -165,6 +179,24 @@ def main() -> None:
         "--in-place",
         action="store_true",
         help="Replace .sif files in --sif-dir (ignores --output-dir).",
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=str,
+        default=None,
+        help="Directory for sandboxes and temp outputs (recommended on local scratch).",
+    )
+    parser.add_argument(
+        "--apptainer-tmpdir",
+        type=str,
+        default=None,
+        help="Override APPTAINER_TMPDIR/SINGULARITY_TMPDIR for builds.",
+    )
+    parser.add_argument(
+        "--apptainer-cachedir",
+        type=str,
+        default=None,
+        help="Override APPTAINER_CACHEDIR/SINGULARITY_CACHEDIR for builds.",
     )
     parser.add_argument(
         "--packages",
@@ -211,6 +243,19 @@ def main() -> None:
         raise SystemExit("--output-dir is required unless --in-place is set.")
     wheel_dir = Path(args.wheel_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.work_dir:
+        work_dir = Path(args.work_dir).expanduser().resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        work_dir = output_dir
+
+    env = os.environ.copy()
+    if args.apptainer_tmpdir:
+        env["APPTAINER_TMPDIR"] = args.apptainer_tmpdir
+        env["SINGULARITY_TMPDIR"] = args.apptainer_tmpdir
+    if args.apptainer_cachedir:
+        env["APPTAINER_CACHEDIR"] = args.apptainer_cachedir
+        env["SINGULARITY_CACHEDIR"] = args.apptainer_cachedir
 
     if not sif_dir.is_dir():
         raise SystemExit(f"SIF dir not found: {sif_dir}")
@@ -232,30 +277,30 @@ def main() -> None:
         sif_paths = sif_paths[: args.limit]
 
     if args.download_wheels:
-        _download_wheels(wheel_dir, packages)
+        _download_wheels(wheel_dir, packages, env)
 
     for sif_path in sif_paths:
         out_sif = output_dir / sif_path.name
         temp_out_sif = out_sif
         if args.in_place:
-            temp_out_sif = output_dir / f"{sif_path.stem}.tmp.sif"
-        sandbox_dir = output_dir / f"{sif_path.stem}.sandbox"
+            temp_out_sif = work_dir / f"{sif_path.stem}.tmp.sif"
+        sandbox_dir = work_dir / f"{sif_path.stem}.sandbox"
 
         print(f"[INFO] Processing {sif_path.name}")
         if args.show_existing:
-            _check_existing_packages(args.apptainer_bin, sif_path, packages)
+            _check_existing_packages(args.apptainer_bin, sif_path, packages, env)
 
         if sandbox_dir.exists():
             shutil.rmtree(sandbox_dir)
 
-        _build_sandbox(args.apptainer_bin, sif_path, sandbox_dir)
-        _install_wheels(args.apptainer_bin, sandbox_dir, wheel_dir, packages)
-        _build_sif(args.apptainer_bin, sandbox_dir, temp_out_sif)
+        _build_sandbox(args.apptainer_bin, sif_path, sandbox_dir, env)
+        _install_wheels(args.apptainer_bin, sandbox_dir, wheel_dir, packages, env)
+        _build_sif(args.apptainer_bin, sandbox_dir, temp_out_sif, env)
         if args.in_place and temp_out_sif != out_sif:
             os.replace(temp_out_sif, out_sif)
 
         if args.show_existing:
-            _check_existing_packages(args.apptainer_bin, out_sif, packages)
+            _check_existing_packages(args.apptainer_bin, out_sif, packages, env)
 
         if not args.keep_sandbox:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
