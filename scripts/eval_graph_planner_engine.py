@@ -1593,6 +1593,7 @@ def main() -> None:
         "model": args.planner_model,
         "temperature": args.planner_temperature,
         "top_p": args.planner_top_p,
+        "max_tokens": args.max_output_tokens,
     }
 
     rollout_args = {"base_url": args.planner_base_url}
