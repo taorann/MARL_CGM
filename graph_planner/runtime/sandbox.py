@@ -99,6 +99,7 @@ class SandboxRuntime:
         # every time and could race with SSH timeout.)
         self._remote_started: bool = False
         self._remote_bootstrapped: bool = False
+        self._remote_pytest_available: Optional[bool] = None
         self._remote_start_lock = threading.Lock()
 
         if self._mode == "repoenv":
@@ -426,23 +427,66 @@ class SandboxRuntime:
         assert self._remote is not None, "remote_swe backend not initialized"
         try:
             _dbg("remote_swe bootstrap: installing pytest (best effort)")
+            precheck = self._remote.exec(
+                "python - <<'PY'\n"
+                "import pytest\n"
+                "print(pytest.__version__)\n"
+                "PY",
+                timeout=60,
+                cwd=self.workdir,
+            )
+            if _safe_int(precheck.get("returncode", 1), 1) == 0:
+                self._remote_pytest_available = True
+                self._remote_bootstrapped = True
+                return
             wheel_dir = str(os.environ.get("GP_PIP_WHEEL_DIR", "")).strip()
+            if not wheel_dir:
+                workdir = (self.workdir or "/testbed").rstrip("/")
+                candidate_dirs = [
+                    os.path.join(workdir, "whl"),
+                    os.path.join(workdir, "wheels"),
+                    os.path.join(workdir, "third_party", "whl"),
+                    os.path.join(workdir, "third_party", "wheels"),
+                    "/testbed/whl",
+                    "/testbed/wheels",
+                    "/repo/whl",
+                    "/repo/wheels",
+                ]
+                for candidate in candidate_dirs:
+                    resp = self._remote.exec(f"test -d {candidate}", timeout=30, cwd=self.workdir)
+                    if _safe_int(resp.get("returncode", 1), 1) == 0:
+                        wheel_dir = candidate
+                        break
             if wheel_dir:
                 cmd = (
                     "python -m pip install --no-index "
                     f"--find-links={wheel_dir} pytest || true"
                 )
             else:
-                cmd = "python -m pip install pytest || true"
-            resp = self._remote.exec(cmd, timeout=300, cwd=self.workdir)
-            stdout = (resp.get("stdout") or "").strip()
-            stderr = (resp.get("stderr") or "").strip()
-            if stdout or stderr:
-                _dbg(
-                    "remote_swe bootstrap output:"
-                    f"{' stdout=' + stdout if stdout else ''}"
-                    f"{' stderr=' + stderr if stderr else ''}"
-                )
+                cmd = ""
+            if not cmd:
+                _dbg("remote_swe bootstrap: no wheel dir found for offline pytest install")
+            else:
+                resp = self._remote.exec(cmd, timeout=300, cwd=self.workdir)
+                stdout = (resp.get("stdout") or "").strip()
+                stderr = (resp.get("stderr") or "").strip()
+                if stdout or stderr:
+                    _dbg(
+                        "remote_swe bootstrap output:"
+                        f"{' stdout=' + stdout if stdout else ''}"
+                        f"{' stderr=' + stderr if stderr else ''}"
+                    )
+            check = self._remote.exec(
+                "python - <<'PY'\n"
+                "import pytest\n"
+                "print(pytest.__version__)\n"
+                "PY",
+                timeout=60,
+                cwd=self.workdir,
+            )
+            self._remote_pytest_available = _safe_int(check.get("returncode", 0), 1) == 0
+            if not self._remote_pytest_available:
+                _dbg("remote_swe bootstrap: pytest not available after install attempt")
         except Exception as exc:
             _dbg(f"remote_swe bootstrap failed: {exc!r}")
         self._remote_bootstrapped = True
@@ -781,6 +825,25 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                 )
 
         # 回退 pytest（禁用 --cache-dir，统一用 python -m pytest）
+        if self._mode == "remote_swe" and self._remote_pytest_available is False:
+            cmd = "python -m pytest -q"
+            result = {
+                "mode": "pytest-missing",
+                "passed": False,
+                "rc": 1,
+                "stdout": (
+                    "pytest is not available in the remote_swe environment. "
+                    "Set GP_PIP_WHEEL_DIR to a directory with pytest wheels, or "
+                    "place wheels under /testbed/whl, /testbed/wheels, /repo/whl, "
+                    "or /repo/wheels, or provide a run_tests.sh script in the repo."
+                ),
+            }
+            return self._finalize_test_result(
+                result,
+                command=cmd,
+                selector=selector_tuple,
+                duration=0.0,
+            )
         cmd = f"python -m pytest -q {sel}".strip()
         _dbg(f"pytest cmd: {cmd}")
         start = time.time()
