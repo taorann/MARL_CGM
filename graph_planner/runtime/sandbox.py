@@ -424,20 +424,8 @@ class SandboxRuntime:
         if self._mode != "remote_swe":
             return
         assert self._remote is not None, "remote_swe backend not initialized"
-        if str(os.environ.get("GP_REMOTE_SWE_SKIP_BOOTSTRAP", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }:
-            self._remote_bootstrapped = True
-            return
         try:
             _dbg("remote_swe bootstrap: installing pytest (best effort)")
-            self._remote.exec(
-                "python -m pip -q install --upgrade pip >/dev/null 2>&1 || true",
-                timeout=300,
-                cwd=self.workdir,
-            )
             self._remote.exec(
                 "python -m pip -q install pytest >/dev/null 2>&1 || true",
                 timeout=300,

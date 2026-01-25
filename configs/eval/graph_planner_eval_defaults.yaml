@@ -20,7 +20,6 @@ planner_timeout: 180
 planner_max_input_tokens: 12000
 max_prompt_tokens: 12000
 max_output_tokens: 4000
-max_response_tokens: 200000
 max_steps: 60  # increased for deeper trajectories; override via GP_MAX_STEPS
 enable_rule_fallback: false
 parallel: 4
