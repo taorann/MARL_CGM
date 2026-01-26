@@ -20,6 +20,7 @@ Example:
         --sif-dir $HOME/sif/sweb \
         --in-place \
         --wheel-dir /appsnew/home/chongbin_pkuhpc/chongbin_cls/wheels \
+        --output-dir /home/chongbin_pkuhpc/chongbin_cls/lustre1 \
         --download-wheels \
         --packages pytest hypothesis \
         --limit 10 \
@@ -37,6 +38,7 @@ from typing import Iterable, List
 
 
 _STALE_NFS_MARKERS = ("stale NFS file handle",)
+_DEFAULT_OUTPUT_ROOT = Path("/home/chongbin_pkuhpc/chongbin_cls/lustre1")
 
 
 def _is_stale_nfs_error(output: str) -> bool:
@@ -204,7 +206,10 @@ def main() -> None:
         "--output-dir",
         type=str,
         default=None,
-        help="Directory to store rebuilt .sif images (required unless --in-place).",
+        help=(
+            "Directory to store rebuilt .sif images (default: "
+            f"{_DEFAULT_OUTPUT_ROOT})."
+        ),
     )
     parser.add_argument(
         "--wheel-dir",
@@ -220,7 +225,7 @@ def main() -> None:
     parser.add_argument(
         "--in-place",
         action="store_true",
-        help="Replace .sif files in --sif-dir (ignores --output-dir).",
+        help="Replace .sif files in --output-dir when rebuilding.",
     )
     parser.add_argument(
         "--apptainer-tmpdir",
@@ -277,15 +282,14 @@ def main() -> None:
     args = parser.parse_args()
 
     sif_dir = Path(args.sif_dir).expanduser().resolve()
-    if args.in_place:
-        output_dir = sif_dir
-    elif args.output_dir:
-        output_dir = Path(args.output_dir).expanduser().resolve()
-    else:
-        raise SystemExit("--output-dir is required unless --in-place is set.")
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else _DEFAULT_OUTPUT_ROOT
+    )
     wheel_dir = Path(args.wheel_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    cache_root = sif_dir / ".sif-cache"
+    cache_root = output_dir / ".sif-cache"
     cache_root.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
