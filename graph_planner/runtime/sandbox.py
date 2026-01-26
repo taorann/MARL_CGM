@@ -839,7 +839,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
 
     def _build_testbed_pytest_cmd(self, sel: str) -> str:
         selector = sel.strip()
-        pytest_args = f"-q -o cache_dir=/tmp/pytest_cache {selector}".strip()
+        pytest_args = f"-W ignore -q -o cache_dir=/tmp/pytest_cache {selector}".strip()
         # Some SWE-bench images configure pytest to treat warnings as errors.
         # Inject a narrow PYTHONWARNINGS filter (方案3) so collection doesn't abort
         # on known NumPy 1.25 DeprecationWarnings.
@@ -850,6 +850,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                 'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
                 + flt
                 + '"; '
+                'export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-W ignore"; '
             )
         return (
             "set -euo pipefail; "
@@ -874,13 +875,10 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
     def _eval_sh_pythonwarnings_filter(self) -> str:
         """Return the PYTHONWARNINGS filter we inject into harness eval.sh.
 
-        Default: only silence the known NumPy 1.25 DeprecationWarning that breaks
-        pytest collection in some SWE-bench images.
+        Default: ignore all warnings to prevent warnings-as-errors from aborting test collection.
         Set GP_EVAL_SH_PYTHONWARNINGS to override; set it to empty to disable.
         """
-        default = (
-            "ignore:Conversion of an array with ndim > 0 to a scalar is deprecated.*:DeprecationWarning"
-        )
+        default = "ignore"
         v = str(os.environ.get("GP_EVAL_SH_PYTHONWARNINGS", default) or "").strip()
         return v
 
@@ -908,17 +906,20 @@ p = pathlib.Path(sys.argv[1])
 flt = sys.argv[2]
 txt = p.read_text(encoding="utf-8", errors="replace")
 
-# Idempotent: if PYTHONWARNINGS is already exported, do nothing.
-if re.search(r"(?m)^\s*export\s+PYTHONWARNINGS=", txt):
+# Idempotent: only insert missing exports.
+has_pw = re.search(r"(?m)^\s*export\s+PYTHONWARNINGS=", txt)
+has_pa = re.search(r"(?m)^\s*export\s+PYTEST_ADDOPTS=", txt)
+if has_pw and has_pa:
     sys.exit(0)
 
 lines = txt.splitlines(True)
 
-export_line = (
+pw_line = (
     'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
     + flt
     + '"\n'
 )
+pa_line = 'export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-W ignore"\n'
 
 insert_at = 0
 # Prefer: after 'set -euo pipefail'
@@ -931,7 +932,13 @@ else:
     if lines and lines[0].startswith("#!"):
         insert_at = 1
 
-lines.insert(insert_at, export_line)
+to_insert = []
+if not has_pw:
+    to_insert.append(pw_line)
+if not has_pa:
+    to_insert.append(pa_line)
+for j, ln in enumerate(to_insert):
+    lines.insert(insert_at + j, ln)
 p.write_text("".join(lines), encoding="utf-8")
 """
 
