@@ -426,59 +426,11 @@ class SandboxRuntime:
             return
         assert self._remote is not None, "remote_swe backend not initialized"
         try:
-            _dbg("remote_swe bootstrap: installing pytest (best effort)")
-            precheck = self._remote.exec(
-                "python - <<'PY'\n"
-                "import pytest\n"
-                "print(pytest.__version__)\n"
-                "PY",
-                timeout=60,
-                cwd=self.workdir,
-            )
-            if _safe_int(precheck.get("returncode", 1), 1) == 0:
-                self._remote_pytest_available = True
-                self._remote_bootstrapped = True
-                return
-            wheel_dir = str(os.environ.get("GP_PIP_WHEEL_DIR", "")).strip()
-            if not wheel_dir:
-                workdir = (self.workdir or "/testbed").rstrip("/")
-                candidate_dirs = [
-                    os.path.join(workdir, "whl"),
-                    os.path.join(workdir, "wheels"),
-                    os.path.join(workdir, "third_party", "whl"),
-                    os.path.join(workdir, "third_party", "wheels"),
-                    "/testbed/whl",
-                    "/testbed/wheels",
-                    "/repo/whl",
-                    "/repo/wheels",
-                    "/mnt/share/whl",
-                    "/mnt/share/wheels",
-                ]
-                for candidate in candidate_dirs:
-                    resp = self._remote.exec(f"test -d {candidate}", timeout=30, cwd=self.workdir)
-                    if _safe_int(resp.get("returncode", 1), 1) == 0:
-                        wheel_dir = candidate
-                        break
-            if wheel_dir:
-                cmd = (
-                    "python -m pip install --no-index "
-                    f"--find-links={wheel_dir} pytest || true"
-                )
-            else:
-                cmd = ""
-            if not cmd:
-                _dbg("remote_swe bootstrap: no wheel dir found for offline pytest install")
-            else:
-                resp = self._remote.exec(cmd, timeout=300, cwd=self.workdir)
-                stdout = (resp.get("stdout") or "").strip()
-                stderr = (resp.get("stderr") or "").strip()
-                if stdout or stderr:
-                    _dbg(
-                        "remote_swe bootstrap output:"
-                        f"{' stdout=' + stdout if stdout else ''}"
-                        f"{' stderr=' + stderr if stderr else ''}"
-                    )
+            _dbg("remote_swe bootstrap: verifying pytest in testbed env")
             check = self._remote.exec(
+                "set -euo pipefail; "
+                "source /opt/miniconda3/bin/activate; "
+                "conda activate testbed; "
                 "python - <<'PY'\n"
                 "import pytest\n"
                 "print(pytest.__version__)\n"
@@ -488,7 +440,7 @@ class SandboxRuntime:
             )
             self._remote_pytest_available = _safe_int(check.get("returncode", 0), 1) == 0
             if not self._remote_pytest_available:
-                _dbg("remote_swe bootstrap: pytest not available after install attempt")
+                _dbg("remote_swe bootstrap: pytest not available in testbed env")
         except Exception as exc:
             _dbg(f"remote_swe bootstrap failed: {exc!r}")
         self._remote_bootstrapped = True
@@ -762,6 +714,25 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         selector_tuple: Tuple[str, ...] = tuple(selector or ())
         sel = " ".join(selector_tuple)
 
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            self._ensure_eval_script_from_spec()
+
+        # Prefer harness-generated eval.sh when available (e.g., Singularity workflow).
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            for eval_script in ("/work/eval.sh", "/testbed/eval.sh"):
+                if self._exec(f"test -f {eval_script}")[1] == 0:
+                    cmd = self._build_testbed_eval_cmd(eval_script)
+                    start = time.time()
+                    out, rc = self._exec(cmd, timeout=timeout)
+                    duration = time.time() - start
+                    result = {"mode": "eval.sh", "passed": rc == 0, "rc": rc, "stdout": out}
+                    return self._finalize_test_result(
+                        result,
+                        command=cmd,
+                        selector=selector_tuple,
+                        duration=duration,
+                    )
+
         # remote_swe: prefer /repo (workdir) run_tests.sh if present, else fallback pytest
         if self._mode == "remote_swe":
             wd = (self.workdir or "/repo").rstrip("/")
@@ -826,7 +797,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                     duration=duration,
                 )
 
-        # 回退 pytest（禁用 --cache-dir，统一用 python -m pytest）
+        # 回退 pytest（避免使用不兼容的 --cache-dir，统一用 python -m pytest）
         if self._mode == "remote_swe" and self._remote_pytest_available is False:
             cmd = "python -m pytest -q"
             result = {
@@ -847,7 +818,10 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                 selector=selector_tuple,
                 duration=0.0,
             )
-        cmd = f"python -m pytest -q {sel}".strip()
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            cmd = self._build_testbed_pytest_cmd(sel)
+        else:
+            cmd = f"python -m pytest -q {sel}".strip()
         _dbg(f"pytest cmd: {cmd}")
         start = time.time()
         out, rc = self._exec(cmd, timeout=timeout)
@@ -859,6 +833,44 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             selector=selector_tuple,
             duration=duration,
         )
+
+    def _build_testbed_pytest_cmd(self, sel: str) -> str:
+        selector = sel.strip()
+        pytest_args = f"-q -o cache_dir=/tmp/pytest_cache {selector}".strip()
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "export TMPDIR=/tmp; "
+            "export PYTHONPYCACHEPREFIX=/tmp/pycache; "
+            "cd /testbed; "
+            f"python -m pytest {pytest_args}"
+        )
+
+    def _build_testbed_eval_cmd(self, eval_script: str) -> str:
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "cd /testbed; "
+            f"bash {eval_script}"
+        )
+
+    def _ensure_eval_script_from_spec(self) -> None:
+        if not self.cfg.swebench_spec:
+            return
+        eval_list = self.cfg.swebench_spec.get("eval_script_list")
+        if not eval_list:
+            return
+        if self._exec("test -f /work/eval.sh")[1] == 0 or self._exec("test -f /testbed/eval.sh")[1] == 0:
+            return
+        target_dir = "/work" if self._exec("test -d /work")[1] == 0 else "/testbed"
+        lines = [str(line) for line in eval_list if str(line).strip()]
+        if not lines:
+            return
+        script_body = "#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(lines) + "\n"
+        heredoc = f"cat >{target_dir}/eval.sh <<'EOF'\n{script_body}EOF\nchmod +x {target_dir}/eval.sh"
+        self._exec(heredoc)
 
     def _aci_root(self) -> Path:
         # Host-side cache root for GraphPlanner artifacts
