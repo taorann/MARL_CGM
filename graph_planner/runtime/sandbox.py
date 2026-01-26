@@ -847,7 +847,10 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                 selector=selector_tuple,
                 duration=0.0,
             )
-        cmd = f"python -m pytest -q {sel}".strip()
+        if self._mode == "apptainer_queue":
+            cmd = self._build_apptainer_pytest_cmd(sel)
+        else:
+            cmd = f"python -m pytest -q {sel}".strip()
         _dbg(f"pytest cmd: {cmd}")
         start = time.time()
         out, rc = self._exec(cmd, timeout=timeout)
@@ -858,6 +861,17 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             command=cmd,
             selector=selector_tuple,
             duration=duration,
+        )
+
+    def _build_apptainer_pytest_cmd(self, sel: str) -> str:
+        selector = sel.strip()
+        pytest_args = f"-q {selector}".strip()
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "cd /testbed; "
+            f"python -m pytest {pytest_args}"
         )
 
     def _aci_root(self) -> Path:
