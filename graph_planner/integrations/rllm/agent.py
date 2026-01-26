@@ -119,6 +119,10 @@ OPENAI_TOOLS: List[Dict[str, Any]] = [
                         "enum": ["file", "class", "func", "method", "test"],
                         "description": "Optional type filter for find results.",
                     },
+                    "class_name": {
+                        "type": "string",
+                        "description": "Optional. When locating methods, provide the containing class name to scope/rerank results (file→class→method). Leave empty for free functions.",
+                    },
                 },
                 "required": ["query", "find_type"],
                 "additionalProperties": False,
@@ -368,6 +372,9 @@ def _tool_call_to_internal_action(name: str, arguments: Mapping[str, Any]) -> Di
         find_type = args.get("find_type")
         if isinstance(find_type, str) and find_type.strip():
             params["find_type"] = find_type.strip()
+        class_name = args.get("class_name")
+        if isinstance(class_name, str) and class_name.strip():
+            params["class_name"] = class_name.strip()
         return {"name": "explore", "params": params}
 
     if tool == "explore_expand":
