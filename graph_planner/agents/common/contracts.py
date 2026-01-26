@@ -133,7 +133,7 @@ Tools (preferred):
 1) run_failed_test()
    - Run the default test suite to capture failure signatures.
    - Use this only when you need fresh failure context for targeted search queries.
-2) explore_find(query, find_type)
+2) explore_find(query, find_type, class_name?)
    - HARD RULE: provide exactly ONE query string.
    - HARD RULE: provide exactly ONE find_type.
    - Query is a single string that may contain multiple keywords.
@@ -162,6 +162,11 @@ Tools (preferred):
 10) noop(reason?)
 
 Recommended workflow:
+- Hierarchical locate rule (File → Class → Function):
+    (1) Use explore_find with find_type="file" and a path: constraint from the traceback.
+    (2) If a class is involved, locate the class (find_type="class") before searching for methods.
+    (3) When searching for a method, pass class_name to explore_find to scope/rerank results.
+
 - Use explore_find to locate symbol-level nodes (func/class/method). Then use explore_expand on the best candidate.
 - After each successful explore (find/expand) you should either:
     (a) memory_commit the key node(s) so CGM can see the code, OR
@@ -194,6 +199,7 @@ PLANNER_CONTRACT = PlannerContract(
             "query",
             "find_type",
             "expand_mode",
+            "class_name",
             "hop",
             "limit",
             "max_per_anchor",
