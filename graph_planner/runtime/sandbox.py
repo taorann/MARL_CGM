@@ -714,6 +714,25 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         selector_tuple: Tuple[str, ...] = tuple(selector or ())
         sel = " ".join(selector_tuple)
 
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            self._ensure_eval_script_from_spec()
+
+        # Prefer harness-generated eval.sh when available (e.g., Singularity workflow).
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            for eval_script in ("/work/eval.sh", "/testbed/eval.sh"):
+                if self._exec(f"test -f {eval_script}")[1] == 0:
+                    cmd = self._build_testbed_eval_cmd(eval_script)
+                    start = time.time()
+                    out, rc = self._exec(cmd, timeout=timeout)
+                    duration = time.time() - start
+                    result = {"mode": "eval.sh", "passed": rc == 0, "rc": rc, "stdout": out}
+                    return self._finalize_test_result(
+                        result,
+                        command=cmd,
+                        selector=selector_tuple,
+                        duration=duration,
+                    )
+
         # remote_swe: prefer /repo (workdir) run_tests.sh if present, else fallback pytest
         if self._mode == "remote_swe":
             wd = (self.workdir or "/repo").rstrip("/")
@@ -827,6 +846,31 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             "cd /testbed; "
             f"python -m pytest {pytest_args}"
         )
+
+    def _build_testbed_eval_cmd(self, eval_script: str) -> str:
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "cd /testbed; "
+            f"bash {eval_script}"
+        )
+
+    def _ensure_eval_script_from_spec(self) -> None:
+        if not self.cfg.swebench_spec:
+            return
+        eval_list = self.cfg.swebench_spec.get("eval_script_list")
+        if not eval_list:
+            return
+        if self._exec("test -f /work/eval.sh")[1] == 0 or self._exec("test -f /testbed/eval.sh")[1] == 0:
+            return
+        target_dir = "/work" if self._exec("test -d /work")[1] == 0 else "/testbed"
+        lines = [str(line) for line in eval_list if str(line).strip()]
+        if not lines:
+            return
+        script_body = "#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(lines) + "\n"
+        heredoc = f"cat >{target_dir}/eval.sh <<'EOF'\n{script_body}EOF\nchmod +x {target_dir}/eval.sh"
+        self._exec(heredoc)
 
     def _aci_root(self) -> Path:
         # Host-side cache root for GraphPlanner artifacts
