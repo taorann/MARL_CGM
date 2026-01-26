@@ -840,12 +840,24 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
     def _build_testbed_pytest_cmd(self, sel: str) -> str:
         selector = sel.strip()
         pytest_args = f"-q -o cache_dir=/tmp/pytest_cache {selector}".strip()
+        # Some SWE-bench images configure pytest to treat warnings as errors.
+        # Inject a narrow PYTHONWARNINGS filter (方案3) so collection doesn't abort
+        # on known NumPy 1.25 DeprecationWarnings.
+        flt = self._eval_sh_pythonwarnings_filter()
+        warn_part = ""
+        if flt:
+            warn_part = (
+                'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
+                + flt
+                + '"; '
+            )
         return (
             "set -euo pipefail; "
             "source /opt/miniconda3/bin/activate; "
             "conda activate testbed; "
             "export TMPDIR=/tmp; "
             "export PYTHONPYCACHEPREFIX=/tmp/pycache; "
+            + warn_part
             "cd /testbed; "
             f"python -m pytest {pytest_args}"
         )
