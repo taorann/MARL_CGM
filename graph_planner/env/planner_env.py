@@ -646,7 +646,9 @@ class PlannerEnv:
         rid = raw_id.strip()
         if not rid:
             return rid
-        if rid.startswith(("func:", "cls:", "file:", "test:", "node:")):
+        # Accept canonical ids as-is.
+        # Note: repo_graph may use either "class:" or "cls:" prefix for classes.
+        if rid.startswith(("func:", "class:", "cls:", "file:", "test:", "node:", "module:")):
             return rid
         if ".py" in rid:
             # path.py:Symbol:123  -> func:path.py:Symbol:123
@@ -705,7 +707,11 @@ class PlannerEnv:
             return False
         if find_type == "t-file":
             path = str(candidate.get("path") or "")
-            return kind == "t-file" or ("test" in path.lower())
+            # Only treat *files* under tests as t-files; avoid letting classes/functions
+            # in test directories masquerade as test files.
+            if kind == "t-file":
+                return True
+            return kind == "file" and ("test" in path.lower())
         return kind == find_type
 
     def _expand_by_mode(
@@ -803,6 +809,9 @@ class PlannerEnv:
         find_type = self._normalize_find_type(getattr(act, "find_type", None))
         if find_type:
             info["find_type"] = find_type
+        class_name = getattr(act, "class_name", None)
+        if isinstance(class_name, str) and class_name.strip():
+            info["class_name"] = class_name.strip()
         expand_mode = getattr(act, "expand_mode", None)
         if isinstance(expand_mode, str) and expand_mode.strip():
             info["expand_mode"] = expand_mode.strip().lower()
@@ -866,6 +875,21 @@ class PlannerEnv:
                         query = relaxed
             if find_type:
                 candidates = [c for c in candidates if self._candidate_kind_match(c, find_type)]
+
+            # Optional rerank: if a class name is provided, prefer candidates that
+            # mention that class (helps file→class→method workflows).
+            if isinstance(class_name, str) and class_name.strip() and candidates:
+                cls = class_name.strip()
+
+                def _hit(c: Mapping[str, Any]) -> bool:
+                    s = f"{c.get('id','')} {c.get('name','')} {c.get('path','')}"
+                    return (cls in s) or (f"{cls}." in s)
+
+                hit = [c for c in candidates if _hit(c)]
+                miss = [c for c in candidates if not _hit(c)]
+                if hit:
+                    candidates = hit + miss
+                    info["class_name_rerank"] = {"hits": len(hit), "total": len(candidates)}
 
             # Expose candidates to the agent.
             self.last_candidates = candidates
