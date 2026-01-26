@@ -721,6 +721,9 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         if self._mode in ("apptainer_queue", "remote_swe"):
             for eval_script in ("/work/eval.sh", "/testbed/eval.sh"):
                 if self._exec(f"test -f {eval_script}")[1] == 0:
+                    # Patch harness-generated scripts to ignore known warnings
+                    # that can be promoted to errors in collection.
+                    self._patch_eval_sh_pythonwarnings(eval_script)
                     cmd = self._build_testbed_eval_cmd(eval_script)
                     start = time.time()
                     out, rc = self._exec(cmd, timeout=timeout)
@@ -856,6 +859,78 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             f"bash {eval_script}"
         )
 
+    def _eval_sh_pythonwarnings_filter(self) -> str:
+        """Return the PYTHONWARNINGS filter we inject into harness eval.sh.
+
+        Default: only silence the known NumPy 1.25 DeprecationWarning that breaks
+        pytest collection in some SWE-bench images.
+        Set GP_EVAL_SH_PYTHONWARNINGS to override; set it to empty to disable.
+        """
+        default = (
+            "ignore:Conversion of an array with ndim > 0 to a scalar is deprecated.*:DeprecationWarning"
+        )
+        v = str(os.environ.get("GP_EVAL_SH_PYTHONWARNINGS", default) or "").strip()
+        return v
+
+    def _patch_eval_sh_pythonwarnings(self, eval_script: str) -> None:
+        """Best-effort patch: inject an export PYTHONWARNINGS=... line into eval.sh.
+
+        This implements '方案3' by modifying the harness-generated script after
+        it is generated/copied, so that warnings-as-errors do not abort test
+        collection.
+        """
+        flt = self._eval_sh_pythonwarnings_filter()
+        if not flt:
+            return
+        path = str(eval_script or "").strip()
+        if not path:
+            return
+        # Only patch if the file exists.
+        if self._exec(f"test -f {path}")[1] != 0:
+            return
+
+        py = r"""
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+flt = sys.argv[2]
+txt = p.read_text(encoding="utf-8", errors="replace")
+
+# Idempotent: if PYTHONWARNINGS is already exported, do nothing.
+if re.search(r"(?m)^\s*export\s+PYTHONWARNINGS=", txt):
+    sys.exit(0)
+
+lines = txt.splitlines(True)
+
+export_line = (
+    'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
+    + flt
+    + '"\n'
+)
+
+insert_at = 0
+# Prefer: after 'set -euo pipefail'
+for i, ln in enumerate(lines[:60]):
+    if ln.strip().startswith("set ") and "pipefail" in ln:
+        insert_at = i + 1
+        break
+else:
+    # Fallback: after shebang
+    if lines and lines[0].startswith("#!"):
+        insert_at = 1
+
+lines.insert(insert_at, export_line)
+p.write_text("".join(lines), encoding="utf-8")
+"""
+
+        # Use the system python inside the image and pass argv explicitly.
+        cmd = (
+            f"/opt/miniconda3/bin/python - {shlex.quote(path)} {shlex.quote(flt)} <<'PY'\n"
+            f"{py}\n"
+            "PY"
+        )
+        self._exec(cmd, timeout=60)
+
     def _ensure_eval_script_from_spec(self) -> None:
         if not self.cfg.swebench_spec:
             return
@@ -868,7 +943,11 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
         lines = [str(line) for line in eval_list if str(line).strip()]
         if not lines:
             return
-        script_body = "#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(lines) + "\n"
+        warn = self._eval_sh_pythonwarnings_filter()
+        warn_line = ""
+        if warn:
+            warn_line = f"export PYTHONWARNINGS=\"${{PYTHONWARNINGS:+$PYTHONWARNINGS,}}{warn}\"\n"
+        script_body = "#!/usr/bin/env bash\nset -euo pipefail\n" + warn_line + "\n".join(lines) + "\n"
         heredoc = f"cat >{target_dir}/eval.sh <<'EOF'\n{script_body}EOF\nchmod +x {target_dir}/eval.sh"
         self._exec(heredoc)
 
