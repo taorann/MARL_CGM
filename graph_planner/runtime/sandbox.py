@@ -778,7 +778,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                     duration=duration,
                 )
 
-        # 回退 pytest（禁用 --cache-dir，统一用 python -m pytest）
+        # 回退 pytest（避免使用不兼容的 --cache-dir，统一用 python -m pytest）
         if self._mode == "remote_swe" and self._remote_pytest_available is False:
             cmd = "python -m pytest -q"
             result = {
@@ -817,7 +817,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
 
     def _build_testbed_pytest_cmd(self, sel: str) -> str:
         selector = sel.strip()
-        pytest_args = f"-q --cache-dir=/tmp/pytest_cache {selector}".strip()
+        pytest_args = f"-q -o cache_dir=/tmp/pytest_cache {selector}".strip()
         return (
             "set -euo pipefail; "
             "source /opt/miniconda3/bin/activate; "
