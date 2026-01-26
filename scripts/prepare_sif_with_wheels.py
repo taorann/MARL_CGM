@@ -38,7 +38,7 @@ from typing import Iterable, List
 
 
 _STALE_NFS_MARKERS = ("stale NFS file handle",)
-_DEFAULT_OUTPUT_ROOT = Path("/home/chongbin_pkuhpc/chongbin_cls/lustre1")
+_DEFAULT_OUTPUT_ROOT = Path("/home/chongbin_pkuhpc/chongbin_cls/lustre1/sif/sweb")
 
 
 def _is_stale_nfs_error(output: str) -> bool:
