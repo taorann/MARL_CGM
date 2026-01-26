@@ -20,6 +20,11 @@ class ExploreAction(BaseModel):
     find_type: Optional[str] = None
     expand_mode: Optional[str] = None
 
+    # Optional scoping hint for method/function search.
+    # When locating a method, provide the containing class name to help the
+    # environment rerank candidates in a file→class→method workflow.
+    class_name: Optional[str] = None
+
     # 图扩展半径 & 数量预算
     hop: conint(ge=0, le=2) = 1
     limit: conint(ge=1, le=100) = 50  # 兼容旧字段
