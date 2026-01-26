@@ -426,59 +426,11 @@ class SandboxRuntime:
             return
         assert self._remote is not None, "remote_swe backend not initialized"
         try:
-            _dbg("remote_swe bootstrap: installing pytest (best effort)")
-            precheck = self._remote.exec(
-                "python - <<'PY'\n"
-                "import pytest\n"
-                "print(pytest.__version__)\n"
-                "PY",
-                timeout=60,
-                cwd=self.workdir,
-            )
-            if _safe_int(precheck.get("returncode", 1), 1) == 0:
-                self._remote_pytest_available = True
-                self._remote_bootstrapped = True
-                return
-            wheel_dir = str(os.environ.get("GP_PIP_WHEEL_DIR", "")).strip()
-            if not wheel_dir:
-                workdir = (self.workdir or "/testbed").rstrip("/")
-                candidate_dirs = [
-                    os.path.join(workdir, "whl"),
-                    os.path.join(workdir, "wheels"),
-                    os.path.join(workdir, "third_party", "whl"),
-                    os.path.join(workdir, "third_party", "wheels"),
-                    "/testbed/whl",
-                    "/testbed/wheels",
-                    "/repo/whl",
-                    "/repo/wheels",
-                    "/mnt/share/whl",
-                    "/mnt/share/wheels",
-                ]
-                for candidate in candidate_dirs:
-                    resp = self._remote.exec(f"test -d {candidate}", timeout=30, cwd=self.workdir)
-                    if _safe_int(resp.get("returncode", 1), 1) == 0:
-                        wheel_dir = candidate
-                        break
-            if wheel_dir:
-                cmd = (
-                    "python -m pip install --no-index "
-                    f"--find-links={wheel_dir} pytest || true"
-                )
-            else:
-                cmd = ""
-            if not cmd:
-                _dbg("remote_swe bootstrap: no wheel dir found for offline pytest install")
-            else:
-                resp = self._remote.exec(cmd, timeout=300, cwd=self.workdir)
-                stdout = (resp.get("stdout") or "").strip()
-                stderr = (resp.get("stderr") or "").strip()
-                if stdout or stderr:
-                    _dbg(
-                        "remote_swe bootstrap output:"
-                        f"{' stdout=' + stdout if stdout else ''}"
-                        f"{' stderr=' + stderr if stderr else ''}"
-                    )
+            _dbg("remote_swe bootstrap: verifying pytest in testbed env")
             check = self._remote.exec(
+                "set -euo pipefail; "
+                "source /opt/miniconda3/bin/activate; "
+                "conda activate testbed; "
                 "python - <<'PY'\n"
                 "import pytest\n"
                 "print(pytest.__version__)\n"
@@ -488,7 +440,7 @@ class SandboxRuntime:
             )
             self._remote_pytest_available = _safe_int(check.get("returncode", 0), 1) == 0
             if not self._remote_pytest_available:
-                _dbg("remote_swe bootstrap: pytest not available after install attempt")
+                _dbg("remote_swe bootstrap: pytest not available in testbed env")
         except Exception as exc:
             _dbg(f"remote_swe bootstrap failed: {exc!r}")
         self._remote_bootstrapped = True
@@ -847,8 +799,8 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
                 selector=selector_tuple,
                 duration=0.0,
             )
-        if self._mode == "apptainer_queue":
-            cmd = self._build_apptainer_pytest_cmd(sel)
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            cmd = self._build_testbed_pytest_cmd(sel)
         else:
             cmd = f"python -m pytest -q {sel}".strip()
         _dbg(f"pytest cmd: {cmd}")
@@ -863,7 +815,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             duration=duration,
         )
 
-    def _build_apptainer_pytest_cmd(self, sel: str) -> str:
+    def _build_testbed_pytest_cmd(self, sel: str) -> str:
         selector = sel.strip()
         pytest_args = f"-q {selector}".strip()
         return (
