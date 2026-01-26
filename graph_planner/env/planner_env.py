@@ -169,6 +169,7 @@ class PlannerEnv:
 
         self.steps: int = 0
         self.last_info: Dict[str, Any] = {}
+        self.last_tests_report: Optional[Any] = None
         self.repo_root_in_container: str = sandbox_cfg.workdir or "."
         if getattr(self.box, "_mode", None) == "remote_swe":
             self.repo_root_in_container = "/repo"
@@ -220,6 +221,7 @@ class PlannerEnv:
         """重置环境：重建 repo_graph，并清空 memory_subgraph / working_subgraph。"""
         self.steps = 0
         self.last_info = {"reset": True}
+        self.last_tests_report = None
         backend_mode = getattr(self.box, "_mode", None)
 
         # === 1) 构建完整仓库图 repo_graph ===
@@ -1131,7 +1133,7 @@ class PlannerEnv:
     def _handle_run_failed_test(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "run_failed_test"}
         try:
-            tests_report = self.box.test()
+            tests_report = self._remember_tests(self.box.test())
         except Exception as exc:
             info["error"] = f"test-run-failed:{exc}"
             return info
@@ -1496,7 +1498,7 @@ class PlannerEnv:
             info["plan_targets"] = act.plan_targets
 
             lint_report = self.box.lint()
-            tests_report = self.box.test()
+            tests_report = self._remember_tests(self.box.test())
             info["lint"] = lint_report
             info["tests"] = tests_report
             info["applied"] = bool(apply_result.get("success"))
@@ -1600,7 +1602,7 @@ class PlannerEnv:
         info["plan_targets"] = act.plan_targets
 
         lint_ok = bool(self.box.lint())
-        tests_report = self.box.test()
+        tests_report = self._remember_tests(self.box.test())
         info["lint_ok"] = lint_ok
         info["tests"] = tests_report
         info["priority_tests"] = prioritize_tests(
@@ -1614,7 +1616,7 @@ class PlannerEnv:
     def _handle_submit(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {"kind": "submit"}
         try:
-            tests_report = self.box.test()
+            tests_report = self._remember_tests(self.box.test())
         except Exception as exc:
             info["success"] = False
             info["error"] = f"test-error:{exc}"
@@ -1633,6 +1635,10 @@ class PlannerEnv:
         except Exception as exc:
             return {"success": False, "error": f"apply-error:{exc}"}
         return dict(result or {})
+
+    def _remember_tests(self, tests_report: Any) -> Any:
+        self.last_tests_report = tests_report
+        return tests_report
 
     # ------------------------------------------------------------------
     # 辅助函数
@@ -1659,6 +1665,7 @@ class PlannerEnv:
             "issue": self.issue,
             "steps": self.steps,
             "last_info": self.last_info,
+            "tests": self.last_tests_report,
             # LLM 看到的是“当前工作图”，里面节点已经带 status/tags（explored/remembered）
             "subgraph": working_json,
             # Backward/forward compatible aliases expected by various rLLM prompts/loggers
