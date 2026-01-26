@@ -817,11 +817,13 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
 
     def _build_testbed_pytest_cmd(self, sel: str) -> str:
         selector = sel.strip()
-        pytest_args = f"-q {selector}".strip()
+        pytest_args = f"-q --cache-dir=/tmp/pytest_cache {selector}".strip()
         return (
             "set -euo pipefail; "
             "source /opt/miniconda3/bin/activate; "
             "conda activate testbed; "
+            "export TMPDIR=/tmp; "
+            "export PYTHONPYCACHEPREFIX=/tmp/pycache; "
             "cd /testbed; "
             f"python -m pytest {pytest_args}"
         )
