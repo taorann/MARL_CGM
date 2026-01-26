@@ -858,7 +858,7 @@ print(json.dumps({'success': ok, 'applied': applied, 'paths': paths}, ensure_asc
             "export TMPDIR=/tmp; "
             "export PYTHONPYCACHEPREFIX=/tmp/pycache; "
             + warn_part
-            "cd /testbed; "
+            + "cd /testbed; "
             f"python -m pytest {pytest_args}"
         )
 
