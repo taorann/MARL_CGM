@@ -1,1 +1,0 @@
-{"kind": "planner_step", "payload": {"action": {"params": {}, "tool": "run_failed_test"}, "result": {"error": "FileNotFoundError", "reason": "[Errno 2] No such file or directory: '/repo'", "tool": "run_failed_test"}, "step": 1, "visible_thinking": null}}

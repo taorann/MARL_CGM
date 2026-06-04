@@ -9,5 +9,6 @@ __pycache__/
 
 runs/tmp/
 runs/graph_cache/
+src/runs/
 src/runs/tmp/
 src/runs/graph_cache/
