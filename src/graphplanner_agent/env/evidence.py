@@ -26,10 +26,74 @@ MAX_DISPATCH_TABLES = 4
 MAX_DISPATCH_ENTRIES = 24
 MAX_DISPATCH_CONTEXT_FACTS = 4
 MAX_CONSUMER_CANDIDATES = 6
+MAX_VALUE_FLOW_FACTS = 8
 MAX_RELATED_CODE_LINES = 80
 MAX_RELATED_CODE_CHARS = 5000
 
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_PY_DEF_RE = re.compile(r"\b(?:async\s+def|def)\s+[A-Za-z_][A-Za-z0-9_.]*\s*\((?P<params>[^)]*)\)")
+_GO_FUNC_RE = re.compile(r"^\s*func\s+(?:\((?P<recv>[^)]*)\)\s*)?(?P<name>[A-Za-z_]\w*)\s*\((?P<params>[^)]*)\)")
+_GO_KEYWORDS = {
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+}
+_JS_TS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+_JS_KEYWORDS = {
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "return",
+    "switch",
+    "throw",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+}
 _STOP_IDENTIFIERS = set(keyword.kwlist) | {
     "False",
     "None",
@@ -183,6 +247,98 @@ def local_symbol_references(
         if len(references) >= limit:
             break
     return references
+
+
+def value_flow_context(
+    graph: RepoGraph,
+    runtime,
+    source_node: GraphNode,
+    text: str,
+    *,
+    read_node_ids: set[str] | None = None,
+    limit: int = MAX_VALUE_FLOW_FACTS,
+) -> tuple[list[dict[str, object]], list[GraphNode]]:
+    """Expose caller/callee argument-to-parameter flow around a read node.
+
+    This is intentionally best-effort. It does not try to prove runtime values;
+    it only reports implementation facts visible in call expressions, such as
+    ``walkDirTree(ctx, root, results)`` passing ``root`` into the callee's
+    ``rootFolder`` parameter. These facts help the planner follow upstream and
+    downstream data movement before committing repair evidence.
+    """
+    if not source_node.id or not text.strip():
+        return [], []
+    read_node_ids = read_node_ids or set()
+    facts: list[dict[str, object]] = []
+    related: list[GraphNode] = []
+    seen_nodes: set[str] = set()
+    outgoing = [
+        edge
+        for edge in graph.edges
+        if edge.type == "CALLS" and edge.source == source_node.id and edge.target in graph.nodes
+    ]
+    incoming = [
+        edge
+        for edge in graph.edges
+        if edge.type == "CALLS" and edge.target == source_node.id and edge.source in graph.nodes
+    ]
+
+    downstream_budget = max(1, limit // 2)
+    upstream_budget = max(1, limit - downstream_budget)
+
+    source_calls = _extract_calls_for_node(source_node, text)
+    for edge in outgoing[: downstream_budget * 3]:
+        callee = graph.nodes.get(edge.target)
+        if callee is None or is_test_path(callee.path):
+            continue
+        params = _node_params(callee)
+        calls = _matching_calls(source_calls, callee)
+        if not calls:
+            continue
+        call = calls[0]
+        fact = _value_flow_fact(
+            relation="value_flow_downstream",
+            source=source_node,
+            target=callee,
+            call=call,
+            params=params,
+            read_node_ids=read_node_ids,
+        )
+        facts.append(fact)
+        if callee.id not in seen_nodes:
+            seen_nodes.add(callee.id)
+            related.append(callee)
+        if len([f for f in facts if f.get("relation") == "value_flow_downstream"]) >= downstream_budget:
+            break
+
+    for edge in incoming[: upstream_budget * 3]:
+        caller = graph.nodes.get(edge.source)
+        if caller is None or is_test_path(caller.path):
+            continue
+        caller_text = _node_text_for_flow(runtime, caller)
+        if not caller_text:
+            continue
+        caller_calls = _extract_calls_for_node(caller, caller_text)
+        calls = _matching_calls(caller_calls, source_node)
+        if not calls:
+            continue
+        call = calls[0]
+        fact = _value_flow_fact(
+            relation="value_flow_upstream",
+            source=caller,
+            target=source_node,
+            call=call,
+            params=_node_params(source_node),
+            read_node_ids=read_node_ids,
+        )
+        facts.append(fact)
+        if caller.id not in seen_nodes:
+            seen_nodes.add(caller.id)
+            related.append(caller)
+        if len([f for f in facts if f.get("relation") == "value_flow_upstream"]) >= upstream_budget:
+            break
+
+    return facts[:limit], related
 
 
 def dispatch_tables(
@@ -577,6 +733,502 @@ def _dedupe_dict_nodes(items: list[dict[str, object]], *, limit: int) -> list[di
         if len(out) >= limit:
             break
     return out
+
+
+def _node_text_for_flow(runtime, node: GraphNode) -> str:
+    if node.text and node.text.strip():
+        return node.text
+    try:
+        hydrated = read_node_for_evidence(runtime, node, "body")
+    except Exception:
+        return ""
+    return hydrated.text or ""
+
+
+def _extract_calls_for_node(node: GraphNode, text: str) -> list[dict[str, object]]:
+    if node.path.endswith(".go"):
+        return _extract_go_calls(text)
+    if node.path.endswith(_JS_TS_EXTS):
+        return _extract_js_calls(text)
+    return _extract_python_calls(text)
+
+
+def _extract_python_calls(text: str) -> list[dict[str, object]]:
+    if not text.strip():
+        return []
+    try:
+        tree = ast.parse(textwrap.dedent(text).strip() + "\n")
+    except SyntaxError:
+        return []
+    calls: list[dict[str, object]] = []
+    for call in [item for item in ast.walk(tree) if isinstance(item, ast.Call)]:
+        name = _call_name(call.func) or ""
+        if not name:
+            continue
+        args = [_unparse(arg) or "" for arg in call.args]
+        for keyword_arg in call.keywords:
+            key = str(keyword_arg.arg or "").strip()
+            value = _unparse(keyword_arg.value) or ""
+            if key:
+                args.append(f"{key}={value}")
+            else:
+                args.append("**" + value)
+        calls.append(
+            {
+                "name": name,
+                "base_name": name.rsplit(".", 1)[-1],
+                "args": [arg for arg in args if arg],
+                "line": int(getattr(call, "lineno", 0) or 0),
+                "call_text": _call_expr_text(name, args),
+            }
+        )
+    return calls
+
+
+def _extract_go_calls(text: str) -> list[dict[str, object]]:
+    clean = "\n".join(_strip_go_line_comment(line) for line in text.splitlines())
+    calls: list[dict[str, object]] = []
+    i = 0
+    while i < len(clean):
+        ch = clean[i]
+        if not (ch == "_" or ch.isalpha()):
+            i += 1
+            continue
+        if i > 0 and (clean[i - 1] == "_" or clean[i - 1].isalnum()):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(clean) and (clean[j] == "_" or clean[j].isalnum()):
+            j += 1
+        first = clean[i:j]
+        k = _skip_space(clean, j)
+        owner = ""
+        name = first
+        if k < len(clean) and clean[k] == ".":
+            k2 = _skip_space(clean, k + 1)
+            if k2 < len(clean) and (clean[k2] == "_" or clean[k2].isalpha()):
+                j2 = k2 + 1
+                while j2 < len(clean) and (clean[j2] == "_" or clean[j2].isalnum()):
+                    j2 += 1
+                owner = first
+                name = clean[k2:j2]
+                k = _skip_space(clean, j2)
+        if name in _GO_KEYWORDS:
+            i = j
+            continue
+        if k >= len(clean) or clean[k] != "(":
+            i = j
+            continue
+        if _go_identifier_is_declaration(clean, i):
+            i = k + 1
+            continue
+        end = _matching_paren(clean, k)
+        if end <= k:
+            i = k + 1
+            continue
+        arg_text = clean[k + 1 : end]
+        args = [arg.strip() for arg in _split_top_level_commas(arg_text) if arg.strip()]
+        line = clean.count("\n", 0, i) + 1
+        call_name = f"{owner}.{name}" if owner else name
+        calls.append(
+            {
+                "name": call_name,
+                "base_name": name,
+                "owner": owner,
+                "args": args,
+                "line": line,
+                "call_text": _call_expr_text(call_name, args),
+            }
+        )
+        i = end + 1
+    return calls
+
+
+def _extract_js_calls(text: str) -> list[dict[str, object]]:
+    clean = "\n".join(_strip_go_line_comment(line) for line in text.splitlines())
+    calls: list[dict[str, object]] = []
+    ident_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$")
+    i = 0
+    while i < len(clean):
+        ch = clean[i]
+        if not (ch == "_" or ch == "$" or ch.isalpha()):
+            i += 1
+            continue
+        if i > 0 and clean[i - 1] in ident_chars:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(clean) and clean[j] in ident_chars:
+            j += 1
+        first = clean[i:j]
+        k = _skip_space(clean, j)
+        owner = ""
+        name = first
+        if k < len(clean) and clean[k] == ".":
+            k2 = _skip_space(clean, k + 1)
+            if k2 < len(clean) and (clean[k2] == "_" or clean[k2] == "$" or clean[k2].isalpha()):
+                j2 = k2 + 1
+                while j2 < len(clean) and clean[j2] in ident_chars:
+                    j2 += 1
+                owner = first
+                name = clean[k2:j2]
+                k = _skip_space(clean, j2)
+        if name in _JS_KEYWORDS:
+            i = j
+            continue
+        if k >= len(clean) or clean[k] != "(":
+            i = j
+            continue
+        if _js_identifier_is_declaration(clean, i):
+            i = k + 1
+            continue
+        if i > 0 and clean[i - 1] == "." and not owner:
+            i = j
+            continue
+        end = _matching_paren(clean, k)
+        if end <= k:
+            i = k + 1
+            continue
+        if _js_call_is_probably_declaration(clean, i, k, end):
+            i = end + 1
+            continue
+        arg_text = clean[k + 1 : end]
+        args = [arg.strip() for arg in _split_top_level_commas(arg_text) if arg.strip()]
+        line = clean.count("\n", 0, i) + 1
+        call_name = f"{owner}.{name}" if owner else name
+        calls.append(
+            {
+                "name": call_name,
+                "base_name": name,
+                "owner": owner,
+                "args": args,
+                "line": line,
+                "call_text": _call_expr_text(call_name, args),
+            }
+        )
+        i = end + 1
+    return calls
+
+
+def _matching_calls(calls: list[dict[str, object]], target: GraphNode) -> list[dict[str, object]]:
+    target_names = _node_callable_names(target)
+    if not target_names:
+        return []
+    out: list[dict[str, object]] = []
+    for call in calls:
+        names = {
+            str(call.get("name") or ""),
+            str(call.get("base_name") or ""),
+        }
+        if names & target_names:
+            out.append(call)
+    out.sort(key=lambda item: int(item.get("line") or 0))
+    return out
+
+
+def _node_callable_names(node: GraphNode) -> set[str]:
+    name = str(node.name or "").strip()
+    if not name:
+        return set()
+    tail = name.rsplit(".", 1)[-1]
+    return {item for item in {name, tail} if item}
+
+
+def _node_params(node: GraphNode) -> list[str]:
+    signature = _node_signature_text(node)
+    text = node.text or ""
+    if node.path.endswith(".go") or signature.lstrip().startswith("func "):
+        return _go_params(signature or _first_code_line(text))
+    if node.path.endswith(_JS_TS_EXTS):
+        return _js_params(text or signature)
+    return _python_params(text or signature)
+
+
+def _node_signature_text(node: GraphNode) -> str:
+    if node.preview and node.preview.strip():
+        return node.preview.strip()
+    return _first_code_line(node.text or "")
+
+
+def _first_code_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _python_params(text_or_sig: str) -> list[str]:
+    text = textwrap.dedent(text_or_sig or "").strip()
+    if text:
+        try:
+            tree = ast.parse(text + "\n")
+            func = next((item for item in ast.walk(tree) if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+            if func is not None:
+                params: list[str] = []
+                params.extend(arg.arg for arg in getattr(func.args, "posonlyargs", []) or [])
+                params.extend(arg.arg for arg in getattr(func.args, "args", []) or [])
+                params.extend(arg.arg for arg in getattr(func.args, "kwonlyargs", []) or [])
+                if func.args.vararg is not None:
+                    params.append("*" + func.args.vararg.arg)
+                if func.args.kwarg is not None:
+                    params.append("**" + func.args.kwarg.arg)
+                return [param for param in params if param not in {"self", "cls"}]
+        except SyntaxError:
+            pass
+    match = _PY_DEF_RE.search(text_or_sig or "")
+    if not match:
+        return []
+    return _simple_python_param_names(match.group("params") or "")
+
+
+def _simple_python_param_names(params_text: str) -> list[str]:
+    params: list[str] = []
+    for raw in _split_top_level_commas(params_text):
+        part = raw.strip()
+        if not part or part in {"/", "*"}:
+            continue
+        part = part.lstrip("*")
+        part = part.split("=", 1)[0].split(":", 1)[0].strip()
+        if part and part not in {"self", "cls"}:
+            params.append(part)
+    return params
+
+
+def _go_params(signature: str) -> list[str]:
+    match = _GO_FUNC_RE.search(signature or "")
+    if not match:
+        return []
+    raw_params = match.group("params") or ""
+    params: list[str] = []
+    pending_names: list[str] = []
+    for raw in _split_top_level_commas(raw_params):
+        part = raw.strip()
+        if not part:
+            continue
+        tokens = part.replace("*", " ").split()
+        if len(tokens) == 1:
+            token = tokens[0].strip()
+            if _looks_like_identifier(token) and not _looks_like_go_type(token):
+                pending_names.append(token)
+            continue
+        first = tokens[0].strip()
+        names = list(pending_names)
+        pending_names.clear()
+        if _looks_like_identifier(first) and not _looks_like_go_type(first):
+            names.append(first)
+        for name in names:
+            if name and name != "_" and name not in params:
+                params.append(name)
+    return params
+
+
+def _js_params(text_or_sig: str) -> list[str]:
+    line = _first_code_line(text_or_sig or "")
+    if not line:
+        return []
+    match = re.search(r"\bfunction\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\((?P<params>[^)]*)\)", line)
+    if not match:
+        match = re.search(r"[A-Za-z_$][A-Za-z0-9_$]*\s*\((?P<params>[^)]*)\)\s*(?::[^{=]+)?\{?", line)
+    if not match:
+        match = re.search(r"=\s*(?:async\s*)?\((?P<params>[^)]*)\)\s*=>", line)
+    if not match:
+        one = re.search(r"=\s*(?:async\s*)?(?P<param>[A-Za-z_$][A-Za-z0-9_$]*)\s*=>", line)
+        return [one.group("param")] if one else []
+    params: list[str] = []
+    for raw in _split_top_level_commas(match.group("params") or ""):
+        part = raw.strip()
+        if not part:
+            continue
+        part = part.split("=", 1)[0].strip()
+        part = part.lstrip(".").lstrip("*").strip()
+        part = part.split(":", 1)[0].strip()
+        part = part.rstrip("?").strip()
+        if part.startswith("{") or part.startswith("["):
+            params.append(part)
+        elif _looks_like_identifier(part):
+            params.append(part)
+    return params
+
+
+def _value_flow_fact(
+    *,
+    relation: str,
+    source: GraphNode,
+    target: GraphNode,
+    call: dict[str, object],
+    params: list[str],
+    read_node_ids: set[str],
+) -> dict[str, object]:
+    args = [str(arg) for arg in call.get("args", []) if str(arg)]
+    mappings: list[dict[str, object]] = []
+    used_params: set[str] = set()
+    for idx, arg in enumerate(args):
+        param = params[idx] if idx < len(params) else ""
+        if "=" in arg and not arg.lstrip().startswith(("==", ">=", "<=", "!=")):
+            key, value = arg.split("=", 1)
+            key = key.strip().lstrip("*")
+            if key in params:
+                param = key
+                arg = value.strip()
+        item: dict[str, object] = {"position": idx, "argument": arg}
+        if param:
+            item["parameter"] = param
+            used_params.add(param)
+        mappings.append(item)
+    fact = {
+        "relation": relation,
+        "source": node_brief(source),
+        "target": node_brief(target),
+        "call": str(call.get("call_text") or ""),
+        "call_line": int(call.get("line") or 0) or None,
+        "argument_to_parameter": mappings,
+        "unmapped_parameters": [param for param in params if param not in used_params],
+        "target_read_status": "read" if target.id in read_node_ids else "unread",
+        "source_read_status": "read" if source.id in read_node_ids else "unread",
+    }
+    return fact
+
+
+def _call_expr_text(name: str, args: list[str]) -> str:
+    text = f"{name}({', '.join(str(arg) for arg in args)})"
+    if len(text) > 240:
+        return text[:237] + "..."
+    return text
+
+
+def _strip_go_line_comment(line: str) -> str:
+    out: list[str] = []
+    in_string = ""
+    escaped = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        nxt = line[i + 1] if i + 1 < len(line) else ""
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\" and in_string != "`":
+                escaped = True
+            elif ch == in_string:
+                in_string = ""
+            i += 1
+            continue
+        if ch in {'"', "'", "`"}:
+            in_string = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _skip_space(text: str, idx: int) -> int:
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    return idx
+
+
+def _matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    in_string = ""
+    escaped = False
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\" and in_string != "`":
+                escaped = True
+            elif ch == in_string:
+                in_string = ""
+            continue
+        if ch in {'"', "'", "`"}:
+            in_string = ch
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    in_string = ""
+    escaped = False
+    for idx, ch in enumerate(text or ""):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\" and in_string != "`":
+                escaped = True
+            elif ch == in_string:
+                in_string = ""
+            continue
+        if ch in {'"', "'", "`"}:
+            in_string = ch
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}" and depth > 0:
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:idx])
+            start = idx + 1
+    parts.append(text[start:])
+    return parts
+
+
+def _go_identifier_is_declaration(text: str, idx: int) -> bool:
+    line_start = text.rfind("\n", 0, idx) + 1
+    prefix = text[line_start:idx].strip()
+    return prefix == "func" or prefix.startswith("func ") or prefix.startswith("func(") or prefix.startswith("func (")
+
+
+def _js_identifier_is_declaration(text: str, idx: int) -> bool:
+    line_start = text.rfind("\n", 0, idx) + 1
+    prefix = text[line_start:idx].strip()
+    return bool(
+        re.search(r"\b(function|class|interface|type|enum)\s*$", prefix)
+        or re.search(r"\b(const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*$", prefix)
+        or prefix.endswith("=>")
+    )
+
+
+def _js_call_is_probably_declaration(text: str, name_start: int, open_idx: int, close_idx: int) -> bool:
+    line_start = text.rfind("\n", 0, name_start) + 1
+    prefix = text[line_start:name_start]
+    if _js_identifier_is_declaration(text, name_start):
+        return True
+    suffix_start = _skip_space(text, close_idx + 1)
+    suffix = text[suffix_start : min(len(text), suffix_start + 4)]
+    args = text[open_idx + 1 : close_idx]
+    if not prefix.strip() and (suffix.startswith("{") or suffix.startswith(":")) and ":" in args:
+        return True
+    return False
+
+
+def _looks_like_identifier(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", value or ""))
+
+
+def _looks_like_go_type(value: str) -> bool:
+    if not value:
+        return False
+    if value in {"string", "int", "int64", "uint32", "bool", "error", "byte", "rune", "float64"}:
+        return True
+    if value[0].isupper() or "." in value or value.startswith(("[]", "map[", "chan", "<-")):
+        return True
+    return False
 
 
 def jsonish_key(item: dict[str, object]) -> str:

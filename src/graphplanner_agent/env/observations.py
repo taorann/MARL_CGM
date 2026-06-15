@@ -17,6 +17,7 @@ def _runtime_facts(
     latest_result: dict[str, object] | None,
     last_repair_attempt: dict[str, object] | None,
     last_repair_review: dict[str, object] | None,
+    pending_patch: dict[str, object] | None,
     verified: bool,
 ) -> dict[str, object]:
     missing = [node.id for node in memory.nodes.values() if not node.has_code]
@@ -40,6 +41,7 @@ def _runtime_facts(
         "unhydrated_memory_node_ids": missing,
         "repair_feedback_present": bool(repair_feedback),
         "last_patch_api_signature_failure": api_hint,
+        "pending_patch_present": pending_patch is not None,
     }
 
 
@@ -157,7 +159,7 @@ def _compact_latest_result(result: dict[str, object] | None) -> tuple[dict[str, 
     if result is None:
         return None, report
     tool = str(result.get("tool") or "")
-    if tool == "repair":
+    if tool in {"repair", "repair_chunk", "repair_propose", "repair_revise", "repair_submit", "discard_pending_patch"}:
         status = str(result.get("status") or "")
         compact = {
             "tool": tool,
@@ -170,6 +172,8 @@ def _compact_latest_result(result: dict[str, object] | None) -> tuple[dict[str, 
             "summary": result.get("summary"),
             "error_origin": result.get("error_origin"),
             "source_tree_state": result.get("source_tree_state"),
+            "pending_patch_summary": result.get("pending_patch_summary"),
+            "submit_decision": result.get("submit_decision"),
         }
         if status in {"patch_rejected", "syntax_failed", "test_failed", "infra_bug"}:
             compact["failure_feedback"] = result.get("failure_feedback") or _repair_failure_feedback_from_result(result)
@@ -564,7 +568,7 @@ def _repair_failure_followup(
     latest_result: dict[str, object] | None,
     last_repair_attempt: dict[str, object] | None,
 ) -> dict[str, object] | None:
-    if not latest_result or latest_result.get("tool") != "repair":
+    if not latest_result or latest_result.get("tool") not in {"repair", "repair_submit"}:
         return None
     status = str(latest_result.get("status") or "")
     if status not in {"test_failed", "syntax_failed", "patch_rejected"}:
@@ -617,6 +621,7 @@ def _current_turn_protocol(
     latest_result: dict[str, object] | None,
     last_repair_attempt: dict[str, object] | None,
     last_repair_review: dict[str, object] | None,
+    pending_patch: dict[str, object] | None,
     repair_disabled_reason: str | None,
 ) -> dict[str, object]:
     hydrated = [node.id for node in memory.nodes.values() if node.has_code]
@@ -641,6 +646,16 @@ def _current_turn_protocol(
         valid_next_actions.append("read or re-commit unhydrated memory nodes so CGM receives real code")
     if input_truncation_report.get("truncated"):
         blockers.append("some observation fields were truncated; omitted code is uncertainty, not evidence")
+    if pending_patch:
+        blockers.append("pending_patch_summary is present; inspect it before generating another patch")
+        valid_next_actions.extend(
+            [
+                "repair_submit if the pending patch covers the issue mechanism and known risks are acceptable",
+                "repair_revise with pending_patch_review if the pending patch is close but incomplete or risky",
+                "discard_pending_patch if the pending patch is wrong, stale, or based on bad assumptions",
+                "read/grep/expand more implementation code if pending patch risks cannot be judged from visible evidence",
+            ]
+        )
     if latest_result and latest_result.get("blocked"):
         blockers.append(f"latest action was blocked: {latest_result.get('reason')}")
         suggested = latest_result.get("suggested_next_actions")
@@ -696,6 +711,9 @@ def _current_turn_protocol(
     if repair_disabled_reason:
         blockers.append(repair_disabled_reason)
         invalid_next_actions.append("repair")
+        invalid_next_actions.append("repair_chunk")
+        invalid_next_actions.append("repair_propose")
+        invalid_next_actions.append("repair_revise")
         if failure_summary is None:
             valid_next_actions.append("run_failed_test; repair is not an available tool yet")
         elif candidate_ids:
@@ -709,14 +727,20 @@ def _current_turn_protocol(
         valid_next_actions.append("W may contain extra context; commit only nodes that prove target_nodes/evidence_chain or use memory_delete to remove stale M nodes")
     if hydrated and failure_summary is not None and not unhydrated:
         valid_next_actions.append(
-            "repair is allowed only after target_nodes are committed in M, evidence_chain uses read code ids, target_nodes appear in evidence_chain, "
+            "repair is allowed only after existing-file target_nodes are committed in M and appear in evidence_chain (or explicit new_file:relative/path targets are justified), evidence_chain uses read code ids/new_file targets, "
             "intent_analysis explains the local mechanism, and confidence is numeric"
         )
         valid_next_actions.append(
             "repair_review is allowed with the same structured evidence package when you want CGM to critique intent/target before generating a patch"
         )
+        valid_next_actions.append(
+            "repair_propose is the preferred patch-generation action for high-risk or multi-file repairs; inspect pending_patch_summary before repair_submit"
+        )
     if not hydrated or failure_summary is None or unhydrated:
         invalid_next_actions.append("repair")
+        invalid_next_actions.append("repair_chunk")
+        invalid_next_actions.append("repair_propose")
+        invalid_next_actions.append("repair_revise")
         invalid_next_actions.append("repair_review")
 
     if latest_result and latest_result.get("tool") == "repair_review":
@@ -765,6 +789,10 @@ def _current_turn_protocol(
     if not blockers:
         blockers.append("no hard blocker detected, but repair still requires a structured evidence package grounded in committed M nodes")
 
+    blockers = _dedupe_strings(blockers)
+    valid_next_actions = _dedupe_strings(valid_next_actions)
+    invalid_next_actions = _dedupe_strings(invalid_next_actions)
+
     return {
         "observation_priority": "read this first; it states which planner actions are currently valid",
         "w_m_rule": "working_code_W includes read code and explore_find previews; repair_memory_M is model-curated CGM evidence; memory_commit never auto-adds related nodes and requires explicit read evidence",
@@ -780,12 +808,17 @@ def _current_turn_protocol(
         "committed_unhydrated_memory_ids": unhydrated,
         "repair_failure_followup": repair_failure_followup,
         "repair_mechanism_requirements": {
-            "evidence_chain": "observed runtime behavior -> implementation entry/state/decision/output -> patch target; unsupported links mean explore/read/commit, not repair",
+            "evidence_chain": "read implementation code node ids plus any explicit new_file target; put observed runtime/test behavior in failure_seen, not as a pseudo node_id like test_behavior",
             "failure_seen": "actual issue/runtime failure only",
-            "target_nodes": "committed M nodes CGM should treat as the patch locus; each target must appear in evidence_chain",
+            "target_nodes": "committed M nodes CGM should edit, or new_file:relative/path for an issue-required implementation file that is absent; existing-file targets must appear in evidence_chain",
             "intent_analysis": "short advisory mechanism analysis, not exact patch text",
             "confidence": "planner self-score from 0 to 1; lower it when localization or behavior details are uncertain",
             "repair_review": "same evidence package as repair, but CGM returns critique only; it does not apply or test a patch",
+            "repair_chunk": "same evidence package as repair, but asks CGM for one small coherent patch and keeps it only after patch validation/syntax checks; final verification still requires ordinary repair",
+            "repair_propose": "same evidence package as repair, but stores a validated pending patch without running fail-to-pass/PASS_TO_PASS",
+            "repair_revise": "revise the current pending patch using pending_patch_review; does not run fail-to-pass/PASS_TO_PASS",
+            "repair_submit": "submit the current pending patch for official fail-to-pass and explicit PASS_TO_PASS verification",
+            "discard_pending_patch": "discard a pending patch that is wrong, stale, or too risky to test",
             "review_adoption": (
                 "repair_review returns critique/adoption_advice, not a binding contract. Decide whether to adopt, revise, or reject it using visible code evidence."
             ),
@@ -801,6 +834,18 @@ def _current_turn_protocol(
             ),
         },
     }
+
+
+def _dedupe_strings(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
 
 
 def _json_block(value: object) -> str:
@@ -918,6 +963,9 @@ def _render_text_observation(state: dict[str, object]) -> str:
         "input_truncation_report": state.get("input_truncation_report"),
         "last_repair_attempt": state.get("last_repair_attempt"),
         "last_repair_review": state.get("last_repair_review"),
+        "pending_patch_summary": state.get("pending_patch_summary"),
+        "recent_repair_attempts": state.get("recent_repair_attempts"),
+        "recent_cgm_insights": state.get("recent_cgm_insights"),
         "planner_diagnostics": state.get("planner_diagnostics"),
         "recent_actions": state.get("recent_actions"),
         "recent_action_signatures": state.get("recent_action_signatures"),
@@ -938,6 +986,9 @@ def build_observation(
     repair_feedback: str | None,
     last_repair_attempt: dict[str, object] | None,
     last_repair_review: dict[str, object] | None,
+    pending_patch: dict[str, object] | None,
+    repair_attempts: list[dict[str, object]],
+    cgm_insights: list[dict[str, object]],
     trajectory: list[dict[str, object]],
     planner_diagnostics: list[dict[str, object]],
     recent_actions: list[str],
@@ -965,6 +1016,7 @@ def build_observation(
         compact_latest_result,
         last_repair_attempt,
         last_repair_review,
+        pending_patch,
         repair_disabled_reason,
     )
     state = {
@@ -1011,12 +1063,15 @@ def build_observation(
         ),
         "last_repair_attempt": last_repair_attempt,
         "last_repair_review": last_repair_review,
+        "pending_patch_summary": pending_patch,
+        "recent_repair_attempts": repair_attempts[-5:],
+        "recent_cgm_insights": cgm_insights[-5:],
         "trajectory_summary": trajectory,
         "planner_diagnostics": planner_diagnostics,
         "verified": verified,
         "recent_actions": recent_actions[-8:],
         "recent_action_signatures": recent_action_signatures[-5:],
-        "runtime_facts": _runtime_facts(failure_summary, memory, repair_feedback, latest_result, last_repair_attempt, last_repair_review, verified),
+        "runtime_facts": _runtime_facts(failure_summary, memory, repair_feedback, latest_result, last_repair_attempt, last_repair_review, pending_patch, verified),
     }
     if str(observation_mode or "json").strip().lower() == "text":
         return _render_text_observation(state)

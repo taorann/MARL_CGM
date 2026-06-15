@@ -35,6 +35,32 @@ PY
     else
       echo "summary_missing"
     fi
+    echo "--- single eval ---"
+    if [[ -f "$RUN_DIR/results.jsonl" ]]; then
+      echo "results_lines=$(wc -l < "$RUN_DIR/results.jsonl")"
+      python - "$RUN_DIR/results.jsonl" <<'PY'
+import json, sys
+from pathlib import Path
+counts = {"pass": 0, "not_pass": 0, "bug": 0}
+p = Path(sys.argv[1])
+for line in p.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    rec = json.loads(line)
+    status = rec.get("status")
+    if status not in counts:
+        status = "bug"
+    counts[status] += 1
+print(json.dumps({"counts": counts}, sort_keys=True))
+PY
+    else
+      echo "single_results_missing"
+    fi
+    if [[ -f "$RUN_DIR/progress.md" ]]; then
+      sed -n '1,40p' "$RUN_DIR/progress.md"
+    else
+      echo "single_progress_missing"
+    fi
     echo "--- latest round ---"
     latest_round="$(find "$RUN_DIR" -maxdepth 1 -type d -name 'round_*' | sort | tail -n 1 || true)"
     if [[ -n "$latest_round" ]]; then

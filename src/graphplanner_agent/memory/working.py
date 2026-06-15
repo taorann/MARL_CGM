@@ -19,6 +19,14 @@ class WorkingMemory:
 
     def add(self, node: GraphNode, source: str, score: float = 0.0, step: int = 0) -> None:
         current = self.entries.get(node.id)
+        if current and _is_stronger_evidence_source(current.source, source):
+            self.entries[node.id] = WorkingEntry(
+                node=current.node,
+                source=current.source,
+                score=max(current.score, score),
+                last_step=max(current.last_step, step),
+            )
+            return
         if current and current.node.has_code and not node.has_code:
             node = current.node
         self.entries[node.id] = WorkingEntry(node=node, source=source, score=score, last_step=step)
@@ -59,6 +67,16 @@ def code_status_for(source: str, node: GraphNode) -> str:
     if str(source or "").startswith(("find_preview:", "relation_context:", "expand_preview:")):
         return "preview"
     return "code"
+
+
+def _is_stronger_evidence_source(current: str, incoming: str) -> bool:
+    """Do not let orientation candidates/previews downgrade explicit read evidence."""
+
+    current_text = str(current or "")
+    incoming_text = str(incoming or "")
+    if current_text.startswith("read:") or current_text == "hydrated_for_memory":
+        return not (incoming_text.startswith("read:") or incoming_text == "hydrated_for_memory")
+    return False
 
 
 def _public_node_kind(kind: str) -> str:

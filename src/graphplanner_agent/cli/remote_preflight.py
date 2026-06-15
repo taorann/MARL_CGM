@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+import subprocess
 import time
 from typing import Any
 
@@ -17,6 +19,110 @@ def normalize_remote_preflight_mode(value: str | None, *, backend: str) -> str:
     if mode not in {"off", "cleanup", "full"}:
         raise ValueError(f"invalid remote preflight mode: {value}; expected auto, off, cleanup, or full")
     return mode
+
+
+def _runner_pool_status(session: RemoteSweSession, *, timeout: float = 45.0) -> dict[str, Any]:
+    if not hasattr(session, "simple_ssh_cmd") or not hasattr(session, "_remote_env_prefix"):
+        kwargs = getattr(session, "kwargs", {})
+        runner_count = int(getattr(session, "num_runners", None) or (kwargs.get("num_runners") if isinstance(kwargs, dict) else None) or 1)
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "session object does not expose SSH status probe",
+            "runner_count": runner_count,
+            "fresh_count": runner_count,
+            "pending_request_count": 0,
+            "runners": [],
+        }
+    script = r'''
+import json
+import os
+import time
+from pathlib import Path
+
+queue_root = Path(os.environ.get("QUEUE_ROOT") or str(Path.home() / "gp_queue")).expanduser()
+runner_count = int(os.environ.get("GP_NUM_RUNNERS") or "1")
+ttl = float(os.environ.get("GRAPHPLANNER_REMOTE_HEARTBEAT_TTL_SEC") or "120")
+runners = []
+for rid in range(runner_count):
+    runner_dir = queue_root / f"runner-{rid}"
+    hb_path = runner_dir / "heartbeat.json"
+    heartbeat_age = None
+    heartbeat_ok = False
+    if hb_path.exists():
+        try:
+            data = json.loads(hb_path.read_text(encoding="utf-8"))
+            ts = float(data.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = hb_path.stat().st_mtime
+        if ts > 0:
+            heartbeat_age = max(0.0, time.time() - ts)
+            heartbeat_ok = heartbeat_age <= ttl
+    current_run = ""
+    current_path = runner_dir / "current_run_id"
+    if current_path.exists():
+        current_run = current_path.read_text(encoding="utf-8", errors="replace").strip()
+    runners.append(
+        {
+            "runner_id": rid,
+            "heartbeat_age_sec": None if heartbeat_age is None else round(heartbeat_age, 3),
+            "heartbeat_ok": heartbeat_ok,
+            "current_run_id": current_run,
+        }
+    )
+pending = sorted(str(p) for p in queue_root.glob("runner-*/in/*.json"))
+print(json.dumps({
+    "ok": True,
+    "queue_root": str(queue_root),
+    "runner_count": runner_count,
+    "fresh_count": sum(1 for item in runners if item["heartbeat_ok"]),
+    "pending_request_count": len(pending),
+    "pending_request_preview": pending[:5],
+    "runners": runners,
+}, sort_keys=True))
+'''
+    command = f"{session._remote_env_prefix()} {session.remote_python or 'python'} - <<'PY'\n{script}\nPY"
+    proc = subprocess.run(
+        session.simple_ssh_cmd(command),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    try:
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        return {"ok": False, "reason": f"runner status JSON parse failed: {exc}", "stdout": proc.stdout}
+    return data
+
+
+def _wait_for_fresh_runners(
+    session: RemoteSweSession,
+    *,
+    expected_count: int,
+    timeout: float,
+    poll_sec: float = 5.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while True:
+        last = _runner_pool_status(session, timeout=45.0)
+        if bool(last.get("ok")) and int(last.get("fresh_count") or 0) >= expected_count:
+            return last
+        if time.monotonic() >= deadline:
+            last = dict(last)
+            last["ok"] = False
+            last["reason"] = f"runner heartbeats did not become fresh before {timeout:.1f}s"
+            return last
+        time.sleep(poll_sec)
 
 
 def run_remote_swe_preflight(config: AgentConfig, first_task: TaskSpec, *, mode: str = "cleanup") -> dict[str, Any]:
@@ -66,14 +172,48 @@ def run_remote_swe_preflight(config: AgentConfig, first_task: TaskSpec, *, mode:
             record.update({"reason": "remote layout check failed"})
             return record
 
+        before = _runner_pool_status(session)
+        step("runner_pool_before_cleanup", before)
+
         cleanup = session.cleanup_pool(timeout=180.0, cwd=config.sandbox_workdir)
         step("cleanup_pool", cleanup)
         if not bool(cleanup.get("ok", True)):
             record.update({"reason": "remote cleanup_pool reported not ok"})
             return record
+        cleanup_results = cleanup.get("results")
+        if isinstance(cleanup_results, list):
+            failed = [item for item in cleanup_results if isinstance(item, dict) and not bool(item.get("ok", True))]
+            if failed:
+                record.update(
+                    {
+                        "reason": "remote cleanup_pool has failed runner result",
+                        "failed_cleanup_results": failed[:3],
+                    }
+                )
+                return record
+
+        after_cleanup = _runner_pool_status(session)
+        step("runner_pool_after_cleanup", after_cleanup)
+        if bool(after_cleanup.get("ok")) and int(after_cleanup.get("pending_request_count") or 0) > 0:
+            record.update(
+                {
+                    "reason": "remote queue still has pending runner requests after cleanup",
+                    "runner_pool": after_cleanup,
+                }
+            )
+            return record
 
         session.ensure_remote_runners(timeout=max(180.0, 60.0 * int(config.sandbox_num_runners or 1)))
         step("ensure_runners", {"ok": True, "runner_count": int(config.sandbox_num_runners or 1)})
+        fresh = _wait_for_fresh_runners(
+            session,
+            expected_count=int(config.sandbox_num_runners or 1),
+            timeout=max(120.0, 45.0 * int(config.sandbox_num_runners or 1)),
+        )
+        step("runner_pool_after_ensure", fresh)
+        if not bool(fresh.get("ok")):
+            record.update({"reason": "remote runners did not become fresh", "runner_pool": fresh})
+            return record
 
         if mode == "full":
             start = session.start(timeout=max(float(config.command_timeout or 0), 300.0), cwd=config.sandbox_workdir)

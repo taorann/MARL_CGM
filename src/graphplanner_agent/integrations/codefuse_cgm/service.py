@@ -48,7 +48,7 @@ Return exactly one complete unified diff and nothing else.
 The diff must include file headers (`--- a/...`, `+++ b/...`) and at least one `@@` hunk.
 Do not output JSON, markdown fences, analysis, or prose.
 Do not edit tests.
-Do not create or delete files; do not use `/dev/null`.
+Do not create or delete files unless the request explicitly lists a new_file target.
 Do not output binary-file notices, property changes, SVN metadata, or reproduction scripts.
 After the final implementation hunk, stop immediately.
 Keep the patch minimal and syntactically valid."""
@@ -294,6 +294,8 @@ def _parse_single_unified_diff(diff_text: str) -> Patch | None:
             return None
         old_start = int(header.group(1))
         old_count = int(header.group(2) or "1")
+        start = 1 if old_start == 0 and old_count == 0 else old_start
+        end = 0 if old_start == 0 and old_count == 0 else old_start + old_count - 1
         new_lines: list[str] = []
         i += 1
         while i < len(lines):
@@ -319,10 +321,6 @@ def _parse_single_unified_diff(diff_text: str) -> Patch | None:
             else:
                 return None
             i += 1
-        start = old_start
-        end = old_start + old_count - 1
-        if old_count == 0:
-            end = old_start - 1
         edits.append({"path": path, "start": start, "end": end, "new_text": _ensure_newline("\n".join(new_lines))})
 
     if not edits:
@@ -1265,7 +1263,7 @@ def _coerce_plan(request: GenerateRequest) -> Plan:
                 path = _safe_str(item.get("path"))
                 start = _safe_int(item.get("start"), 0)
                 end = _safe_int(item.get("end", start), start)
-                if path and start > 0 and end >= start:
+                if path and start > 0 and end >= start - 1:
                     targets.append(PlanTarget(path=path, start=start, end=end, id=_safe_str(item.get("id") or f"target-{idx}"), confidence=float(item.get("confidence") or 1.0), why=_safe_str(item.get("why"))))
     if not targets and isinstance(request.snippets, Sequence):
         for idx, item in enumerate(request.snippets):

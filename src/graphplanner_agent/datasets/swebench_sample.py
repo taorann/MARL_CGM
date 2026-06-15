@@ -113,7 +113,7 @@ def _record_image_stem(record: Mapping[str, Any]) -> str:
 def _available_sif_stems(*, ssh_target: str, ssh_args: str, remote_sif_dir: str) -> set[str]:
     if not ssh_target.strip():
         raise ValueError("--require-remote-sif requires --ssh-target")
-    directory = remote_sif_dir.strip() or "/appsnew/home/chongbin_pkuhpc/chongbin_cls/sif/sweb"
+    directory = remote_sif_dir.strip() or "/lustre3/chongbin_pkuhpc/chongbin_cls/graphplanner_sif/sweb"
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
     if ssh_args.strip():
         cmd.extend(shlex.split(ssh_args))
@@ -332,11 +332,9 @@ def _find_local_instance_payload(instance_id: str) -> dict[str, Any] | None:
             roots.append(Path(part.strip()).expanduser())
     roots.extend(
         [
+            Path(__file__).resolve().parents[3] / "datasets/swebench/instances",
             Path("../datasets/swebench/instances"),
             Path("datasets/swebench/instances"),
-            Path("/root/private_data/MARL_CGM-main/datasets/swebench/instances"),
-            Path("/root/private_data/MARL_CGM/datasets/swebench/instances"),
-            Path("/appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM/datasets/swebench/instances"),
         ]
     )
     for root in roots:

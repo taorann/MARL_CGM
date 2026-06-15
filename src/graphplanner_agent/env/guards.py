@@ -15,8 +15,8 @@ def validate_action(action: PlannerAction) -> str | None:
         query = str(params.get("query", "")).strip()
         find_type = FIND_TYPE_ALIASES.get(str(params.get("find_type", "")).strip(), str(params.get("find_type", "")).strip())
         path_glob = str(params.get("path_glob", "")).strip()
-        if not query:
-            return "explore_find requires a non-empty implementation query"
+        if not query and not path_glob:
+            return "explore_find requires non-empty query or path_glob"
         if find_type not in VALID_FIND_TYPES:
             return f"explore_find find_type must be one of {sorted(VALID_FIND_TYPES)}"
         if path_glob and is_test_path(path_glob):

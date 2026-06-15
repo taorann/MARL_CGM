@@ -12,7 +12,7 @@ The new implementation should:
 - avoid rLLM, Verl, PPO, GRPO, and reward-training dependencies;
 - split modules cleanly instead of recreating the monolithic `PlannerEnv`;
 - optionally inspect the old repository only when a capability needs implementation detail;
-- support both mock CGM and real HTTP CGM backends.
+- support mock CGM, DashScope direct CGM, and optional HTTP-compatible CGM backends.
 
 ## Create A Clean Root
 
@@ -106,7 +106,8 @@ Hard requirements:
 - Do not recreate the old monolithic `PlannerEnv`.
 - Split planner client, planner loop, action parser, environment, graph retrieval, memory, repair, runtime, dataset loading, and telemetry into separate modules.
 - Do not use benchmark test source as repair evidence. Tests are behavior/fail-to-pass symptoms only.
-- Implement both `CGM_BACKEND=mock` and `CGM_BACKEND=http`.
+- Implement `CGM_BACKEND=mock`, `CGM_BACKEND=dashscope`, and optional
+  `CGM_BACKEND=http`.
 - Make patch apply safe: validate, snapshot, apply, run fail-to-pass, rollback on failure.
 - Use `09_capability_matrix_audit.md` as the acceptance matrix before declaring the rebuild complete.
 ```
@@ -139,18 +140,26 @@ This lets Codex verify most architecture and control-flow behavior without a loa
 
 ## When Real CGM Is Running
 
-Use HTTP CGM:
+Use DashScope direct CGM by default:
+
+```bash
+export CGM_BACKEND=dashscope
+export CGM_DASHSCOPE_API_KEY=...
+export CGM_DASHSCOPE_MODEL=qwen3-235b-a22b-thinking-2507
+```
+
+The HTTP CGM backend is a compatibility path for an explicitly managed local or
+remote service:
 
 ```bash
 export CGM_BACKEND=http
 export CGM_ENDPOINT=http://127.0.0.1:30001/generate
 ```
 
-Default assumption for the current rebuild is that the real CGM service runs in
-the same container as the agent. Only override `CGM_ENDPOINT` to a non-local
-host when you intentionally deploy CGM elsewhere. Historical traces may still
-contain old `172.*:30001` endpoints; those are legacy records, not the current
-recommended setup.
+Default assumption for the current rebuild is DashScope direct mode. Only set
+`CGM_ENDPOINT` when you intentionally deploy a separate HTTP CGM service.
+Historical traces may still contain old `172.*:30001` endpoints; those are
+legacy records, not the current recommended setup.
 
 Smoke-check the CGM service from the machine that will call it:
 

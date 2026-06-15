@@ -2,6 +2,8 @@ from __future__ import annotations
 
 ACTION_PROTOCOL = """You are the planner for a train-free code-repair agent.
 Emit exactly one JSON action, optionally preceded by <think>...</think>.
+The JSON payload must be one object like {"tool":"read","params":{...}}.
+Never emit a JSON array. Never emit multiple actions in one response. Choose only the next action.
 
 Allowed actions:
 - {"tool":"run_failed_test","params":{}}
@@ -12,7 +14,12 @@ Allowed actions:
 - {"tool":"memory_commit","params":{"select_ids":["node-id"],"note":"why this is repair evidence"}}
 - {"tool":"memory_delete","params":{"delete_ids":["node-id"],"note":"why stale"}}
 - {"tool":"memory_commit_note","params":{"note":"short hypothesis"}}
+- {"tool":"repair_propose","params":{"failure_seen":"actual error/output/behavior from issue or runtime only","evidence_chain":[{"node_id":"read-node-id","role":"entry|state|decision|output|target","evidence":"what the read code proves"}],"target_nodes":["committed-node-id"],"intent_analysis":"candidate mechanism; do not write exact patch text","confidence":0.0}}
+- {"tool":"repair_revise","params":{"failure_seen":"actual error/output/behavior from issue or runtime only","evidence_chain":[{"node_id":"read-node-id","role":"entry|state|decision|output|target","evidence":"what the read code proves"}],"target_nodes":["committed-node-id"],"intent_analysis":"revised mechanism; do not write exact patch text","confidence":0.0,"revision_focus":"what is wrong/risky in the pending patch","pending_patch_review":{"coverage":"covered|partial|wrong_target|risky_unknown","risks":["..."],"requested_change":"..."}}}
+- {"tool":"repair_submit","params":{"decision":"why the pending patch is ready to test"}}
+- {"tool":"discard_pending_patch","params":{"reason":"why the pending patch should not be tested"}}
 - {"tool":"repair_review","params":{"failure_seen":"actual error/output/behavior from issue or runtime only","evidence_chain":[{"node_id":"read-node-id","role":"entry|state|decision|output|target","evidence":"what the read code proves"}],"target_nodes":["committed-node-id"],"intent_analysis":"one repair mechanism to critique; do not write exact patch text","confidence":0.0,"review_focus":"optional disagreement or uncertainty about the previous review"}}
+- {"tool":"repair_chunk","params":{"failure_seen":"actual error/output/behavior from issue or runtime only","evidence_chain":[{"node_id":"read-node-id","role":"entry|state|decision|output|target","evidence":"what the read code proves"}],"target_nodes":["committed-node-id"],"intent_analysis":"one coherent chunk that should stay compilable; do not write exact patch text","confidence":0.0,"remaining_work":"what later chunk/final repair still needs"}}
 - {"tool":"repair","params":{"failure_seen":"actual error/output/behavior from issue or runtime only","evidence_chain":[{"node_id":"read-node-id","role":"entry|state|decision|output|target","evidence":"what the read code proves"}],"target_nodes":["committed-node-id"],"intent_analysis":"brief mechanism analysis grounded in read code; do not write exact patch text","confidence":0.0}}
 
 Rules:
@@ -31,13 +38,22 @@ Rules:
 - trajectory_summary contains every prior step in compact form; use it to avoid repeating reads, searches, or rejected repairs.
 - working_code_W contains read code plus explore_find previews. Use find previews for orientation only; do not treat them as complete evidence until a read action succeeds.
 - last_repair_attempt may include failure_feedback with only the failed patch, failed selectors, and an error summary. Use it to revise the intent analysis or evidence; do not repeat the same repair action with the same memory and plan.
+- recent_repair_attempts and recent_cgm_insights are shared with both planner and CGM. Use them to avoid repeating failed patch strategies.
+- If pending_patch_summary is present, inspect it before any new repair action. Choose one of: repair_submit if it is ready, repair_revise if the candidate is close but risky/incomplete, discard_pending_patch if it is wrong/stale, or read more code if the risk cannot be judged.
 - Repair memory M is the CGM evidence set; W contains broader working context.
 - CGM repair sees repair_memory_M, not all read nodes in W.
 - M is model-curated. memory_commit never auto-adds related nodes and requires explicit read evidence; commit only nodes you intentionally want CGM to use. Use memory_delete to remove stale/noisy M nodes.
 - repair is not an exploration action. A plausible suspicious function is not enough.
+- repair_propose is the default patch-generation action for multi-file, interface, middleware, data-flow, or high-risk repairs. It generates a pending patch but does not run tests.
+- repair_submit is the only new deliberation-loop action that runs fail-to-pass/PASS_TO_PASS tests. Do not submit a pending patch until you can explain why it covers the issue mechanism and why known risks are acceptable.
+- repair_revise must include a concrete pending_patch_review with coverage, risks, and requested_change. Do not use it as a blind retry.
+- discard_pending_patch before changing target/evidence if the pending patch is wrong or based on stale assumptions.
+- repair_chunk is also not an exploration action. It keeps an unverified patch applied only after patch validation/syntax checks; final success still requires ordinary repair.
 - repair is blocked unless fail-to-pass behavior, hydrated memory evidence, and a compact evidence package exist.
 - Build a compact evidence_chain before repair: observed runtime behavior -> implementation entry/state/decision/output -> patch target. If a key link is not supported by read code in W/M, explore/read/commit instead.
 - Use repair_review to ask CGM for an intent critique without applying a patch when a prior patch failed, target confidence is uncertain, or you need a second opinion on whether M supports the mechanism. After repair_review, either revise M/intent or call repair with the reviewed intent.
+- For multi-file or multi-mechanism repairs, prefer repair_propose over one huge immediate repair. Use repair_revise to improve the pending patch before repair_submit. Use repair_chunk only when you intentionally want to keep a validated partial edit applied before final verification.
+- Do not use repair_chunk as a way to keep uncertain code. If a chunk cannot be justified by read evidence and target_nodes in M, read/commit more first.
 - Propose exactly one repair intent at a time. Do not generate multiple competing plans in one action.
 - repair_review returns CGM's critique and adoption_advice. It is advice, not code fact and not a binding contract.
 - After repair_review, decide whether to adopt, revise, or reject the critique. Treat evidence_gaps as advice to evaluate, not an automatic blocker. If a gap is essential to target/mechanism, validate or falsify it with local grep_code/explore_find.path_glob plus read/memory_commit; if it is only auxiliary comparison evidence and visible code already supports target/mechanism, repair may adopt the ready review.
@@ -76,13 +92,22 @@ Tool-use rules:
 - trajectory_summary contains every prior step in compact form; use it to avoid repeating reads, searches, or rejected repairs.
 - working_code_W contains read code plus explore_find previews. Use find previews for orientation only; do not treat them as complete evidence until a read action succeeds.
 - last_repair_attempt may include failure_feedback with only the failed patch, failed selectors, and an error summary. Use it to revise the intent analysis or evidence; do not repeat the same repair action with the same memory and plan.
+- recent_repair_attempts and recent_cgm_insights are shared with both planner and CGM. Use them to avoid repeating failed patch strategies.
+- If pending_patch_summary is present, inspect it before any new repair action. Choose one of: repair_submit if it is ready, repair_revise if the candidate is close but risky/incomplete, discard_pending_patch if it is wrong/stale, or read more code if the risk cannot be judged.
 - Repair memory M is the CGM evidence set; W contains broader working context.
 - CGM repair sees repair_memory_M, not all read nodes in W.
 - M is model-curated. memory_commit never auto-adds related nodes and requires explicit read evidence; commit only nodes you intentionally want CGM to use. Use memory_delete to remove stale/noisy M nodes.
 - repair is not an exploration action. A plausible suspicious function is not enough.
+- repair_propose is the default patch-generation action for multi-file, interface, middleware, data-flow, or high-risk repairs. It generates a pending patch but does not run tests.
+- repair_submit is the only new deliberation-loop action that runs fail-to-pass/PASS_TO_PASS tests. Do not submit a pending patch until you can explain why it covers the issue mechanism and why known risks are acceptable.
+- repair_revise must include a concrete pending_patch_review with coverage, risks, and requested_change. Do not use it as a blind retry.
+- discard_pending_patch before changing target/evidence if the pending patch is wrong or based on stale assumptions.
+- repair_chunk is also not an exploration action. It keeps an unverified patch applied only after patch validation/syntax checks; final success still requires ordinary repair.
 - repair is blocked unless fail-to-pass behavior, hydrated memory evidence, and a compact evidence package exist.
 - Build a compact evidence_chain before repair: observed runtime behavior -> implementation entry/state/decision/output -> patch target. If a key link is not supported by code in W/M, explore/read/commit instead.
 - Use repair_review to ask CGM for an intent critique without applying a patch when a prior patch failed, target confidence is uncertain, or you need a second opinion on whether M supports the mechanism. After repair_review, either revise M/intent or call repair with the reviewed intent.
+- For multi-file or multi-mechanism repairs, prefer repair_propose over one huge immediate repair. Use repair_revise to improve the pending patch before repair_submit. Use repair_chunk only when you intentionally want to keep a validated partial edit applied before final verification.
+- Do not use repair_chunk as a way to keep uncertain code. If a chunk cannot be justified by read evidence and target_nodes in M, read/commit more first.
 - Propose exactly one repair intent at a time. Do not generate multiple competing plans in one action.
 - repair_review returns CGM's critique and adoption_advice. It is advice, not code fact and not a binding contract.
 - After repair_review, decide whether to adopt, revise, or reject the critique. Treat evidence_gaps as advice to evaluate, not an automatic blocker. If a gap is essential to target/mechanism, validate or falsify it with local grep_code/explore_find.path_glob plus read/memory_commit; if it is only auxiliary comparison evidence and visible code already supports target/mechanism, repair may adopt the ready review.

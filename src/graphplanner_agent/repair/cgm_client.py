@@ -9,6 +9,12 @@ import urllib.request
 
 from graphplanner_agent.config import AgentConfig
 from graphplanner_agent.infra.http import urlopen_no_proxy_for_localhost
+from graphplanner_agent.integrations.dashscope_cgm_bridge import (
+    DEFAULT_ENDPOINT as DASHSCOPE_DEFAULT_ENDPOINT,
+    DEFAULT_MODEL as DASHSCOPE_DEFAULT_MODEL,
+    BridgeConfig,
+    DashScopeCgmBridge,
+)
 
 RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 
@@ -53,11 +59,14 @@ class MockCgmClient(CgmClient):
 class StaticCgmClient(CgmClient):
     def __init__(self, response: dict[str, object]):
         self.response = response
+        self.payloads: list[dict[str, object]] = []
 
     def generate_patch(self, payload: dict[str, object]) -> dict[str, object]:
+        self.payloads.append(payload)
         return self.response
 
     def review_intent(self, payload: dict[str, object]) -> dict[str, object]:
+        self.payloads.append(payload)
         if isinstance(self.response.get("review"), dict):
             return self.response
         return {
@@ -118,6 +127,36 @@ class HttpCgmClient(CgmClient):
         raise CgmUnavailableError(f"CGM request failed: {last_error}")
 
 
+class DashScopeDirectCgmClient(CgmClient):
+    """DashScope-backed CGM client used directly by the agent.
+
+    The implementation reuses the prompt/output normalization code from the
+    former HTTP bridge module, but there is no local bridge process in this
+    route. This is now the preferred CGM backend for normal eval runs.
+    """
+
+    def __init__(self, bridge: DashScopeCgmBridge):
+        self._bridge = bridge
+
+    def generate_patch(self, payload: dict[str, object]) -> dict[str, object]:
+        return self._bridge.generate_patch(payload)
+
+    def review_intent(self, payload: dict[str, object]) -> dict[str, object]:
+        return self._bridge.review_intent(payload)
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value for {name}: {value}")
+
+
 def make_cgm_client(config: AgentConfig) -> CgmClient:
     backend = config.cgm_backend.lower()
     if backend == "mock":
@@ -137,4 +176,26 @@ def make_cgm_client(config: AgentConfig) -> CgmClient:
             or str(config.command_timeout)
         )
         return HttpCgmClient(config.cgm_endpoint, timeout=timeout, max_attempts=config.cgm_http_max_attempts)
+    if backend in {"dashscope", "dashscope_direct"}:
+        api_key = os.getenv("CGM_DASHSCOPE_API_KEY") or config.planner_api_key or os.getenv("PLANNER_API_KEY")
+        if not api_key:
+            raise ValueError("CGM_DASHSCOPE_API_KEY or PLANNER_API_KEY is required when CGM_BACKEND=dashscope")
+        bridge_config = BridgeConfig(
+            endpoint=(
+                os.getenv("CGM_DASHSCOPE_ENDPOINT")
+                or os.getenv("DASHSCOPE_ENDPOINT")
+                or DASHSCOPE_DEFAULT_ENDPOINT
+            ),
+            api_key=api_key,
+            model=os.getenv("CGM_DASHSCOPE_MODEL") or DASHSCOPE_DEFAULT_MODEL,
+            temperature=float(os.getenv("CGM_DASHSCOPE_TEMPERATURE", "0") or 0.0),
+            max_output_tokens=int(os.getenv("CGM_DASHSCOPE_MAX_TOKENS", "1536") or 1536),
+            timeout=int(
+                os.getenv("CGM_DASHSCOPE_TIMEOUT")
+                or os.getenv("CGM_HTTP_TIMEOUT")
+                or str(config.command_timeout)
+            ),
+            enable_thinking=_env_bool("CGM_DASHSCOPE_ENABLE_THINKING", default=True),
+        )
+        return DashScopeDirectCgmClient(DashScopeCgmBridge(bridge_config))
     raise ValueError(f"unsupported CGM_BACKEND: {config.cgm_backend}")

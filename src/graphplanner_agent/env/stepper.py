@@ -32,6 +32,10 @@ class CodeRepairEnv:
     repair_feedback: str | None = None
     last_repair_attempt: dict[str, object] | None = None
     last_repair_review: dict[str, object] | None = None
+    pending_patch: object | None = None
+    pending_patch_origin: dict[str, object] | None = None
+    repair_attempts: list[dict[str, object]] = field(default_factory=list)
+    cgm_insights: list[dict[str, object]] = field(default_factory=list)
     trajectory: list[dict[str, object]] = field(default_factory=list)
     planner_diagnostics: list[dict[str, object]] = field(default_factory=list)
     recent_actions: list[str] = field(default_factory=list)
@@ -59,6 +63,9 @@ class CodeRepairEnv:
             self.repair_feedback,
             self.last_repair_attempt,
             self.last_repair_review,
+            _pending_patch_summary(self),
+            self.repair_attempts,
+            self.cgm_insights,
             self.trajectory,
             self.planner_diagnostics,
             self.recent_actions,
@@ -97,8 +104,10 @@ class CodeRepairEnv:
         return memory_ids == sorted(str(node_id) for node_id in self.memory.nodes)
 
     def action_disabled_reason(self, tool: str) -> str | None:
-        if tool == "repair":
+        if tool in {"repair", "repair_chunk", "repair_propose", "repair_revise"}:
             return self.repair_disabled_reason()
+        if tool == "repair_submit" and self.pending_patch is None:
+            return "repair_submit is temporarily disabled until CGM has produced a pending patch with repair_propose or repair_revise"
         if tool == "repair_review":
             if self.config.require_failed_test_before_repair and self.failure_summary is None:
                 return "repair_review is temporarily disabled until fail-to-pass behavior is collected with run_failed_test"
@@ -240,7 +249,7 @@ def _result_summary(result: dict[str, object]) -> dict[str, object]:
             "memory_changed": result.get("memory_changed"),
             "memory_count": len(result.get("memory") or []),
         }
-    if tool == "repair":
+    if tool in {"repair", "repair_chunk", "repair_propose", "repair_revise", "repair_submit", "discard_pending_patch"}:
         return {
             "status": result.get("status"),
             "blocked": result.get("blocked"),
@@ -272,7 +281,7 @@ def _compact_value(value, limit: int):
 
 
 def _compact_action_params(tool: str, params: dict[str, object]) -> object:
-    if tool not in {"repair", "repair_review"}:
+    if tool not in {"repair", "repair_chunk", "repair_review", "repair_propose", "repair_revise", "repair_submit"}:
         return _compact_value(params, 700)
     compact: dict[str, object] = {}
     for key in ["failure_seen", "intent_analysis", "confidence"]:
@@ -283,6 +292,15 @@ def _compact_action_params(tool: str, params: dict[str, object]) -> object:
         value = params.get(key)
         if isinstance(value, list):
             compact[key] = [str(item) for item in value[:8]]
+    remaining_work = params.get("remaining_work")
+    if remaining_work is not None:
+        compact["remaining_work"] = _compact_text(str(remaining_work), 180)
+    revision_focus = params.get("revision_focus")
+    if revision_focus is not None:
+        compact["revision_focus"] = _compact_text(str(revision_focus), 220)
+    pending_patch_review = params.get("pending_patch_review")
+    if isinstance(pending_patch_review, dict):
+        compact["pending_patch_review"] = _compact_value(pending_patch_review, 500)
     evidence_chain = params.get("evidence_chain")
     if isinstance(evidence_chain, list):
         compact["evidence_chain"] = [
@@ -307,3 +325,26 @@ def _compact_text(text: str, limit: int) -> str:
 def _has_read_code_outside_memory(env: CodeRepairEnv) -> bool:
     committed = set(env.memory.nodes)
     return any(node_id not in committed and entry.node.has_code for node_id, entry in env.working.entries.items())
+
+
+def _pending_patch_summary(env: CodeRepairEnv) -> dict[str, object] | None:
+    patch = env.pending_patch
+    if patch is None or not hasattr(patch, "edits"):
+        return None
+    edits = []
+    for edit in list(getattr(patch, "edits", []))[:8]:
+        edits.append(
+            {
+                "path": getattr(edit, "path", None),
+                "start": getattr(edit, "start", None),
+                "end": getattr(edit, "end", None),
+                "new_text": _compact_text(str(getattr(edit, "new_text", "") or ""), 900),
+            }
+        )
+    return {
+        "summary": getattr(patch, "summary", ""),
+        "touched_paths": getattr(patch, "touched_paths", []),
+        "edit_count": len(getattr(patch, "edits", [])),
+        "edits": edits,
+        "origin": _compact_value(env.pending_patch_origin, 1800) if env.pending_patch_origin else None,
+    }

@@ -48,6 +48,7 @@ from graphplanner_agent.runtime.remote_swe_session import (
 )
 from graphplanner_agent.runtime.sandbox_base import CommandResult, TestResult
 from graphplanner_agent.runtime.swebench_official import official_eval_script, parse_official_report
+from graphplanner_agent.runtime import swebench_pro
 from graphplanner_agent.runtime.test_runner import behavior_summary
 from graphplanner_agent.telemetry.progress import ProgressTracker
 
@@ -588,6 +589,113 @@ class AgentRebuildTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "test_failed")
             self.assertIn("return a - b", (root / "pkg" / "calc.py").read_text(encoding="utf-8"))
+
+    def test_repair_chunk_keeps_valid_patch_without_final_verification(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task = self._make_repo(root)
+            cgm = StaticCgmClient(
+                {"patch": {"summary": "chunk add implementation", "edits": [{"path": "pkg/calc.py", "start": 2, "end": 2, "new_text": "    return a + b\n"}]}}
+            )
+            env = CodeRepairEnv.create(task, LocalRepoRuntime(root), cgm, AgentConfig(max_patch_edits=4))
+
+            env.step(PlannerAction("explore_find", {"query": "add", "find_type": "function"}))
+            node_id = env.latest_result["results"][0]["id"]
+            env.step(PlannerAction("read", {"node_id": node_id, "view": "body"}))
+            env.step(PlannerAction("memory_commit", {"select_ids": [node_id]}))
+            env.step(PlannerAction("run_failed_test", {}))
+            params = self._repair_params(node_id, "apply the add implementation chunk")
+            params["remaining_work"] = "run final verification after this chunk"
+
+            result = env.step(PlannerAction("repair_chunk", params))
+
+            self.assertEqual(result["status"], "chunk_applied")
+            self.assertFalse(result["done"])
+            self.assertFalse(env.done)
+            self.assertIn("return a + b", (root / "pkg" / "calc.py").read_text(encoding="utf-8"))
+
+    def test_repair_propose_saves_pending_patch_without_testing_or_applying(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task = self._make_repo(root)
+            cgm = StaticCgmClient(
+                {
+                    "insight_summary": {"bug_mechanism": "add subtracts", "patch_strategy": "replace subtraction"},
+                    "patch": {"summary": "candidate add implementation", "edits": [{"path": "pkg/calc.py", "start": 2, "end": 2, "new_text": "    return a + b\n"}]},
+                }
+            )
+            env = CodeRepairEnv.create(task, LocalRepoRuntime(root), cgm, AgentConfig(max_patch_edits=4))
+
+            env.step(PlannerAction("explore_find", {"query": "add", "find_type": "function"}))
+            node_id = env.latest_result["results"][0]["id"]
+            env.step(PlannerAction("read", {"node_id": node_id, "view": "body"}))
+            env.step(PlannerAction("memory_commit", {"select_ids": [node_id]}))
+            env.step(PlannerAction("run_failed_test", {}))
+            result = env.step(PlannerAction("repair_propose", self._repair_params(node_id)))
+
+            self.assertEqual(result["status"], "patch_proposed")
+            self.assertIsNotNone(env.pending_patch)
+            self.assertFalse(env.verified)
+            self.assertIn("return a - b", (root / "pkg" / "calc.py").read_text(encoding="utf-8"))
+            observation = json.loads(env.observe())
+            self.assertTrue(observation["runtime_facts"]["pending_patch_present"])
+            self.assertTrue(observation["recent_cgm_insights"])
+
+    def test_repair_submit_tests_pending_patch_and_clears_it_on_pass(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task = self._make_repo(root)
+            cgm = StaticCgmClient(
+                {"patch": {"summary": "candidate add implementation", "edits": [{"path": "pkg/calc.py", "start": 2, "end": 2, "new_text": "    return a + b\n"}]}}
+            )
+            env = CodeRepairEnv.create(task, LocalRepoRuntime(root), cgm, AgentConfig(max_patch_edits=4))
+
+            env.step(PlannerAction("explore_find", {"query": "add", "find_type": "function"}))
+            node_id = env.latest_result["results"][0]["id"]
+            env.step(PlannerAction("read", {"node_id": node_id, "view": "body"}))
+            env.step(PlannerAction("memory_commit", {"select_ids": [node_id]}))
+            env.step(PlannerAction("run_failed_test", {}))
+            env.step(PlannerAction("repair_propose", self._repair_params(node_id)))
+            result = env.step(PlannerAction("repair_submit", {"decision": "candidate directly fixes the read implementation"}))
+
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(env.verified)
+            self.assertIsNone(env.pending_patch)
+            self.assertIn("return a + b", (root / "pkg" / "calc.py").read_text(encoding="utf-8"))
+
+    def test_repair_revise_sends_pending_patch_and_history_to_cgm(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task = self._make_repo(root)
+            cgm = StaticCgmClient(
+                {"patch": {"summary": "bad candidate", "edits": [{"path": "pkg/calc.py", "start": 2, "end": 2, "new_text": "    return a * b\n"}]}}
+            )
+            env = CodeRepairEnv.create(task, LocalRepoRuntime(root), cgm, AgentConfig(max_patch_edits=4))
+
+            env.step(PlannerAction("explore_find", {"query": "add", "find_type": "function"}))
+            node_id = env.latest_result["results"][0]["id"]
+            env.step(PlannerAction("read", {"node_id": node_id, "view": "body"}))
+            env.step(PlannerAction("memory_commit", {"select_ids": [node_id]}))
+            env.step(PlannerAction("run_failed_test", {}))
+            env.step(PlannerAction("repair_propose", self._repair_params(node_id)))
+            cgm.response = {
+                "patch": {"summary": "revised add candidate", "edits": [{"path": "pkg/calc.py", "start": 2, "end": 2, "new_text": "    return a + b\n"}]}
+            }
+            params = self._repair_params(node_id, "revise the candidate to add instead of multiply")
+            params["revision_focus"] = "pending patch multiplies; the issue requires addition"
+            params["pending_patch_review"] = {
+                "coverage": "partial",
+                "risks": ["wrong operator"],
+                "requested_change": "replace multiplication with addition",
+            }
+            result = env.step(PlannerAction("repair_revise", params))
+
+            self.assertEqual(result["status"], "patch_proposed")
+            self.assertIn("return a - b", (root / "pkg" / "calc.py").read_text(encoding="utf-8"))
+            revise_payload = cgm.payloads[-1]
+            self.assertTrue(revise_payload["pending_patch"])
+            self.assertTrue(revise_payload["repair_history"])
+            self.assertEqual(revise_payload["planner_decision_context"]["pending_patch_review"]["coverage"], "partial")
 
     def test_action_guards_reject_empty_find_query(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -2516,6 +2624,31 @@ diff --git a/pkg/calc.py b/pkg/calc.py
         self.assertEqual(task.base_commit, "abc123")
         self.assertEqual(task.metadata["repo"], "django/django")
         self.assertEqual(task.metadata["swebench_spec"]["eval_script_list"][0], "python -m pytest tests/admin_views/test.py::Case::test_a")
+
+    def test_swebench_pro_without_explicit_p2p_does_not_infer_regression(self):
+        task = TaskSpec(
+            "pro",
+            Path("/testbed"),
+            "title",
+            "body",
+            fail_to_pass=["TestScanner"],
+            pass_to_pass=[],
+            metadata={"swebench_pro": {"run_script": "unused", "parser": "unused", "selected_test_files_to_run": ["TestScanner"]}},
+        )
+        report = {
+            "tests": [
+                {"name": "TestScanner", "status": "PASSED"},
+                {"name": "UnrelatedRegression", "status": "PASSED"},
+            ],
+            "runs": [{"label": "selected", "run_script_returncode": 0, "parser_returncode": 0, "test_count": 2}],
+        }
+        stdout = f"{swebench_pro.START_PRO_JSON}\n{json.dumps(report)}\n{swebench_pro.END_PRO_JSON}\n"
+
+        result = swebench_pro.result_from_run(task, CommandResult("cmd", 0, stdout, ""))
+
+        self.assertTrue(result.resolved)
+        self.assertFalse(result.tests_status["PASS_TO_PASS"]["required"])
+        self.assertEqual(result.tests_status["PASS_TO_PASS"]["source"], "not_provided")
 
     def test_eval_rejects_incomplete_swebench_instance(self):
         task = TaskSpec.from_dict(

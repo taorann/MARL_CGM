@@ -166,4 +166,8 @@ def _malformed_retry_message(error: str, tool_calling: bool) -> str:
             "Previous response was malformed: "
             f"{error}. Call exactly one provided tool via tool_calls. Do not answer in prose or JSON text."
         )
-    return f"Previous response was malformed: {error}. Emit exactly one JSON action."
+    return (
+        f"Previous response was malformed: {error}. "
+        'Emit exactly one JSON object action like {"tool":"read","params":{"node_id":"..."}}. '
+        "Do not emit a JSON array, markdown list, or multiple actions. Choose only the single next action."
+    )

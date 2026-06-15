@@ -28,7 +28,10 @@ Required configuration:
 - `sandbox_backend=remote_swe`;
 - `sandbox_ssh_target=chongbin_cls@localhost`;
 - `GP_REMOTE_SWE_SSH_ARGS="-i /root/.ssh/id_ed25519_login24 -p 40022 ..."`; 
-- `sandbox_remote_repo=/appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM`.
+- `sandbox_remote_repo` points to the remote working repo that receives
+  `remote_runtime/` via `scripts/sync_remote_runtime_code.sh`;
+- SIF images and large caches should live under lustre3, e.g.
+  `/lustre3/chongbin_pkuhpc/chongbin_cls/graphplanner_sif/`.
 
 A clean implementation should treat this as one runtime plugin, not as core agent logic.
 

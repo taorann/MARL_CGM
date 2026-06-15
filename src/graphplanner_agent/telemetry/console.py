@@ -50,7 +50,7 @@ def summarize_action_result(result: dict[str, Any] | None) -> str:
         changed = result.get("memory_changed")
         changed_text = "" if changed is None else f" changed={changed}"
         return f"deleted={len(result.get('deleted_ids') or [])} memory={len(result.get('memory') or [])}{changed_text}"
-    if tool == "repair":
+    if tool in {"repair", "repair_chunk", "repair_propose", "repair_revise", "repair_submit", "discard_pending_patch"}:
         touched = ",".join(result.get("touched_paths") or [])
         return f"status={result.get('status')} rolled_back={result.get('rolled_back')} paths={touched}"
     return compact_json(result, limit=300)

@@ -50,7 +50,7 @@ def parse_cgm_output(raw: str | dict[str, Any]) -> Patch:
 def _normalize_new_text(text: str, start: int, end: int) -> str:
     if "\n" in text or "\\n" not in text:
         return text
-    if end <= start and not re.search(r"\\n[ \t]*(?:def |class |if |for |while |try:|with |return |super\\(|[A-Za-z_])", text):
+    if end <= start and not re.search(r"\\n[ \t]*(?:def |class |if |for |while |try:|with |return |super\(|[A-Za-z_])", text):
         return text
     return text.replace("\\r\\n", "\n").replace("\\n", "\n")
 
@@ -101,6 +101,8 @@ def parse_unified_diff(diff_text: str) -> Patch:
                 raise ValueError(f"invalid diff hunk header: {line}")
             old_start = int(match.group(1))
             old_len = int(match.group(2) or "1")
+            edit_start = 1 if old_start == 0 and old_len == 0 else old_start
+            edit_end = 0 if old_start == 0 and old_len == 0 else old_start + old_len - 1
             new_lines: list[str] = []
             i += 1
             while i < len(lines) and not lines[i].startswith("@@ ") and not lines[i].startswith("diff --git "):
@@ -118,8 +120,8 @@ def parse_unified_diff(diff_text: str) -> Patch:
             edits.append(
                 PatchEdit(
                     path=current_path,
-                    start=old_start,
-                    end=old_start + old_len - 1,
+                    start=edit_start,
+                    end=edit_end,
                     new_text="\n".join(new_lines) + ("\n" if new_lines else ""),
                 )
             )

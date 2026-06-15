@@ -15,19 +15,37 @@ from graphplanner_agent.datasets import TaskSpec
 from graphplanner_agent.graph.schema import GraphNode, RepoGraph
 from graphplanner_agent.runtime.remote_swe_session import RemoteSweError, RemoteSweSession, infer_sif_dir_from_ref, normalize_sif_image_ref
 from graphplanner_agent.runtime.sandbox_base import CommandResult, TestResult
+import graphplanner_agent.runtime.swebench_pro as swebench_pro
 from graphplanner_agent.runtime.swebench_official import official_eval_command, result_from_official_run
 
 
 WRONG_PYTHON_ENV_RETURNCODE = 97
 WRONG_PYTHON_ENV_MARKER = "INFRA_WRONG_PYTHON_ENV"
+REMOTE_GRAPH_BUILDER_CACHE_VERSION = "2026-06-05-multilang-graph-v1"
 
 
-def decode_repo_graph_payload(payload: str) -> RepoGraph:
+def _remote_instance_lost(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "no active instance on this runner" in lowered or "call instance_start first" in lowered
+
+
+def _remote_runner_recoverable(text: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        _remote_instance_lost(lowered)
+        or "runner bound to run_id" in lowered
+        or "cannot resolve runner for run_id" in lowered
+        or "heartbeat did not report it as current_run_id" in lowered
+        or "while setting image/instance: eof" in lowered
+    )
+
+
+def decode_repo_graph_payload(payload: str, *, root: str = "/testbed") -> RepoGraph:
     try:
         raw = gzip.decompress(base64.b64decode(payload.encode("ascii"), validate=False))
     except Exception as exc:
         raise RemoteSweError(f"failed to decode remote repo graph payload len={len(payload or '')}") from exc
-    return repo_graph_from_jsonl(raw.decode("utf-8", "replace"))
+    return repo_graph_from_jsonl(raw.decode("utf-8", "replace"), root=root)
 
 
 def repo_graph_from_jsonl(text: str, root: str = "/testbed") -> RepoGraph:
@@ -137,6 +155,8 @@ class RemoteSweRuntime:
         resp = self.session.start(timeout=max(float(self.config.command_timeout), 300.0), cwd=self.config.sandbox_workdir)
         if not bool(resp.get("ok", True)) or int(resp.get("returncode") or 0) != 0:
             raise RemoteSweError(f"remote_swe start failed: {resp}")
+        if swebench_pro.is_swebench_pro_task(task):
+            self._prepare_swebench_pro_repo(task)
 
     def stop(self) -> None:
         if self.session is None:
@@ -156,6 +176,25 @@ class RemoteSweRuntime:
         if resp.get("error"):
             stderr = (stderr + "\n" + str(resp.get("error"))).strip()
         rc = int(resp.get("returncode") if resp.get("returncode") is not None else (0 if resp.get("ok", False) else 1))
+        if (
+            rc != 0
+            and os.environ.get("GRAPHPLANNER_REMOTE_RESTART_ON_LOST", "1").lower() in {"1", "true", "yes", "on"}
+            and _remote_runner_recoverable(stdout + "\n" + stderr)
+        ):
+            try:
+                self.session.start(timeout=max(float(self.config.command_timeout), 300.0), cwd=self.config.sandbox_workdir)
+                if self.task is not None and swebench_pro.is_swebench_pro_task(self.task):
+                    self._prepare_swebench_pro_repo(self.task)
+                resp = self.session.exec(cmd, cwd=effective_cwd, env=env, timeout=float(timeout))
+                stdout = str(resp.get("stdout") or "")
+                stderr = str(resp.get("stderr") or "")
+                if resp.get("error"):
+                    stderr = (stderr + "\n" + str(resp.get("error"))).strip()
+                rc = int(resp.get("returncode") if resp.get("returncode") is not None else (0 if resp.get("ok", False) else 1))
+            except TimeoutError as exc:
+                return CommandResult(cmd, 124, "", f"remote instance was lost; restart timed out: {exc}", timed_out=True)
+            except RemoteSweError as exc:
+                return CommandResult(cmd, rc, stdout, (stderr + "\n" + f"remote instance restart failed: {exc}").strip())
         return CommandResult(cmd, rc, stdout, stderr)
 
     def read_file(self, path: str, start: int | None = None, end: int | None = None) -> str:
@@ -259,18 +298,39 @@ print("ok")
         cached = self._load_graph_payload_cache()
         if cached is not None:
             self.last_graph_cache_hit = True
-            return decode_repo_graph_payload(cached)
+            return decode_repo_graph_payload(cached, root=self.config.sandbox_workdir)
         self.last_graph_cache_hit = False
-        payload = self.session.build_repo_graph(
-            repo_id=repo_id,
-            timeout=int(self.config.sandbox_remote_graph_timeout),
-            cwd=self.config.sandbox_workdir,
-            repo=self.config.sandbox_workdir,
-        )
+        try:
+            payload = self.session.build_repo_graph(
+                repo_id=repo_id,
+                timeout=int(self.config.sandbox_remote_graph_timeout),
+                cwd=self.config.sandbox_workdir,
+                repo=self.config.sandbox_workdir,
+            )
+        except RemoteSweError as exc:
+            if not (
+                os.environ.get("GRAPHPLANNER_REMOTE_RESTART_ON_LOST", "1").lower()
+                in {"1", "true", "yes", "on"}
+                and _remote_runner_recoverable(str(exc))
+            ):
+                raise
+            self.session.start(timeout=max(float(self.config.command_timeout), 300.0), cwd=self.config.sandbox_workdir)
+            if self.task is not None and swebench_pro.is_swebench_pro_task(self.task):
+                self._prepare_swebench_pro_repo(self.task)
+            payload = self.session.build_repo_graph(
+                repo_id=repo_id,
+                timeout=int(self.config.sandbox_remote_graph_timeout),
+                cwd=self.config.sandbox_workdir,
+                repo=self.config.sandbox_workdir,
+            )
         self._store_graph_payload_cache(payload)
-        return decode_repo_graph_payload(payload)
+        return decode_repo_graph_payload(payload, root=self.config.sandbox_workdir)
 
     def run_fail_to_pass(self, task: TaskSpec) -> TestResult:
+        if swebench_pro.is_swebench_pro_task(task):
+            cmd = swebench_pro.test_command(task)
+            result = self.run(cmd, timeout=max(self.config.command_timeout, 1800), cwd=self.config.sandbox_workdir)
+            return swebench_pro.result_from_run(task, result)
         official_cmd = official_eval_command(task)
         if task.test_command:
             cmd = wrap_testbed_test_command(task.test_command)
@@ -304,6 +364,17 @@ print("ok")
             parser_error = "wrong_python_env"
         return TestResult(status, cmd, result.stdout, result.stderr, result.returncode, parser_error=parser_error)
 
+    def _prepare_swebench_pro_repo(self, task: TaskSpec) -> None:
+        cmd = swebench_pro.setup_command(task)
+        if not cmd:
+            return
+        result = self.run(cmd, timeout=max(self.config.command_timeout, 1800), cwd=self.config.sandbox_workdir)
+        if result.returncode != 0:
+            raise RemoteSweError(
+                "SWE-bench Pro repository setup failed "
+                f"rc={result.returncode}: {(result.stderr or result.stdout)[-2000:]}"
+            )
+
     def _graph_cache_path(self) -> Path | None:
         if not self.config.sandbox_graph_cache:
             self.last_graph_cache_path = None
@@ -317,6 +388,7 @@ print("ok")
             "workdir": self.config.sandbox_workdir,
             "frontend": os.environ.get("GP_REPO_GRAPH_FRONTEND", "treesitter"),
             "embed_snippets": os.environ.get("GP_REPO_GRAPH_EMBED_SNIPPETS", "0"),
+            "builder_version": os.environ.get("GP_REPO_GRAPH_BUILDER_VERSION", REMOTE_GRAPH_BUILDER_CACHE_VERSION),
         }
         digest = hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()[:24]
         image_name = (self.image or "remote").replace("/", "-").replace(":", "-").replace("@", "-")

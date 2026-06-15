@@ -10,6 +10,7 @@ TRACEBACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in ([^\n]+)')
 PYTEST_STATUS_LINE_RE = re.compile(r"^(?P<status>FAILED|ERROR|PASSED|SKIPPED)\s+(?P<selector>\S+::\S+)(?:\s+-\s+(?P<detail>.*))?$")
 EXCEPTION_LINE_RE = re.compile(r"^\s*E\s+(?P<type>[A-Za-z_][\w.]*?(?:Error|Exception|Failure)):\s*(?P<message>.*)$")
 PLAIN_EXCEPTION_LINE_RE = re.compile(r"^(?P<type>[A-Za-z_][\w.]*?(?:Error|Exception|Failure)):\s*(?P<message>.*)$")
+JS_MISSING_MODULE_RE = re.compile(r"Cannot find module\s+['\"](?P<module>[^'\"]+)['\"](?:\s+from\s+['\"](?P<from>[^'\"]+)['\"])?")
 
 
 def behavior_summary(result: TestResult, limit: int = 1600) -> dict[str, object]:
@@ -50,6 +51,11 @@ def actual_runtime_observations(output: str, *, limit: int = 8) -> dict[str, obj
         if "INFRA_WRONG_PYTHON_ENV" in stripped:
             _append_unique(exception_types, "WrongPythonEnvironment", limit)
             _append_unique(actual_messages, stripped, limit)
+            continue
+        missing_module = JS_MISSING_MODULE_RE.search(stripped)
+        if missing_module:
+            _append_unique(exception_types, "MissingModule", limit)
+            _append_unique(actual_messages, f"Cannot find module {missing_module.group('module')}", limit)
             continue
         status = PYTEST_STATUS_LINE_RE.match(stripped)
         if status:

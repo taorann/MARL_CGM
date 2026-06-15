@@ -23,6 +23,12 @@ DEFAULT_MODEL = "qwen3-235b-a22b-thinking-2507"
 RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 
 
+class CgmOutputParseError(ValueError):
+    def __init__(self, message: str, *, raw_preview: str = ""):
+        super().__init__(message)
+        self.raw_preview = raw_preview
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     endpoint: str
@@ -59,8 +65,27 @@ def _target_section(plan: dict[str, Any]) -> str:
         node_id = str(target.get("id") or "").strip()
         if not path:
             continue
-        lines.append(f"- {path}:{start}-{end} ({node_id})")
+        prefix = "new file target" if node_id.startswith("new_file:") or (start == 1 and end == 0) else "target"
+        lines.append(f"- {prefix}: {path}:{start}-{end} ({node_id})")
     return "\n".join(lines)
+
+
+def _has_new_file_target(plan: dict[str, Any]) -> bool:
+    targets = plan.get("targets")
+    if not isinstance(targets, list):
+        return False
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        node_id = str(target.get("id") or "")
+        if node_id.startswith("new_file:"):
+            return True
+        try:
+            if int(target.get("start")) == 1 and int(target.get("end")) == 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _snippet_section(snippets: Any, *, limit: int = 12) -> str:
@@ -191,19 +216,30 @@ def _iter_stream_lines(resp, *, deadline: float | None, label: str):
 
 
 def _repair_prompt(payload: dict[str, Any]) -> str:
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
     issue = _issue_section(payload.get("issue") if isinstance(payload.get("issue"), dict) else {})
-    targets = _target_section(payload.get("plan") if isinstance(payload.get("plan"), dict) else {})
+    targets = _target_section(plan)
     snippets = _snippet_section(payload.get("snippets"))
     graph_summary = _graph_section(payload.get("graph") if isinstance(payload.get("graph"), dict) else {})
     plan_text = str(payload.get("plan_text") or "").strip()
     repo = str(payload.get("repo") or payload.get("issue", {}).get("repo") or "").strip()
+    allows_new_file = _has_new_file_target(plan)
     parts = [
         "You are fixing a real repository bug.",
         "Return exactly one valid JSON object and nothing else.",
-        "Do not return unified diff, Markdown fences, explanations, tests, shell commands, new files, deletes, or renames.",
+        (
+            "Do not return unified diff, Markdown fences, explanations, tests, or shell commands. "
+            "Create new files only for explicit new_file targets; do not rename files. "
+            "Delete existing source lines only when the issue explicitly requires removing that implementation."
+            if allows_new_file
+            else "Do not return unified diff, Markdown fences, explanations, tests, shell commands, new files, or renames. "
+            "Delete existing source lines only when the issue explicitly requires removing that implementation."
+        ),
         'The JSON schema is {"summary": string, "edits": [{"path": string, "start": integer, "end": integer, "new_text": string}]}.',
+        "For an explicit new_file target, use start=1 and end=0 and provide the complete new file content in new_text.",
+        "To delete an existing source span, set start/end to that original span and set new_text to the empty string.",
         "The new_text value must be a valid JSON string containing replacement source only; use standard JSON newline escapes and do not double-escape them as literal \\\\n text.",
-        "Use source snippets as evidence. Edit only necessary implementation files; start/end must refer to complete original source lines from the numbered snippets.",
+        "Use source snippets as evidence. Edit only necessary implementation files; for existing files, start/end must refer to complete original source lines from the numbered snippets.",
         "Context snippets explain surrounding mechanisms and are not a request to edit those files.",
         "If an edit range includes an if/elif/else/for/while/try/except/with header, new_text must include the complete header and complete block.",
         "Keep the patch minimal and only modify implementation files that are necessary.",
@@ -297,14 +333,17 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     stripped = _strip_json_wrapping(text)
     try:
         data = json.loads(stripped)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         start = stripped.find("{")
         end = stripped.rfind("}")
         if start < 0 or end <= start:
-            raise
-        data = json.loads(stripped[start : end + 1])
+            raise CgmOutputParseError("CGM output did not contain a JSON object", raw_preview=stripped[:1200]) from exc
+        try:
+            data = json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError as inner:
+            raise CgmOutputParseError(f"CGM output JSON could not be parsed: {inner}", raw_preview=stripped[:1200]) from inner
     if not isinstance(data, dict):
-        raise ValueError("CGM output JSON must be an object")
+        raise CgmOutputParseError("CGM output JSON must be an object", raw_preview=stripped[:1200])
     return data
 
 
@@ -312,25 +351,35 @@ def _patch_from_json_output(text: str) -> dict[str, Any]:
     data = _extract_json_object(text)
     patch = data.get("patch") if isinstance(data.get("patch"), dict) else data
     if not isinstance(patch, dict):
-        raise ValueError("CGM output must contain a patch object or top-level edits")
+        raise CgmOutputParseError("CGM output must contain a patch object or top-level edits", raw_preview=text[:1200])
     edits = patch.get("edits")
     if not isinstance(edits, list) or not edits:
-        raise ValueError("CGM output JSON patch must contain a non-empty edits list")
+        raise CgmOutputParseError("CGM output JSON patch must contain a non-empty edits list", raw_preview=text[:1200])
     normalized_edits: list[dict[str, Any]] = []
     for edit in edits:
         if not isinstance(edit, dict):
-            raise ValueError("CGM edit entries must be objects")
+            raise CgmOutputParseError("CGM edit entries must be objects", raw_preview=text[:1200])
         path = str(edit.get("path") or "").strip()
+        try:
+            start = int(edit["start"])
+            end = int(edit["end"])
+        except Exception as exc:
+            raise CgmOutputParseError(f"CGM edit for {path or '<missing path>'} has invalid start/end", raw_preview=text[:1200]) from exc
         new_text = edit.get("new_text")
         if not path:
-            raise ValueError("CGM edit is missing path")
-        if not isinstance(new_text, str) or not new_text.strip():
-            raise ValueError(f"CGM edit for {path} is missing non-empty new_text")
+            raise CgmOutputParseError("CGM edit is missing path", raw_preview=text[:1200])
+        op = str(edit.get("operation") or edit.get("op") or "").strip().lower()
+        if new_text is None and op in {"delete", "remove"}:
+            new_text = ""
+        if not isinstance(new_text, str):
+            raise CgmOutputParseError(f"CGM edit for {path} is missing new_text string", raw_preview=text[:1200])
+        if start == 1 and end == 0 and not new_text.strip():
+            raise CgmOutputParseError(f"new file edit for {path} must contain complete new_text", raw_preview=text[:1200])
         normalized_edits.append(
             {
                 "path": path,
-                "start": int(edit["start"]),
-                "end": int(edit["end"]),
+                "start": start,
+                "end": end,
                 "new_text": new_text,
             }
         )
@@ -378,9 +427,9 @@ class DashScopeCgmBridge:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_output_tokens,
-            "enable_thinking": self.config.enable_thinking,
         }
         if self.config.enable_thinking:
+            body["enable_thinking"] = True
             body["stream"] = True
         headers = {
             "Content-Type": "application/json",
@@ -478,6 +527,16 @@ def create_app(bridge: DashScopeCgmBridge, *, route: str = "/generate") -> FastA
             if str(payload.get("mode") or "").strip() == "intent_review":
                 return bridge.review_intent(payload)
             return bridge.generate_patch(payload)
+        except CgmOutputParseError as exc:
+            LOGGER.warning("dashscope cgm output parse failure: %s", exc)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "cgm_output_parse_error",
+                    "message": str(exc),
+                    "raw_preview": exc.raw_preview[:1200],
+                },
+            ) from exc
         except Exception as exc:
             LOGGER.exception("dashscope cgm bridge failure")
             raise HTTPException(status_code=502, detail=str(exc)) from exc

@@ -4,11 +4,12 @@ from dataclasses import asdict, replace
 import json
 
 from graphplanner_agent.graph.expand import MECHANISM_MODES, expand, expand_with_context
+from graphplanner_agent.graph.file_discovery import discover_implementation_files, synthetic_file_node
 from graphplanner_agent.graph.grep import grep_code
 from graphplanner_agent.graph.guards import is_test_path
 from graphplanner_agent.graph.read import line_numbered
 from graphplanner_agent.graph.schema import RepoGraph
-from graphplanner_agent.graph.search import search_graph
+from graphplanner_agent.graph.search import SearchResult, search_graph
 from graphplanner_agent.env.evidence import (
     dispatch_relationship_context,
     dispatch_tables,
@@ -20,15 +21,17 @@ from graphplanner_agent.env.evidence import (
     public_node_kind,
     read_node_for_evidence,
     top_symbols_for_file,
+    value_flow_context,
 )
 from graphplanner_agent.env.repair_feedback import api_signature_failure_hint, evidence_mentions_api
 from graphplanner_agent.memory.hydration import hydrate_node_from_runtime
 from graphplanner_agent.planner.protocol import PlannerAction
-from graphplanner_agent.repair.cgm_context import build_cgm_payload, summarize_cgm_payload, validate_cgm_payload
+from graphplanner_agent.repair.cgm_context import build_cgm_payload, new_file_target_path, summarize_cgm_payload, validate_cgm_payload
 from graphplanner_agent.repair.cgm_client import CgmUnavailableError
 from graphplanner_agent.repair.patch_apply import apply_patch, normalize_patch_with_runtime, validate_patch_with_runtime
 from graphplanner_agent.repair.patch_quality import syntax_check_python
 from graphplanner_agent.repair.patch_schema import parse_cgm_output
+from graphplanner_agent.repair.patch_schema import Patch
 from graphplanner_agent.runtime.test_runner import behavior_summary
 
 
@@ -51,6 +54,24 @@ def handle_action(env, action: PlannerAction) -> dict[str, object]:
             root=env.runtime.root,
             path_glob=str(path_glob) if path_glob else None,
         )
+        if not results:
+            discovered = discover_implementation_files(
+                env.runtime,
+                query=query,
+                path_glob=str(path_glob) if path_glob else "",
+                limit=12,
+            )
+            if discovered:
+                results = [
+                    SearchResult(
+                        node=synthetic_file_node(item.path, item.line_count),
+                        score=item.score,
+                        source=item.source,
+                    )
+                    for item in discovered
+                ]
+                discovery_warning = "Graph search had no hit; runtime implementation-file discovery returned scoped file candidates."
+                warning = f"{warning}; {discovery_warning}" if warning else discovery_warning
         result_payloads = []
         for result in results:
             payload, working_node = _find_result_payload(env, result)
@@ -185,8 +206,17 @@ def handle_action(env, action: PlannerAction) -> dict[str, object]:
             issue_text=_issue_context_text(env),
             read_node_ids=_read_node_ids(env),
         )
+        flow_context, flow_nodes = value_flow_context(
+            env.graph,
+            env.runtime,
+            read,
+            read.text or "",
+            read_node_ids=_read_node_ids(env),
+        )
         for related in related_nodes:
             env.working.add(related, "relation_context:consumer_candidate_preview", 3.0, env.step_count)
+        for related in flow_nodes:
+            env.working.add(_candidate_only(related), "value_flow_context:candidate", 2.5, env.step_count)
         return {
             "tool": action.tool,
             "node": node_brief(read),
@@ -195,6 +225,12 @@ def handle_action(env, action: PlannerAction) -> dict[str, object]:
             "unread_local_symbol_references": unread_references,
             "dispatch_tables": tables,
             "dispatch_relationship_context": dispatch_context,
+            "value_flow_context": flow_context,
+            "value_flow_context_policy": (
+                "value_flow_context is best-effort implementation evidence from call expressions and signatures; "
+                "it shows upstream/downstream argument-to-parameter flow but is not a proof of runtime values. "
+                "Related caller/callee candidates are added to W; read exact nodes before memory_commit/repair."
+            ),
             "relationship_context_policy": (
                 "consumer candidates are auto-added to W as orientation code only; read the exact node before memory_commit/repair evidence"
             ),
@@ -294,6 +330,21 @@ def handle_action(env, action: PlannerAction) -> dict[str, object]:
 
     if action.tool == "repair":
         return _repair(env, action)
+
+    if action.tool == "repair_propose":
+        return _repair(env, action, propose=True)
+
+    if action.tool == "repair_revise":
+        return _repair(env, action, propose=True, revise=True)
+
+    if action.tool == "repair_submit":
+        return _repair_submit(env, action)
+
+    if action.tool == "discard_pending_patch":
+        return _discard_pending_patch(env, action)
+
+    if action.tool == "repair_chunk":
+        return _repair(env, action, chunk=True)
 
     return {"tool": action.tool, "blocked": True, "reason": "unhandled tool"}
 
@@ -432,27 +483,141 @@ def _node_alias_matches(node, key: str) -> bool:
     return key_lower in {part.lower() for part in (node.id, name, path)}
 
 
-def _repair(env, action: PlannerAction) -> dict[str, object]:
+def _repair_submit(env, action: PlannerAction) -> dict[str, object]:
+    patch = env.pending_patch
+    if not isinstance(patch, Patch):
+        return {"tool": "repair_submit", "blocked": True, "reason": "repair_submit requires a pending patch"}
+    origin = env.pending_patch_origin if isinstance(env.pending_patch_origin, dict) else {}
+    memory_ids = [str(node_id) for node_id in origin.get("memory_node_ids", [])] or list(env.memory.nodes)
+    target_nodes = [str(node_id) for node_id in origin.get("target_nodes", [])]
+    patch_preview = _patch_preview(patch)
+    snapshot = env.runtime.snapshot(patch.touched_paths)
+    apply_patch(env.runtime, patch)
+    syntax = syntax_check_python(env.runtime, patch)
+    if syntax and not syntax.passed:
+        env.runtime.rollback(snapshot)
+        env.repair_feedback = (
+            "syntax_failed: submitted pending patch was syntactically invalid and rolled back; "
+            f"compiler excerpt: {syntax.summary()}"
+        )
+        env.pending_patch = None
+        env.pending_patch_origin = None
+        return _finish_repair(
+            env,
+            {
+                "tool": "repair_submit",
+                "status": "syntax_failed",
+                "rolled_back": True,
+                "reason": "submitted pending patch was syntactically invalid",
+                "summary": syntax.summary(),
+                "error_origin": "pending_patch",
+                "source_tree_state": "rolled_back_to_original",
+                "submit_decision": str(action.params.get("decision") or "").strip(),
+                "patch_preview": patch_preview,
+                "cgm_response": origin.get("cgm_response"),
+            },
+            memory_ids,
+            target_nodes,
+        )
+    test = env.runtime.run_fail_to_pass(env.task)
+    if test.passed:
+        env.verified = True
+        env.done = True
+        env.status = "pass"
+        env.pending_patch = None
+        env.pending_patch_origin = None
+        env.repair_feedback = f"verified pending patch applied: {patch.summary}"
+        return _finish_repair(
+            env,
+            {
+                "tool": "repair_submit",
+                "status": "passed",
+                "rolled_back": False,
+                "done": True,
+                "touched_paths": patch.touched_paths,
+                "summary": patch.summary,
+                "submit_decision": str(action.params.get("decision") or "").strip(),
+                "test_summary": behavior_summary(test),
+                "patch_preview": patch_preview,
+                "cgm_response": origin.get("cgm_response"),
+            },
+            memory_ids,
+            target_nodes,
+        )
+    env.runtime.rollback(snapshot)
+    env.pending_patch = None
+    env.pending_patch_origin = None
+    if test.status == "infra_bug":
+        env.done = True
+        env.status = "bug"
+    env.repair_feedback = (
+        "test_failed and rolled back: submitted pending patch applied but fail-to-pass behavior is still wrong. "
+        "Use recent_repair_attempts, recent_cgm_insights, and failure_feedback before generating another candidate."
+    )
+    return _finish_repair(
+        env,
+        {
+            "tool": "repair_submit",
+            "status": "test_failed" if test.status != "infra_bug" else "infra_bug",
+            "rolled_back": True,
+            "done": test.status == "infra_bug",
+            "touched_paths": patch.touched_paths,
+            "summary": patch.summary,
+            "submit_decision": str(action.params.get("decision") or "").strip(),
+            "test_summary": behavior_summary(test),
+            "error_origin": "generated_patch_behavior" if test.status != "infra_bug" else "test_infra",
+            "source_tree_state": "rolled_back_to_original",
+            "patch_preview": patch_preview,
+            "cgm_response": origin.get("cgm_response"),
+        },
+        memory_ids,
+        target_nodes,
+    )
+
+
+def _discard_pending_patch(env, action: PlannerAction) -> dict[str, object]:
+    summary = _pending_patch_summary(env)
+    reason = str(action.params.get("reason") or "").strip()
+    env.pending_patch = None
+    env.pending_patch_origin = None
+    env.repair_feedback = f"pending patch discarded: {reason or 'planner discarded candidate patch'}"
+    return {
+        "tool": "discard_pending_patch",
+        "status": "discarded",
+        "reason": reason,
+        "discarded_patch": summary,
+        "source_tree_state": "unchanged",
+    }
+
+
+def _repair(env, action: PlannerAction, *, chunk: bool = False, propose: bool = False, revise: bool = False) -> dict[str, object]:
+    tool_name = "repair_revise" if revise else "repair_propose" if propose else "repair_chunk" if chunk else "repair"
     if env.config.require_failed_test_before_repair and env.failure_summary is None:
-        return {"tool": "repair", "blocked": True, "reason": "run_failed_test is required before repair"}
+        return {"tool": tool_name, "blocked": True, "reason": f"run_failed_test is required before {tool_name}"}
     if not env.memory.nodes:
-        return {"tool": "repair", "blocked": True, "reason": "repair requires at least one committed memory node with code"}
+        return {"tool": tool_name, "blocked": True, "reason": f"{tool_name} requires at least one committed memory node with code"}
     missing = [node.id for node in env.memory.nodes.values() if not node.has_code]
     if missing:
-        return {"tool": "repair", "blocked": True, "reason": f"memory nodes lack code bodies: {missing}"}
+        return {"tool": tool_name, "blocked": True, "reason": f"memory nodes lack code bodies: {missing}"}
     contract_errors = _repair_contract_errors(env, action.params)
     if contract_errors:
         return {
-            "tool": "repair",
+            "tool": tool_name,
             "blocked": True,
             "reason": "; ".join(contract_errors),
             "contract_errors": contract_errors,
             "suggested_next_actions": _repair_blocked_guidance(action.params, contract_errors),
         }
     plan = _repair_plan_text(action.params)
+    if chunk:
+        plan = _chunk_plan_text(plan, action.params)
+    if propose:
+        plan = _propose_plan_text(plan, action.params, revise=revise)
     confidence = _confidence(action.params.get("confidence"))
     memory_ids = list(env.memory.nodes)
     target_nodes = [str(node_id) for node_id in action.params.get("target_nodes", [])]
+    pending_patch_summary = _pending_patch_summary(env) if revise else None
+    planner_decision_context = _planner_decision_context(action.params, tool_name, pending_patch_summary)
     payload = build_cgm_payload(
         env.task,
         env.graph,
@@ -463,7 +628,17 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         env.repair_feedback,
         env.config.max_patch_edits,
         target_node_ids=target_nodes,
+        repair_history=env.repair_attempts,
+        pending_patch=pending_patch_summary,
+        cgm_insights=env.cgm_insights,
+        planner_decision_context=planner_decision_context,
     )
+    if revise and env.pending_patch is None:
+        return {
+            "tool": tool_name,
+            "blocked": True,
+            "reason": "repair_revise requires an existing pending_patch from repair_propose or a prior repair_revise",
+        }
     payload_errors = validate_cgm_payload(payload)
     payload_summary = summarize_cgm_payload(payload)
     if payload_errors:
@@ -471,7 +646,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         return _finish_repair(
             env,
             {
-                "tool": "repair",
+                "tool": tool_name,
                 "status": "patch_rejected",
                 "reason": env.repair_feedback,
                 "error_origin": "cgm_payload_validation",
@@ -492,7 +667,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         return _finish_repair(
             env,
             {
-                "tool": "repair",
+                "tool": tool_name,
                 "status": "infra_retryable",
                 "retryable": True,
                 "done": False,
@@ -509,7 +684,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         return _finish_repair(
             env,
             {
-                "tool": "repair",
+                "tool": tool_name,
                 "status": "patch_rejected",
                 "reason": env.repair_feedback,
                 "error_origin": "cgm_generation",
@@ -525,7 +700,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         return _finish_repair(
             env,
             {
-                "tool": "repair",
+                "tool": tool_name,
                 "status": "patch_rejected",
                 "reason": protocol_error,
                 "error_origin": "cgm_output_protocol",
@@ -543,7 +718,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         return _finish_repair(
             env,
             {
-                "tool": "repair",
+                "tool": tool_name,
                 "status": "patch_rejected",
                 "reason": str(exc),
                 "error_origin": "cgm_patch_schema",
@@ -568,7 +743,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
             return _finish_repair(
                 env,
                 {
-                    "tool": "repair",
+                    "tool": tool_name,
                     "status": "patch_rejected",
                     "reason": decision.reason,
                     "error_origin": error_origin,
@@ -590,7 +765,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
         return _finish_repair(
             env,
             {
-                "tool": "repair",
+                "tool": tool_name,
                 "status": "patch_rejected",
                 "reason": "duplicate patch attempt",
                 "error_origin": "duplicate_patch",
@@ -638,7 +813,7 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
             return _finish_repair(
                 env,
                 {
-                    "tool": "repair",
+                    "tool": tool_name,
                     "status": "syntax_failed",
                     "rolled_back": True,
                     "reason": "generated patch was syntactically invalid and rolled back; original source remains unchanged",
@@ -653,6 +828,65 @@ def _repair(env, action: PlannerAction) -> dict[str, object]:
                 memory_ids,
                 target_nodes,
             )
+    if chunk:
+        env.repair_feedback = (
+            f"repair_chunk applied and kept: {patch.summary}. "
+            "This chunk has not been judged by fail-to-pass/PASS_TO_PASS tests; continue with the next chunk or call repair for final verification."
+        )
+        return _finish_repair(
+            env,
+            {
+                "tool": tool_name,
+                "status": "chunk_applied",
+                "rolled_back": False,
+                "done": False,
+                "touched_paths": patch.touched_paths,
+                "summary": patch.summary,
+                "source_tree_state": "patched_unverified_chunk",
+                "remaining_work": str(action.params.get("remaining_work") or "").strip(),
+                "cgm_payload": payload_summary,
+                "patch_preview": patch_preview,
+                "cgm_response": cgm_response,
+            },
+            memory_ids,
+            target_nodes,
+        )
+    if propose:
+        env.runtime.rollback(snapshot)
+        env.pending_patch = patch
+        env.pending_patch_origin = {
+            "tool": tool_name,
+            "status": "patch_proposed",
+            "summary": patch.summary,
+            "memory_node_ids": sorted(str(node_id) for node_id in memory_ids),
+            "target_nodes": sorted(str(node_id) for node_id in target_nodes),
+            "planner_decision_context": planner_decision_context,
+            "patch_preview": patch_preview,
+            "cgm_response": cgm_response,
+        }
+        env.repair_feedback = (
+            f"{tool_name} produced a pending patch: {patch.summary}. "
+            "Planner must inspect pending_patch_summary and choose repair_submit, repair_revise, discard_pending_patch, or read more code before testing."
+        )
+        return _finish_repair(
+            env,
+            {
+                "tool": tool_name,
+                "status": "patch_proposed",
+                "rolled_back": True,
+                "done": False,
+                "touched_paths": patch.touched_paths,
+                "summary": patch.summary,
+                "source_tree_state": "unchanged_pending_patch_saved",
+                "cgm_payload": payload_summary,
+                "patch_preview": patch_preview,
+                "pending_patch_summary": _pending_patch_summary(env),
+                "cgm_response": cgm_response,
+            },
+            memory_ids,
+            target_nodes,
+        )
+
     test = env.runtime.run_fail_to_pass(env.task)
     if test.passed:
         env.verified = True
@@ -762,6 +996,10 @@ def _repair_review(env, action: PlannerAction) -> dict[str, object]:
         env.repair_feedback,
         env.config.max_patch_edits,
         target_node_ids=target_nodes,
+        repair_history=env.repair_attempts,
+        pending_patch=_pending_patch_summary(env),
+        cgm_insights=env.cgm_insights,
+        planner_decision_context=_planner_decision_context(action.params, "repair_review", None),
     )
     payload["mode"] = "intent_review"
     payload["review_request"] = {
@@ -865,12 +1103,22 @@ def _repair_contract_errors(env, params: dict[str, object], *, allow_failed_same
     memory_ids = set(env.memory.nodes)
     read_ids = _read_node_ids(env)
     for node_id in target_nodes:
-        if node_id not in memory_ids:
+        if new_file_target_path(node_id):
+            continue
+        if node_id.startswith("new_file:"):
+            errors.append(f"invalid new_file target path: {node_id}")
+        elif node_id not in memory_ids:
             errors.append(f"target node is not in repair memory M: {node_id}")
     for node_id in chain_node_ids:
+        if new_file_target_path(node_id):
+            continue
         if node_id not in read_ids:
             errors.append(f"evidence_chain node is not a read/committed code node: {node_id}")
-    missing_targets_from_chain = [node_id for node_id in target_nodes if node_id not in chain_node_ids]
+    missing_targets_from_chain = [
+        node_id
+        for node_id in target_nodes
+        if node_id not in chain_node_ids and not new_file_target_path(node_id)
+    ]
     if missing_targets_from_chain:
         errors.append(f"target_nodes must appear in evidence_chain: {missing_targets_from_chain}")
 
@@ -967,6 +1215,8 @@ def _repair_blocked_guidance(params: dict[str, object], errors: list[str]) -> li
         guidance.append("Commit the patch target node into repair_memory_M before repair.")
     if "evidence_chain node is not a read/committed code node" in joined:
         guidance.append("Read or locate every evidence_chain node_id that is not already code-bearing in W/M, then retry with those exact ids.")
+    if "test_behavior" in joined:
+        guidance.append("Do not use test_behavior as an evidence_chain node_id; put runtime/test symptoms only in failure_seen, then use read code node ids and any explicit new_file target in evidence_chain.")
     if "target_nodes must appear in evidence_chain" in joined:
         guidance.append("Add each target node to evidence_chain with a short evidence sentence explaining why it is the patch locus.")
     if "confidence" in joined:
@@ -1014,6 +1264,48 @@ def _repair_plan_text(params: dict[str, object]) -> str:
     return "\n\n".join(f"{title}:\n{body}" for title, body in sections if body)
 
 
+def _chunk_plan_text(plan: str, params: dict[str, object]) -> str:
+    remaining = str(params.get("remaining_work") or "").strip()
+    chunk_rules = [
+        "Generate only this chunk. Do not solve unrelated parts of the issue in this response.",
+        "The chunk must be internally coherent and should leave the repository in a syntactically valid state.",
+        "Final fail-to-pass/PASS_TO_PASS verification will happen in a later ordinary repair action.",
+    ]
+    if remaining:
+        chunk_rules.append(f"Known remaining work after this chunk: {remaining}")
+    return plan.rstrip() + "\n\nChunk mode:\n" + "\n".join(f"- {item}" for item in chunk_rules)
+
+
+def _propose_plan_text(plan: str, params: dict[str, object], *, revise: bool = False) -> str:
+    rules = [
+        "Generate a candidate patch only; the planner will inspect it before tests run.",
+        "Return a concise insight_summary if the service schema supports it.",
+        "Do not repeat recent failed patch strategies from repair_history or cgm_insights.",
+    ]
+    if revise:
+        focus = str(params.get("revision_focus") or "").strip()
+        review = params.get("pending_patch_review") or {}
+        rules.extend(
+            [
+                "Revise the current pending patch instead of producing an unrelated patch.",
+                f"Revision focus: {focus}",
+                "Planner pending patch review: " + json.dumps(review, ensure_ascii=False, sort_keys=True),
+            ]
+        )
+    return plan.rstrip() + "\n\nPatch deliberation mode:\n" + "\n".join(f"- {item}" for item in rules if item)
+
+
+def _planner_decision_context(params: dict[str, object], tool_name: str, pending_patch: dict[str, object] | None) -> dict[str, object]:
+    context: dict[str, object] = {"tool": tool_name}
+    for key in ("revision_focus", "pending_patch_review", "remaining_work"):
+        value = params.get(key)
+        if value:
+            context[key] = value
+    if pending_patch:
+        context["pending_patch"] = pending_patch
+    return context
+
+
 def _format_evidence_chain(value: object) -> str:
     if not isinstance(value, list):
         return ""
@@ -1045,6 +1337,19 @@ def _patch_preview(patch) -> dict[str, object]:
             for edit in patch.edits[:8]
         ],
         "edit_count": len(patch.edits),
+    }
+
+
+def _pending_patch_summary(env) -> dict[str, object] | None:
+    patch = getattr(env, "pending_patch", None)
+    if not isinstance(patch, Patch):
+        return None
+    origin = getattr(env, "pending_patch_origin", None)
+    return {
+        "summary": patch.summary,
+        "touched_paths": patch.touched_paths,
+        "patch_preview": _patch_preview(patch),
+        "origin": _compact_result_value(origin, 1800) if isinstance(origin, dict) else None,
     }
 
 
@@ -1116,7 +1421,7 @@ def _compact_cgm_response(raw: object) -> dict[str, object] | None:
         return None
     reasoning = raw.get("reasoning_content")
     reasoning_text = reasoning if isinstance(reasoning, str) else ""
-    return {
+    compact = {
         "model": raw.get("model"),
         "output_format": raw.get("output_format"),
         "thinking_enabled": raw.get("thinking_enabled"),
@@ -1124,6 +1429,31 @@ def _compact_cgm_response(raw: object) -> dict[str, object] | None:
         "reasoning_preview": _truncate_feedback(str(raw.get("reasoning_preview") or reasoning_text), 1200) if reasoning_text or raw.get("reasoning_preview") else None,
         "raw_preview": _truncate_feedback(str(raw.get("raw_preview") or ""), 1200) if raw.get("raw_preview") else None,
     }
+    if isinstance(raw.get("insight_summary"), dict):
+        compact["insight_summary"] = _compact_result_value(raw.get("insight_summary"), 1400)
+    return compact
+
+
+def _cgm_insight(raw_response: object, compact_response: dict[str, object] | None, patch_preview: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(raw_response, dict) and not compact_response:
+        return None
+    explicit = raw_response.get("insight_summary") if isinstance(raw_response, dict) else None
+    if explicit is None and isinstance(compact_response, dict):
+        explicit = compact_response.get("insight_summary")
+    if isinstance(explicit, dict):
+        insight = dict(explicit)
+    else:
+        insight = {}
+    if patch_preview and "patch_summary" not in insight:
+        insight["patch_summary"] = patch_preview.get("summary")
+        insight["touched_paths"] = sorted({str(edit.get("path")) for edit in patch_preview.get("edits", []) if isinstance(edit, dict) and edit.get("path")})
+        insight["edit_count"] = patch_preview.get("edit_count")
+    if compact_response:
+        insight.setdefault("model", compact_response.get("model"))
+        insight.setdefault("output_format", compact_response.get("output_format"))
+        if compact_response.get("reasoning_preview") and "reasoning_summary" not in insight:
+            insight["reasoning_summary"] = compact_response.get("reasoning_preview")
+    return _compact_result_value(insight, 1800) if insight else None
 
 
 def _compact_cgm_review(raw: object) -> dict[str, object]:
@@ -1360,6 +1690,30 @@ def _finish_repair(env, result: dict[str, object], memory_ids: list[str], target
     failure_feedback = _repair_failure_feedback(result)
     if failure_feedback:
         result["failure_feedback"] = failure_feedback
+    patch_preview = result.get("patch_preview") if isinstance(result.get("patch_preview"), dict) else None
+    cgm_response = result.get("cgm_response") if isinstance(result.get("cgm_response"), dict) else None
+    if patch_preview or status in {"patch_rejected", "syntax_failed", "test_failed", "infra_bug", "passed", "patch_proposed"}:
+        attempt = {
+            "status": status,
+            "tool": result.get("tool"),
+            "summary": result.get("summary"),
+            "touched_paths": result.get("touched_paths"),
+            "error_origin": result.get("error_origin"),
+            "rolled_back": result.get("rolled_back"),
+            "source_tree_state": result.get("source_tree_state"),
+            "memory_node_ids": sorted(str(node_id) for node_id in memory_ids),
+            "target_nodes": sorted(str(node_id) for node_id in target_nodes),
+            "patch_preview": _compact_result_value(patch_preview, 2500) if patch_preview else None,
+            "failure_feedback": failure_feedback,
+        }
+        env.repair_attempts.append(_compact_result_value(attempt, 3600))
+        del env.repair_attempts[:-5]
+    insight = _cgm_insight(result.get("cgm_response_raw"), cgm_response, patch_preview)
+    if insight is None:
+        insight = _cgm_insight(result.get("cgm_response"), cgm_response, patch_preview)
+    if insight:
+        env.cgm_insights.append(insight)
+        del env.cgm_insights[:-5]
     env.repair_history.record_outcome(status, memory_ids, str(result.get("error_origin") or "") or None)
     env.last_repair_attempt = {
         "status": status,

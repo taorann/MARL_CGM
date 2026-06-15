@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
+from .file_discovery import CODE_EXTENSIONS
 from .guards import is_test_path
 from .schema import GraphNode, RepoGraph
 
@@ -105,7 +106,9 @@ def _filesystem_fallback(
     if not clean_terms:
         return []
     hits: dict[str, SearchResult] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in CODE_EXTENSIONS:
+            continue
         rel = path.relative_to(root).as_posix()
         if is_test_path(rel):
             continue

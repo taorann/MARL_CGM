@@ -135,10 +135,39 @@ class RemoteSweSession:
 
     def _remote_env_prefix(self) -> str:
         repo = shlex.quote(self.remote_repo)
-        parts = [f"GP_NUM_RUNNERS={int(self.num_runners)}"]
+        parts = [
+            f"GP_NUM_RUNNERS={int(self.num_runners)}",
+            "PYTHONDONTWRITEBYTECODE=1",
+            f"GRAPHPLANNER_REMOTE_REPO={repo}",
+            f"GP_REMOTE_REPO={repo}",
+        ]
+        queue_root = (
+            os.environ.get("GRAPHPLANNER_SANDBOX_QUEUE_ROOT")
+            or os.environ.get("GP_QUEUE_ROOT")
+            or os.environ.get("QUEUE_ROOT")
+        )
+        if queue_root:
+            parts.append(f"QUEUE_ROOT={shlex.quote(queue_root)}")
+        share_root = (
+            os.environ.get("GRAPHPLANNER_SANDBOX_SHARE_ROOT")
+            or os.environ.get("GP_SHARE_ROOT")
+            or os.environ.get("SHARE_ROOT")
+        )
+        if share_root:
+            parts.append(f"SHARE_ROOT={shlex.quote(share_root)}")
         if self.sif_dir:
             sif_dir = shlex.quote(self.sif_dir)
             parts.extend([f"GP_SIF_DIR={sif_dir}", f"SIF_DIR={sif_dir}"])
+        for name in (
+            "GRAPHPLANNER_REMOTE_HEARTBEAT_TTL_SEC",
+            "GP_ENSURE_RUNNER_HEARTBEAT_TTL_SEC",
+            "GP_ENSURE_RUNNER_GRACE_SEC",
+            "RUNNER_PARTITION",
+            "RUNNER_QOS",
+        ):
+            value = os.environ.get(name)
+            if value:
+                parts.append(f"{name}={shlex.quote(value)}")
         parts.append(f"PYTHONPATH=$PYTHONPATH:{repo}")
         return " ".join(parts)
 

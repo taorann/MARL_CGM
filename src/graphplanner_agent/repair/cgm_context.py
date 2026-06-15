@@ -9,6 +9,9 @@ from graphplanner_agent.graph.schema import GraphNode, RepoGraph
 from graphplanner_agent.memory.cgm_memory import CgmMemory
 
 
+NEW_FILE_TARGET_PREFIX = "new_file:"
+
+
 def build_cgm_payload(
     task: TaskSpec,
     graph: RepoGraph,
@@ -19,12 +22,18 @@ def build_cgm_payload(
     prior_feedback: str | None,
     max_edits: int,
     target_node_ids: list[str] | None = None,
+    repair_history: list[dict[str, object]] | None = None,
+    pending_patch: dict[str, object] | None = None,
+    cgm_insights: list[dict[str, object]] | None = None,
+    planner_decision_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
     nodes = list(memory.nodes.values())
     memory_node_ids = {node.id for node in nodes}
     target_ids = [str(node_id).strip() for node_id in (target_node_ids or []) if str(node_id).strip()]
     target_id_set = set(target_ids)
-    target_nodes = [node for node in nodes if node.id in target_id_set] if target_id_set else nodes
+    new_file_targets = [_new_file_target_node(node_id) for node_id in target_ids if new_file_target_path(node_id)]
+    memory_targets = [node for node in nodes if node.id in target_id_set] if target_id_set else nodes
+    target_nodes = memory_targets + new_file_targets if target_id_set else nodes
     dispatch_facts = _memory_dispatch_tables(graph, memory)
     hydrated_nodes = [(node, _raw_source_text(node.text or "", node.start_line)) for node in nodes if node.text]
     snippet_nodes = _snippet_nodes(hydrated_nodes, target_id_set)
@@ -79,6 +88,10 @@ def build_cgm_payload(
         task.fail_to_pass,
         dispatch_facts,
         target_nodes,
+        repair_history=repair_history,
+        pending_patch=pending_patch,
+        cgm_insights=cgm_insights,
+        planner_decision_context=planner_decision_context,
     )
     return {
         "issue": {
@@ -86,7 +99,7 @@ def build_cgm_payload(
             "title": task.issue_title,
             "body": _issue_body(task),
             "repo": _repo_name(task),
-            "language": "python",
+            "language": _language(task),
         },
         "plan": {
             "targets": [
@@ -109,11 +122,11 @@ def build_cgm_payload(
         "answer": "",
         "task": "issue_fix",
         "repo": _repo_name(task),
-        "language": "python",
+        "language": _language(task),
         "subgraph": graph_nodes,
         "graph": {
             "reponame": _repo_name(task),
-            "language": "python",
+            "language": _language(task),
             "nodes": graph_nodes,
             "edges": graph_edges,
             "adjacency_edges": graph_edges,
@@ -122,6 +135,10 @@ def build_cgm_payload(
         "snippets": snippets,
         "serialized_code": serialized_code,
         "code_facts": {"dispatch_tables": dispatch_facts},
+        "repair_history": list(repair_history or [])[-5:],
+        "pending_patch": pending_patch,
+        "cgm_insights": list(cgm_insights or [])[-5:],
+        "planner_decision_context": planner_decision_context or {},
         "metadata": {
             "constraints": constraints,
             "output_format": "unified_diff",
@@ -194,6 +211,9 @@ def summarize_cgm_payload(payload: dict[str, object]) -> dict[str, object]:
         "dispatch_table_count": len(payload.get("code_facts", {}).get("dispatch_tables", []))
         if isinstance(payload.get("code_facts"), dict)
         else 0,
+        "repair_history_count": len(payload.get("repair_history", [])) if isinstance(payload.get("repair_history"), list) else 0,
+        "cgm_insight_count": len(payload.get("cgm_insights", [])) if isinstance(payload.get("cgm_insights"), list) else 0,
+        "pending_patch_present": isinstance(payload.get("pending_patch"), dict),
         "node_paths": sorted({str(node.get("path", "")) for node in nodes if isinstance(node, dict)}),
     }
 
@@ -328,19 +348,29 @@ def _raw_source_text(text: str, start_line: int) -> str:
 
 def _cgm_prompt(max_edits: int, target_nodes: list[object]) -> str:
     paths = []
+    new_paths = []
     for node in target_nodes:
         path = str(getattr(node, "path", "") or "").strip()
         if path and path not in paths:
             paths.append(path)
+        if str(getattr(node, "kind", "") or "") == "new_file" and path and path not in new_paths:
+            new_paths.append(path)
     guide_lines = [
         "Generate a minimal implementation patch for the issue using the provided target code and graph context.",
         "Return exactly one complete unified diff and nothing else.",
-        "Use only editable target files and exact paths from snippets.",
+        "Use only editable target files and exact paths from listed targets/snippets.",
         "Keep the patch minimal and syntactically valid.",
-        "Do not output markdown, prose, JSON, shell commands, logs, tests, reproduction scripts, new files, deletes, or renames.",
+        "Do not output markdown, prose, JSON, shell commands, logs, tests, or reproduction scripts.",
         "Source snippets and graph node text are authoritative.",
+        "If repair_history, pending_patch, or cgm_insights are provided, use them to avoid repeating failed strategies.",
+        "Also include a concise insight_summary when supported by the service response schema.",
         f"Maximum edits: {max_edits}.",
     ]
+    if new_paths:
+        guide_lines.append("New files are allowed only for these explicit new_file targets: " + ", ".join(new_paths[:6]) + ".")
+        guide_lines.append("Do not create any other new files, deletes, or renames.")
+    else:
+        guide_lines.append("Do not output new files, deletes, or renames.")
     if paths:
         guide_lines.append("Editable target files: " + ", ".join(paths[:6]) + ".")
     return "\n".join(guide_lines).strip()
@@ -351,6 +381,44 @@ def _repo_name(task: TaskSpec) -> str:
     if isinstance(repo, str) and repo.strip():
         return repo.strip().split("/")[-1]
     return task.repo_path.name or "repo"
+
+
+def _language(task: TaskSpec) -> str:
+    meta = task.metadata if isinstance(task.metadata, dict) else {}
+    pro = meta.get("swebench_pro") if isinstance(meta.get("swebench_pro"), dict) else {}
+    for value in (
+        pro.get("repo_language") if isinstance(pro, dict) else None,
+        meta.get("repo_language"),
+        meta.get("language"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return "python"
+
+
+def new_file_target_path(node_id: str) -> str | None:
+    value = str(node_id or "").strip()
+    if not value.startswith(NEW_FILE_TARGET_PREFIX):
+        return None
+    path = value[len(NEW_FILE_TARGET_PREFIX) :].strip().replace("\\", "/")
+    if not path or path.startswith("/") or ".." in path.split("/") or is_test_path(path):
+        return None
+    return path
+
+
+def _new_file_target_node(node_id: str) -> GraphNode:
+    path = new_file_target_path(node_id)
+    if not path:
+        raise ValueError(f"invalid new file target: {node_id}")
+    return GraphNode(
+        id=str(node_id).strip(),
+        kind="new_file",
+        name=path.rsplit("/", 1)[-1],
+        path=path,
+        start_line=1,
+        end_line=0,
+        preview="issue-required implementation file does not exist yet",
+    )
 
 
 def _issue_body(task: TaskSpec) -> str:
@@ -386,6 +454,10 @@ def _plan_text(
     fail_to_pass: list[str],
     dispatch_facts: list[dict[str, object]],
     target_nodes: list[object],
+    repair_history: list[dict[str, object]] | None = None,
+    pending_patch: dict[str, object] | None = None,
+    cgm_insights: list[dict[str, object]] | None = None,
+    planner_decision_context: dict[str, object] | None = None,
 ) -> str:
     sections: list[str] = []
     if target_nodes:
@@ -405,6 +477,14 @@ def _plan_text(
         sections.append("Useful memory notes:\n" + "\n".join(f"- {note}" for note in memory.notes[-2:]))
     if prior_feedback:
         sections.append("Avoid repeating prior failed patch pattern:\n" + prior_feedback.strip())
+    if repair_history:
+        sections.append("Recent patch history shared with planner and CGM:\n" + _clip_text(json.dumps(repair_history[-5:], ensure_ascii=False, sort_keys=True), 1800))
+    if cgm_insights:
+        sections.append("Recent CGM insight summaries:\n" + _clip_text(json.dumps(cgm_insights[-5:], ensure_ascii=False, sort_keys=True), 1400))
+    if pending_patch:
+        sections.append("Current pending patch to inspect/revise/submit:\n" + _clip_text(json.dumps(pending_patch, ensure_ascii=False, sort_keys=True), 1600))
+    if planner_decision_context:
+        sections.append("Planner decision context for this CGM call:\n" + _clip_text(json.dumps(planner_decision_context, ensure_ascii=False, sort_keys=True), 1200))
     return "\n\n".join(section for section in sections if section.strip())
 
 

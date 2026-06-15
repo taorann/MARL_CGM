@@ -31,6 +31,12 @@ class ExpandedNode:
 def expand(graph: RepoGraph, anchor: str, expand_mode: str = "related", limit: int = 12) -> list[GraphNode]:
     if anchor not in graph.nodes:
         return []
+    if expand_mode == "callers":
+        ids = [edge.source for edge in graph.edges if edge.type == "CALLS" and edge.target == anchor]
+        return [graph.nodes[nid] for nid in ids if nid in graph.nodes and not is_test_path(graph.nodes[nid].path)][:limit]
+    if expand_mode == "callees":
+        ids = [edge.target for edge in graph.edges if edge.type == "CALLS" and edge.source == anchor]
+        return [graph.nodes[nid] for nid in ids if nid in graph.nodes and not is_test_path(graph.nodes[nid].path)][:limit]
     modes = MODE_TO_EDGES.get(expand_mode, MODE_TO_EDGES["related"])
     return [node for node in graph.neighbors(anchor, modes) if not is_test_path(node.path)][:limit]
 

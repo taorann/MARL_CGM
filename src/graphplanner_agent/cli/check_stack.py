@@ -175,7 +175,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check planner and CGM connectivity for the rebuild.")
     parser.add_argument("--planner-endpoint")
     parser.add_argument("--planner-model")
-    parser.add_argument("--cgm-backend", choices=["mock", "http"])
+    parser.add_argument("--cgm-backend", choices=["mock", "http", "dashscope"])
     parser.add_argument("--cgm-endpoint")
     parser.add_argument("--sandbox-backend", choices=["local", "remote_swe"])
     parser.add_argument("--sandbox-ssh-target")

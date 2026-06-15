@@ -86,7 +86,7 @@ PYTHONPATH=src python -m graphplanner_agent.cli.check_stack \
   --cgm-backend mock \
   --sandbox-backend remote_swe \
   --remote-swe-smoke \
-  --remote-swe-image /appsnew/home/chongbin_pkuhpc/chongbin_cls/sif/sweb/example.sif
+  --remote-swe-image /lustre3/chongbin_pkuhpc/chongbin_cls/graphplanner_sif/sweb/example.sif
 ```
 
 To exercise every container-backed operation, including read/write, snapshot,
@@ -98,12 +98,24 @@ PYTHONPATH=src python -m graphplanner_agent.cli.check_stack \
   --cgm-backend mock \
   --sandbox-backend remote_swe \
   --remote-swe-full-smoke \
-  --remote-swe-image /appsnew/home/chongbin_pkuhpc/chongbin_cls/sif/sweb/example.sif
+  --remote-swe-image /lustre3/chongbin_pkuhpc/chongbin_cls/graphplanner_sif/sweb/example.sif
 ```
 
 Remote repo graph payloads are cached locally under `runs/graph_cache` by
 default. Set `GRAPHPLANNER_GRAPH_CACHE_DIR` to move the cache, or
 `GRAPHPLANNER_DISABLE_GRAPH_CACHE=1` to force fresh remote graph builds.
+
+For the current portable workflow, runtime code copied to the remote sandbox is
+vendored under `remote_runtime/` and synced by `scripts/sync_remote_runtime_code.sh`.
+SWE-bench and SWE-bench Pro launch scripts run that sync before graph/test work.
+Container images and large caches stay outside git, normally under:
+
+```text
+/lustre3/chongbin_pkuhpc/chongbin_cls/graphplanner_sif/
+```
+
+Copy `.planner_dashscope.env.example` to `.planner_dashscope.env` and fill local
+secrets before running real planner/CGM jobs. The real env file is ignored by git.
 
 ## Implemented
 
@@ -111,11 +123,12 @@ default. Set `GRAPHPLANNER_GRAPH_CACHE_DIR` to move the cache, or
 - Local sandbox runtime with read/run/snapshot/rollback/test.
 - Python AST graph build/search/expand/read plus filesystem fallback mapped to graph nodes.
 - W/M/T memory and hydration before CGM.
-- CGM payload builder, mock/http clients, and payload validation.
+- CGM payload builder, mock/http/DashScope clients, and payload validation.
 - JSON edit and simple unified-diff patch normalization.
 - Patch validation, syntax check, fail-to-pass retest, rollback on failure.
 - JSONL/Markdown telemetry and progress summaries.
 - Remote SWE SSH/proxy backend for Slurm/Apptainer runners.
+- Portable remote runtime bundle under `remote_runtime/`.
 - Direct `.sif` reference normalization for remote SWE tasks.
 - Remote SWE full-smoke CLI and local graph payload cache.
 - SWE-bench-style task metadata and selector loading.
@@ -123,16 +136,18 @@ default. Set `GRAPHPLANNER_GRAPH_CACHE_DIR` to move the cache, or
 
 ## Deployment Notes
 
-- The current real CGM service is expected to run inside this same container by
-  default, typically at `http://127.0.0.1:30001/generate`.
+- The current default real CGM backend is DashScope direct mode:
+  `CGM_BACKEND=dashscope`. It does not require a local CodeFuse-CGM HTTP service
+  or bridge process.
+- The HTTP CGM backend remains available for compatibility by setting
+  `CGM_BACKEND=http` and `CGM_ENDPOINT=...`.
 - Older traces under `runs/tmp/` may still mention historical remote CGM
   endpoints such as `172.*:30001`; treat those as archival run metadata, not as
   the current deployment recommendation.
 
 ## Still To Build
 
-- Full SWE-bench metadata loader and selector enrichment.
-- Docker/local Apptainer runtimes and real remote_swe image-level smoke.
+- Docker/local Apptainer runtimes beyond the current remote Slurm/Apptainer path.
 - Tree-sitter graph frontend and richer call resolution.
 - Full git-diff parser for complex rename/binary/multi-file edge cases.
 - Broader real CGM graph-runtime self-check coverage on top of the current

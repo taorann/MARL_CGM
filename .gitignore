@@ -1,6 +1,8 @@
 .planner_dashscope.env
 *.env
 *.zip
+*.sif
+*.sif.*
 
 __pycache__/
 *.py[cod]
@@ -12,3 +14,12 @@ runs/graph_cache/
 src/runs/
 src/runs/tmp/
 src/runs/graph_cache/
+
+apptainer_cache/
+cache_sweb/
+cache_pro/
+tmp_sweb/
+tmp_pro/
+download_jobs/
+*.log
+*.pid

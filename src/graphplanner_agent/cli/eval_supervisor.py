@@ -133,7 +133,7 @@ def main() -> int:
     parser.add_argument("--recovery-sleep", type=float, default=0.0)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--observation-mode", choices=["json", "text"])
-    parser.add_argument("--cgm-backend", choices=["mock", "http"])
+    parser.add_argument("--cgm-backend", choices=["mock", "http", "dashscope"])
     parser.add_argument("--cgm-endpoint")
     parser.add_argument("--sandbox-backend", choices=["local", "remote_swe"])
     parser.add_argument("--sandbox-num-runners", type=int)

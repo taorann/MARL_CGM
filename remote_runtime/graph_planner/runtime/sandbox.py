@@ -1,0 +1,1473 @@
+﻿# graph_planner/runtime/sandbox.py
+import os, json, time, shutil, tempfile, base64, shlex, re, gzip, hashlib
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+from ..agents.common.contracts import CGM_CONTRACT, CGMPatchErrorCode, ProtocolError, normalize_newlines
+
+# 閬ユ祴
+from ..infra import telemetry as telemetry_mod
+
+from .apptainer_queue_runtime import ApptainerQueueRuntime
+from .queue_protocol import ExecResult
+from .remote_swe_session import RemoteSweSession
+
+def _dbg(msg: str):
+    if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+        print(f"[sandbox] {msg}")
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _major_version(ver: Any) -> int:
+    s = str(ver or "").strip()
+    if not s:
+        return 0
+    m = re.match(r"^(\d+)", s)
+    if not m:
+        return 0
+    try:
+        return int(m.group(1))
+    except Exception:
+        return 0
+
+@dataclass
+class SandboxConfig:
+    docker_image: str
+    workdir: str
+    mounts: Dict[str, str]
+    env: Dict[str, str]
+    pytest_cache_root: Optional[str] = None
+    commit_hash: Optional[str] = None
+    backend: str = "apptainer_queue"
+    requires_build: bool = False
+    swebench_spec: Optional[Dict[str, Any]] = None
+    queue_root: Optional[str] = None
+    sif_dir: Optional[str] = None
+    num_runners: int = 1
+    ssh_target: Optional[str] = None
+    remote_repo: Optional[str] = None
+    remote_python: Optional[str] = None
+    swe_proxy_path: Optional[str] = None
+    runner_manager_path: Optional[str] = None
+    repo_root_host: Optional[str] = None
+    r2e_ds_json: Optional[str] = None
+    target_test_selectors: Optional[List[str]] = None
+
+class SandboxRuntime:
+    """
+    Unified sandbox runtime.
+
+    Supported backends:
+      - "apptainer_queue": direct queue-backed Apptainer execution
+      - "remote_swe": SSH/proxy wrapper over queue-backed runners
+    """
+    def __init__(self, cfg: SandboxConfig, force_backend: Optional[str] = None, run_id: Optional[str] = None):
+        self.cfg = cfg
+        self.run_id = run_id or "__default__"
+        preferred_mode = force_backend or cfg.backend or "apptainer_queue"
+        self._mode = preferred_mode
+
+        self._aq: Optional[ApptainerQueueRuntime] = None
+        self._remote: Optional[RemoteSweSession] = None
+        # remote_swe: avoid duplicated expensive `start` calls within one SandboxRuntime.
+        # (Multiple helpers call into _exec/build_repo_graph, which used to call start
+        # every time and could race with SSH timeout.)
+        self._remote_started: bool = False
+        self._remote_bootstrapped: bool = False
+        self._remote_pytest_available: Optional[bool] = None
+        self._remote_dep_snapshot: Optional[Dict[str, Any]] = None
+        self._remote_start_lock = threading.Lock()
+
+        if self._mode == "apptainer_queue":
+            self._init_apptainer_backend()
+        elif self._mode == "remote_swe":
+            _dbg(f"init remote_swe: run_id={self.run_id} ssh_target={self.cfg.ssh_target} remote_repo={self.cfg.remote_repo} image={self.cfg.docker_image}")
+            self._init_remote_swe_backend()
+        else:
+            raise ValueError(
+                f"Unsupported sandbox backend {self._mode!r}. "
+                "Expected one of: 'apptainer_queue', 'remote_swe'."
+            )
+        self._exposed_ports: List[Dict[str, Any]] = []
+
+    def _init_apptainer_backend(self) -> None:
+        cfg = self.cfg
+        if not cfg.queue_root or not cfg.sif_dir:
+            raise ValueError("backend='apptainer_queue' requires queue_root and sif_dir.")
+        queue_root = Path(os.path.expanduser(cfg.queue_root)).resolve()
+        sif_dir = Path(os.path.expanduser(cfg.sif_dir)).resolve()
+        self._aq = ApptainerQueueRuntime(
+            queue_root=queue_root,
+            sif_dir=sif_dir,
+            num_runners=int(cfg.num_runners or 1),
+        )
+        self.workdir = cfg.workdir or "."
+        _dbg(f"apptainer_queue backend initialized: workdir={self.workdir!r}")
+
+    def _init_remote_swe_backend(self) -> None:
+        cfg = self.cfg
+        if not cfg.ssh_target or not cfg.remote_repo:
+            raise ValueError("backend='remote_swe' requires ssh_target and remote_repo.")
+        num_runners = int(cfg.num_runners or 1)
+        self._remote = RemoteSweSession(
+            ssh_target=cfg.ssh_target,
+            remote_repo=os.path.expanduser(cfg.remote_repo),
+            image=cfg.docker_image,
+            run_id=self.run_id,
+            remote_python=cfg.remote_python or "python",
+            swe_proxy_path=cfg.swe_proxy_path or "hpc/swe_proxy.py",
+            runner_manager_path=cfg.runner_manager_path or "hpc/ensure_runners.py",
+            num_runners=num_runners,
+            ensure_runners=True,
+        )
+        # remote_swe uses the SWE-bench container layout, where the checked-out
+        # repository is mounted at /testbed by default.
+        self.workdir = "/testbed"
+        _dbg(
+            f"remote_swe backend initialized: ssh={cfg.ssh_target!r}, "
+            f"repo={cfg.remote_repo!r}, workdir={self.workdir!r}, num_runners={num_runners}"
+        )
+
+    # ---------- 閫氱敤鎵ц ----------
+    def _ensure_remote_started(self, *, timeout: float) -> None:
+        """Start remote SWE instance once per SandboxRuntime.
+
+        Important: `swe_proxy` uses an internal wait budget that can exceed the
+        nominal payload timeout. We therefore rely on RemoteSweSession._call_proxy
+        to apply a larger outer SSH timeout, and we keep this call idempotent.
+        """
+        if self._mode != "remote_swe":
+            return
+        assert self._remote is not None, "remote_swe backend not initialized"
+        if self._remote_started:
+            return
+        with self._remote_start_lock:
+            if self._remote_started:
+                return
+            t0 = time.perf_counter()
+            resp = self._remote.start(timeout=float(timeout), cwd=self.workdir or "/testbed")
+            dt = time.perf_counter() - t0
+            ok = bool(resp.get("ok", False))
+            rc = resp.get("returncode", None)
+            err = resp.get("error", None)
+            stderr = resp.get("stderr", "") or ""
+            _dbg(
+                f"remote_swe started: run_id={self.run_id} dt={dt:.2f}s "
+                f"ok={ok!r} rc={rc!r} error={err!r} stderr_bytes={len(stderr)}"
+            )
+            if not ok:
+                # Busy runner guard: do NOT silently attach to an existing run by default.
+                # Attaching to the wrong instance can mix repos/images and cause "empty stdout" / wrong paths.
+                msg = str(err or stderr or "")
+                m = re.search(r"current_run_id=([A-Za-z0-9_\-]+)", msg)
+                if m:
+                    cur = m.group(1)
+                    adopt = str(os.environ.get("GP_REMOTE_SWE_ADOPT_BUSY", "0")).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "y",
+                    }
+                    if not adopt:
+                        raise RuntimeError(
+                            "remote_swe runner is busy (instance already running). "
+                            f"Refusing to auto-adopt current_run_id={cur}. "
+                            "Stop the existing instance or set GP_REMOTE_SWE_ADOPT_BUSY=1 if you are sure it's safe. "
+                            f"Raw message: {msg[:800]!r}"
+                        )
+                    # If user explicitly allows adopting, verify image match.
+                    mimg = re.search(r"current_image=([^\s]+)", msg)
+                    req_img = str(self.cfg.docker_image or "")
+                    if not mimg:
+                        # If the proxy did not report current_image, adopting is unsafe.
+                        # Allow only if the user explicitly opts in.
+                        adopt_unverified = str(os.environ.get("GP_REMOTE_SWE_ADOPT_BUSY_UNVERIFIED", "0")).strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "y",
+                        }
+                        if not adopt_unverified:
+                            raise RuntimeError(
+                                "remote_swe runner is busy, but current_image is unknown. "
+                                f"Refusing to adopt current_run_id={cur}. "
+                                "Stop the existing instance or set GP_REMOTE_SWE_ADOPT_BUSY_UNVERIFIED=1 if you are sure it's safe. "
+                                f"Raw message: {msg[:800]!r}"
+                            )
+                    else:
+                        cur_img = mimg.group(1)
+                        if req_img and cur_img and cur_img != req_img:
+                            raise RuntimeError(
+                                "remote_swe busy instance image mismatch: "
+                                f"current_image={cur_img!r} requested_image={req_img!r}. "
+                                "Refusing to adopt. "
+                                f"Raw message: {msg[:800]!r}"
+                            )
+                    _dbg(f"remote_swe start got busy; adopting current_run_id={cur}")
+                    self._remote.run_id = cur
+                    self._remote_started = True
+                    if not self._remote_bootstrapped:
+                        self._bootstrap_remote_swe()
+                    return
+                raise RuntimeError(
+                    f"remote_swe start failed: rc={rc!r} error={err!r} stderr={stderr[:2000]!r}"
+                )
+            self._remote_started = True
+            if not self._remote_bootstrapped:
+                self._bootstrap_remote_swe()
+
+    def _bootstrap_remote_swe(self) -> None:
+        if self._mode != "remote_swe":
+            return
+        assert self._remote is not None, "remote_swe backend not initialized"
+        try:
+            _dbg("remote_swe bootstrap: verifying pytest in testbed env")
+            check = self._remote.exec(
+                "set -euo pipefail; "
+                "source /opt/miniconda3/bin/activate; "
+                "conda activate testbed; "
+                "python - <<'PY'\n"
+                "import pytest\n"
+                "print(pytest.__version__)\n"
+                "PY",
+                timeout=60,
+                cwd=self.workdir,
+            )
+            self._remote_pytest_available = _safe_int(check.get("returncode", 0), 1) == 0
+            if not self._remote_pytest_available:
+                _dbg("remote_swe bootstrap: pytest not available in testbed env")
+            dep_check = self._remote.exec(
+                "set -euo pipefail; "
+                "source /opt/miniconda3/bin/activate; "
+                "conda activate testbed; "
+                "python - <<'PY'\n"
+                "import json, sys\n"
+                "from importlib import metadata as m\n"
+                "pkgs = ['numpy', 'pytest', 'astropy']\n"
+                "out = {'python': sys.version.split()[0]}\n"
+                "for p in pkgs:\n"
+                "    try:\n"
+                "        out[p] = m.version(p)\n"
+                "    except Exception:\n"
+                "        out[p] = ''\n"
+                "print(json.dumps(out, ensure_ascii=False))\n"
+                "PY",
+                timeout=60,
+                cwd=self.workdir,
+            )
+            if _safe_int(dep_check.get("returncode", 1), 1) == 0:
+                out = (dep_check.get("stdout") or "").strip().splitlines()
+                if out:
+                    try:
+                        maybe = json.loads(out[-1])
+                        if isinstance(maybe, Mapping):
+                            self._remote_dep_snapshot = dict(maybe)
+                    except Exception:
+                        pass
+            self._maybe_auto_pin_numpy_for_astropy()
+        except Exception as exc:
+            _dbg(f"remote_swe bootstrap failed: {exc!r}")
+        self._remote_bootstrapped = True
+
+    def _maybe_auto_pin_numpy_for_astropy(self) -> None:
+        """Best-effort dependency correction for known astropy/numpy skew."""
+        if self._mode != "remote_swe" or not self._remote:
+            return
+        enabled = str(os.environ.get("GP_AUTO_PIN_NUMPY_FOR_ASTROPY", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if not enabled:
+            return
+        snap = self._remote_dep_snapshot if isinstance(self._remote_dep_snapshot, Mapping) else {}
+        np_ver = str((snap or {}).get("numpy") or "")
+        astropy_ver = str((snap or {}).get("astropy") or "")
+        if not np_ver or not astropy_ver:
+            return
+        if _major_version(np_ver) < 2:
+            return
+        repo_id = str((self.cfg.env or {}).get("GP_REPO_ID") or "").strip().lower()
+        if "astropy/astropy" not in repo_id:
+            return
+        _dbg(f"remote_swe bootstrap: attempting numpy pin for astropy (numpy={np_ver}, astropy={astropy_ver})")
+        try:
+            fix = self._remote.exec(
+                "set -euo pipefail; "
+                "source /opt/miniconda3/bin/activate; "
+                "conda activate testbed; "
+                "python -m pip install --no-input 'numpy<2' >/tmp/gp_numpy_pin.log 2>&1 || true; "
+                "python - <<'PY'\n"
+                "from importlib import metadata as m\n"
+                "import json\n"
+                "out = {}\n"
+                "for p in ('numpy', 'astropy'):\n"
+                "    try:\n"
+                "        out[p] = m.version(p)\n"
+                "    except Exception:\n"
+                "        out[p] = ''\n"
+                "print(json.dumps(out, ensure_ascii=False))\n"
+                "PY",
+                timeout=240,
+                cwd=self.workdir,
+            )
+            if _safe_int(fix.get("returncode", 1), 1) == 0:
+                out = (fix.get("stdout") or "").strip().splitlines()
+                if out:
+                    try:
+                        maybe = json.loads(out[-1])
+                        if isinstance(maybe, Mapping):
+                            self._remote_dep_snapshot = dict(self._remote_dep_snapshot or {})
+                            self._remote_dep_snapshot.update(dict(maybe))
+                    except Exception:
+                        pass
+        except Exception as exc:
+            _dbg(f"remote_swe bootstrap: numpy pin skipped ({exc!r})")
+
+    def _exec(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
+        if self._mode == "remote_swe":
+            assert self._remote is not None, "remote_swe backend not initialized"
+            start_timeout = max(float(timeout), 300.0)
+            self._ensure_remote_started(timeout=start_timeout)
+            resp = self._remote.exec(
+                cmd,
+                timeout=float(timeout),
+                env=self.cfg.env,
+                cwd=self.workdir,
+            )
+            stdout = resp.get("stdout") or ""
+            stderr = resp.get("stderr") or ""
+            rc = _safe_int(resp.get("returncode", 0), 0)
+            # Critical: do NOT merge stderr into stdout on success.
+            # Some helpers (e.g. read_file_lines) expect stdout to be JSON.
+            if rc == 0:
+                if stderr and os.environ.get("DEBUG_ACTION_RESULT"):
+                    _dbg(f"remote exec produced stderr_bytes={len(stderr)} (suppressed from stdout)")
+                return stdout, 0
+            return stdout + stderr, rc
+        if self._mode == "apptainer_queue":
+            q = "'" + cmd.replace("'", "'\"'\"'") + "'"
+            exec_cmd = ["bash", "-lc", q]
+            result: ExecResult = self._aq.exec(
+                run_id=self.run_id,
+                docker_image=self.cfg.docker_image,
+                cmd=exec_cmd,
+                cwd=Path(self.workdir),
+                env=self.cfg.env,
+                timeout_sec=float(timeout),
+                meta={"src": "sandbox", "op": "exec"},
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            return out, int(result.returncode)
+        raise RuntimeError(f"Unsupported sandbox backend: {self._mode!r}")
+
+    # ---------- ACI 鎺ュ彛 ----------
+    def run(self, cmd: str, timeout: int = 900) -> Tuple[str, int]:
+        return self._exec(cmd, timeout)
+
+    def read_file_lines(self, path: str, start: int = 1, end: int = 1, timeout: int = 60) -> Tuple[List[str], int]:
+        """Read a range of lines from a file inside the sandbox.
+
+        Args:
+          path: absolute path or path relative to current working directory in the sandbox
+          start/end: 1-based inclusive line numbers (best-effort; clamped to file bounds)
+
+        Returns (lines, rc). rc!=0 indicates a failure to read/parse.
+        """
+        try:
+            s_i = int(start)
+        except Exception:
+            s_i = 1
+        try:
+            e_i = int(end)
+        except Exception:
+            e_i = s_i
+        if s_i <= 0:
+            s_i = 1
+        if e_i < s_i:
+            e_i = s_i
+
+        req = {"path": str(path), "start": s_i, "end": e_i}
+        try:
+            payload = json.dumps(req, ensure_ascii=False)
+        except Exception:
+            payload = '{"path":%r,"start":%d,"end":%d}' % (str(path), s_i, e_i)
+        b64 = base64.b64encode(payload.encode('utf-8')).decode('ascii')
+
+        py = r'''
+import base64, json, os, sys
+req = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+path = req.get('path')
+start = int(req.get('start', 1))
+end = int(req.get('end', start))
+if not isinstance(path, str) or not path:
+    raise SystemExit(2)
+try:
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = f.read().replace('\r\n','\n').replace('\r','\n').split('\n')
+except Exception:
+    raise SystemExit(3)
+n = len(lines)
+s = max(1, min(start, n + 1))
+e = max(s, min(end, n))
+out = lines[s-1:e] if n > 0 else []
+print(json.dumps({'lines': out}, ensure_ascii=False))
+'''
+
+        py_bin = 'python'
+        try:
+            if getattr(self, '_mode', None) == 'remote_swe':
+                py_bin = getattr(self.cfg, 'remote_python', None) or 'python'
+        except Exception:
+            pass
+        cmd = f"{py_bin} -c {shlex.quote(py)} {shlex.quote(b64)}"
+        out, rc = self._exec(cmd, timeout=int(timeout or 60))
+        if rc != 0:
+            return [], int(rc)
+        try:
+            data = json.loads(out.strip().splitlines()[-1])
+            lines = data.get('lines') if isinstance(data, dict) else []
+            if not isinstance(lines, list):
+                lines = []
+            return [str(x) for x in lines], 0
+        except Exception:
+            return [], 4
+
+    def snapshot_files(self, paths: List[str], timeout: int = 120) -> Mapping[str, Any]:
+        """Capture exact byte snapshots for a set of files inside the sandbox.
+
+        Returns:
+          {
+            "success": bool,
+            "snapshot": {path: {"exists": bool, "is_file": bool, "content_b64": str}},
+            "paths": [..],
+            "error": str?
+          }
+        """
+        try:
+            norm_paths = [str(p).strip() for p in (paths or []) if str(p).strip()]
+            payload = json.dumps(norm_paths, ensure_ascii=False)
+        except Exception:
+            return {"success": False, "snapshot": {}, "paths": [], "error": "invalid_paths"}
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+        py = r'''
+import base64, json, os, sys
+paths = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
+snap = {}
+for p in paths:
+    if not isinstance(p, str) or not p:
+        continue
+    exists = os.path.exists(p)
+    is_file = os.path.isfile(p)
+    entry = {"exists": bool(exists), "is_file": bool(is_file), "content_b64": ""}
+    if exists and is_file:
+        try:
+            with open(p, "rb") as f:
+                raw = f.read()
+            entry["content_b64"] = base64.b64encode(raw).decode("ascii")
+        except Exception:
+            entry["exists"] = False
+            entry["is_file"] = False
+            entry["content_b64"] = ""
+    snap[p] = entry
+print(json.dumps({"success": True, "snapshot": snap, "paths": list(snap.keys())}, ensure_ascii=False))
+'''
+        cmd = "python -c " + shlex.quote(py) + " " + shlex.quote(b64)
+        out, rc = self._exec(cmd, timeout=int(timeout or 120))
+        if rc != 0:
+            return {"success": False, "snapshot": {}, "paths": [], "error": "exec_failed", "rc": rc, "stdout": out}
+        try:
+            data = json.loads(out.strip().splitlines()[-1])
+            if not isinstance(data, dict):
+                raise ValueError("invalid snapshot payload")
+            return data
+        except Exception:
+            return {"success": False, "snapshot": {}, "paths": [], "error": "parse_failed"}
+
+    def restore_files(self, snapshot: Mapping[str, Any], timeout: int = 180) -> Mapping[str, Any]:
+        """Restore files from a snapshot returned by ``snapshot_files``."""
+        try:
+            snap = snapshot.get("snapshot") if isinstance(snapshot, Mapping) else {}
+            if not isinstance(snap, Mapping):
+                snap = {}
+            payload = json.dumps(dict(snap), ensure_ascii=False)
+        except Exception:
+            return {"success": False, "restored": 0, "removed": 0, "error": "invalid_snapshot"}
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+        py = r'''
+import base64, json, os, sys
+snap = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
+restored = 0
+removed = 0
+errors = []
+for p, meta in snap.items():
+    try:
+        if not isinstance(p, str) or not p:
+            continue
+        if not isinstance(meta, dict):
+            meta = {}
+        exists = bool(meta.get("exists", False))
+        is_file = bool(meta.get("is_file", False))
+        if exists and is_file:
+            raw_b64 = str(meta.get("content_b64") or "")
+            raw = base64.b64decode(raw_b64.encode("ascii")) if raw_b64 else b""
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(raw)
+            restored += 1
+        else:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed += 1
+    except Exception as exc:
+        errors.append(f"{p}: {exc}")
+ok = len(errors) == 0
+print(json.dumps({"success": ok, "restored": restored, "removed": removed, "errors": errors}, ensure_ascii=False))
+'''
+        cmd = "python -c " + shlex.quote(py) + " " + shlex.quote(b64)
+        out, rc = self._exec(cmd, timeout=int(timeout or 180))
+        if rc != 0:
+            return {"success": False, "restored": 0, "removed": 0, "error": "exec_failed", "rc": rc, "stdout": out}
+        try:
+            data = json.loads(out.strip().splitlines()[-1])
+            if not isinstance(data, dict):
+                raise ValueError("invalid restore payload")
+            return data
+        except Exception:
+            return {"success": False, "restored": 0, "removed": 0, "error": "parse_failed"}
+
+    def apply_patch_edits(self, edits: List[Mapping[str, Any]]) -> Mapping[str, Any]:
+        """Apply structured edits in-place within the sandbox.
+
+        Each edit:
+          { "path": str, "start": int, "end": int, "new_text": str }
+
+        Conventions (best-effort):
+        - If start >= 1: treat as 1-based line index, and end as 1-based inclusive.
+        - If start <= 0: treat as 0-based slice indices, and end as 0-based exclusive.
+        - If end < start: treat as insertion at start.
+
+        Robustness:
+        - Accept missing +x for scripts elsewhere (unrelated), but here handle CRLF, empty files, OOB indices,
+          and missing directories; preserve trailing newline when possible.
+        """
+        try:
+            payload = json.dumps(list(edits or []), ensure_ascii=False)
+        except Exception:
+            return {"success": False, "applied": 0, "paths": [], "error": "invalid_edits"}
+
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+        py = r'''
+import base64, json, os, sys
+edits = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+ok = True
+paths = []
+applied = 0
+errors = []
+
+def norm(s: str) -> str:
+    return (s or '').replace('\r\n', '\n').replace('\r', '\n')
+
+for e in edits:
+    try:
+        p = e.get('path')
+        if not isinstance(p, str) or not p.strip():
+            ok = False
+            continue
+        p = p.strip()
+        start_raw = e.get('start', None)
+        end_raw = e.get('end', None)
+        try:
+            s = int(start_raw) if start_raw is not None else 1
+        except Exception:
+            s = 1
+        try:
+            en = int(end_raw) if end_raw is not None else (s - 1 if s >= 1 else s)
+        except Exception:
+            en = (s - 1 if s >= 1 else s)
+
+        nt = norm(e.get('new_text') or '')
+        new_lines = nt.split('\n') if nt != '' else []
+
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+        content = ''
+        had_trailing_nl = False
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            had_trailing_nl = content.endswith('\n') or content.endswith('\r')
+        content = norm(content)
+        lines = content.splitlines()
+
+        # Index mapping
+        if s >= 1:
+            # 1-based inclusive [s, en]
+            i0 = max(0, s - 1)
+            i1 = max(0, en)  # exclusive end
+            if en < s:
+                i1 = i0
+        else:
+            # 0-based slice [s, en) (treat end<start as insertion)
+            i0 = max(0, s)
+            i1 = max(0, en)
+            if en < s:
+                i1 = i0
+
+        # Clamp to file bounds
+        n = len(lines)
+        if i0 > n:
+            i0 = n
+        if i1 > n:
+            i1 = n
+        if i1 < i0:
+            i1 = i0
+
+        out = lines[:i0] + new_lines + lines[i1:]
+
+        with open(p, 'w', encoding='utf-8') as f:
+            if out:
+                f.write('\n'.join(out))
+                if had_trailing_nl:
+                    f.write('\n')
+            else:
+                f.write('')
+
+        paths.append(p)
+        applied += 1
+    except Exception as exc:
+        ok = False
+        try:
+            errors.append({"path": str(p), "error": str(exc)})
+        except Exception:
+            pass
+
+print(json.dumps({'success': ok, 'applied': applied, 'paths': paths, 'errors': errors}, ensure_ascii=False))
+'''
+
+        cmd = "python -c " + shlex.quote(py) + " " + shlex.quote(b64)
+        out, rc = self._exec(cmd, timeout=900)
+        if rc != 0:
+            return {"success": False, "applied": 0, "paths": [], "error": "exec_failed", "rc": rc, "stdout": out}
+        try:
+            return json.loads(out.strip().splitlines()[-1])
+        except Exception:
+            return {"success": True, "applied": 0, "paths": []}
+
+    def apply_patch(self, unified_diff: str) -> bool:
+        heredoc = f"cat >/tmp/graph_planner.patch <<'EOF'\n{unified_diff}\nEOF"
+        _, rc1 = self._exec(heredoc)
+        if rc1 != 0: return False
+        _, rc2 = self._exec("git apply --reject --whitespace=fix /tmp/graph_planner.patch")
+        return rc2 == 0
+
+    def get_patch(self) -> str:
+        out, _ = self._exec("git diff")
+        return out
+
+    def lint(self) -> bool:
+        _, rc = self._exec(
+            "ruff --version >/dev/null 2>&1 || true; "
+            "black --version >/dev/null 2>&1 || true; "
+            "ruff check . || true; black --check . || true"
+        )
+        return rc == 0
+
+    def test(self, selector: Optional[List[str]] = None, timeout: int = 1800) -> Dict:
+        selector_tuple: Tuple[str, ...] = tuple(selector or ())
+        sel = " ".join(selector_tuple)
+        if selector_tuple:
+            official_cmd = self._official_swebench_test_cmd()
+            if official_cmd:
+                cmd = self._build_official_swebench_test_cmd(official_cmd)
+                start = time.time()
+                out, rc = self._exec(cmd, timeout=timeout)
+                duration = time.time() - start
+                result = {
+                    "mode": "swebench-test-cmd-selector",
+                    "passed": rc == 0,
+                    "rc": rc,
+                    "stdout": out,
+                    "official_test_cmd": official_cmd,
+                }
+                return self._finalize_test_result(
+                    result,
+                    command=cmd,
+                    selector=selector_tuple,
+                    duration=duration,
+                )
+            if self._mode == "remote_swe" and self._remote_pytest_available is False:
+                cmd = "python -m pytest -q"
+                result = {
+                    "mode": "pytest-missing",
+                    "passed": False,
+                    "rc": 1,
+                    "stdout": (
+                        "pytest is not available in the remote_swe environment. "
+                        "Set GP_PIP_WHEEL_DIR to a directory with pytest wheels, or "
+                        "place wheels under /testbed/whl, /testbed/wheels, /repo/whl, "
+                        "/repo/wheels, /mnt/share/whl, or /mnt/share/wheels."
+                    ),
+                }
+                return self._finalize_test_result(
+                    result,
+                    command=cmd,
+                    selector=selector_tuple,
+                    duration=0.0,
+                )
+            cmd = self._build_testbed_pytest_cmd(sel)
+            start = time.time()
+            out, rc = self._exec(cmd, timeout=timeout)
+            duration = time.time() - start
+            result = {"mode": "pytest-selector", "passed": rc == 0, "rc": rc, "stdout": out}
+            return self._finalize_test_result(
+                result,
+                command=cmd,
+                selector=selector_tuple,
+                duration=duration,
+            )
+
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            self._ensure_eval_script_from_spec()
+
+        # Prefer harness-generated eval.sh when available (e.g., Singularity workflow).
+        if self._mode in ("apptainer_queue", "remote_swe"):
+            for eval_script in ("/work/eval.sh", "/testbed/eval.sh"):
+                if self._exec(f"test -f {eval_script}")[1] == 0:
+                    # Patch harness-generated scripts to ignore known warnings
+                    # that can be promoted to errors in collection.
+                    self._patch_eval_sh_pythonwarnings(eval_script)
+                    cmd = self._build_testbed_eval_cmd(eval_script)
+                    start = time.time()
+                    out, rc = self._exec(cmd, timeout=timeout)
+                    duration = time.time() - start
+                    result = {"mode": "eval.sh", "passed": rc == 0, "rc": rc, "stdout": out}
+                    return self._finalize_test_result(
+                        result,
+                        command=cmd,
+                        selector=selector_tuple,
+                        duration=duration,
+                    )
+
+        # remote_swe: prefer /repo (workdir) run_tests.sh if present, else fallback pytest
+        if self._mode == "remote_swe":
+            wd = (self.workdir or "/repo").rstrip("/")
+            for script in (f"{wd}/run_tests.sh", "/repo/run_tests.sh"):
+                # Some SWE-bench images ship run_tests.sh without +x; accept if file exists.
+                if self._exec(f"test -f {script}")[1] == 0:
+                    # SWE-bench run_tests.sh typically does not accept extra positional args; run full suite.
+                    cmd = f"cd {os.path.dirname(script)} && bash {script}".strip()
+                    start = time.time()
+                    out, rc = self._exec(cmd, timeout=timeout)
+                    duration = time.time() - start
+                    result = {"mode": "run_tests.sh", "passed": rc == 0, "rc": rc, "stdout": out}
+                    return self._finalize_test_result(
+                        result,
+                        command=cmd,
+                        selector=selector_tuple,
+                        duration=duration,
+                    )
+
+        # RepoEnv / R2E锛氬皾璇曞畼鏂硅剼鏈?鈫?澶辫触鍐嶅洖閫€ pytest
+        if self._mode == "remote_swe" and self._remote_pytest_available is False:
+            cmd = "python -m pytest -q"
+            result = {
+                "mode": "pytest-missing",
+                "passed": False,
+                "rc": 1,
+                "stdout": (
+                    "pytest is not available in the remote_swe environment. "
+                    "Set GP_PIP_WHEEL_DIR to a directory with pytest wheels, or "
+                    "place wheels under /testbed/whl, /testbed/wheels, /repo/whl, "
+                    "/repo/wheels, /mnt/share/whl, or /mnt/share/wheels, or provide "
+                    "a run_tests.sh script in the repo."
+                ),
+            }
+            return self._finalize_test_result(
+                result,
+                command=cmd,
+                selector=selector_tuple,
+                duration=0.0,
+            )
+        cmd = self._build_testbed_pytest_cmd(sel)
+        _dbg(f"pytest cmd: {cmd}")
+        start = time.time()
+        out, rc = self._exec(cmd, timeout=timeout)
+        duration = time.time() - start
+        result = {"mode": "pytest", "passed": rc == 0, "rc": rc, "stdout": out}
+        return self._finalize_test_result(
+            result,
+            command=cmd,
+            selector=selector_tuple,
+            duration=duration,
+        )
+
+    def _build_testbed_pytest_cmd(self, sel: str) -> str:
+        selector = sel.strip()
+        pytest_args = f"-W ignore -q -o cache_dir=/tmp/pytest_cache {selector}".strip()
+        # Some SWE-bench images configure pytest to treat warnings as errors.
+        # Inject a narrow PYTHONWARNINGS filter (鏂规3) so collection doesn't abort
+        # on known NumPy 1.25 DeprecationWarnings.
+        flt = self._eval_sh_pythonwarnings_filter()
+        warn_part = ""
+        if flt:
+            warn_part = (
+                'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
+                + flt
+                + '"; '
+                'export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-W ignore"; '
+            )
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "export TMPDIR=/tmp; "
+            "export PYTHONPYCACHEPREFIX=/tmp/pycache; "
+            + warn_part
+            + "cd /testbed; "
+            f"python -m pytest {pytest_args}"
+        )
+
+    def _official_swebench_test_cmd(self) -> str:
+        """Extract the repository-specific test command from SWE-bench spec.
+
+        SWE-bench does not use pytest uniformly. For example, Django instances
+        are evaluated with ``./tests/runtests.py ...``. Targeted fail-to-pass
+        checks should therefore prefer the official command over assuming
+        ``python -m pytest`` is available in every testbed.
+        """
+        spec = self.cfg.swebench_spec if isinstance(self.cfg.swebench_spec, Mapping) else {}
+        eval_list = spec.get("eval_script_list") if isinstance(spec, Mapping) else None
+        if not isinstance(eval_list, list):
+            return ""
+        in_test_block = False
+        for raw in eval_list:
+            line = str(raw or "").strip()
+            if not line:
+                continue
+            if ">>>>> Start Test Output" in line:
+                in_test_block = True
+                continue
+            if ">>>>> End Test Output" in line:
+                break
+            if in_test_block:
+                return line
+        return ""
+
+    def _build_official_swebench_test_cmd(self, official_cmd: str) -> str:
+        cmd = str(official_cmd or "").strip()
+        flt = self._eval_sh_pythonwarnings_filter()
+        warn_part = ""
+        if flt:
+            warn_part = (
+                'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
+                + flt
+                + '"; '
+                'export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-W ignore"; '
+            )
+        # Keep a small subset of SWE-bench's common locale setup for Django.
+        locale_part = (
+            "if command -v locale-gen >/dev/null 2>&1; then "
+            "sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen >/dev/null 2>&1 || true; "
+            "locale-gen >/dev/null 2>&1 || true; "
+            "fi; "
+            "export LANG=en_US.UTF-8; export LANGUAGE=en_US:en; export LC_ALL=en_US.UTF-8; "
+        )
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "export TMPDIR=/tmp; "
+            "export PYTHONPYCACHEPREFIX=/tmp/pycache; "
+            + warn_part
+            + locale_part
+            + "git config --global --add safe.directory /testbed >/dev/null 2>&1 || true; "
+            + "cd /testbed; "
+            + cmd
+        )
+
+    def _build_testbed_eval_cmd(self, eval_script: str) -> str:
+        return (
+            "set -euo pipefail; "
+            "source /opt/miniconda3/bin/activate; "
+            "conda activate testbed; "
+            "cd /testbed; "
+            f"bash {eval_script}"
+        )
+
+    def _eval_sh_pythonwarnings_filter(self) -> str:
+        """Return the PYTHONWARNINGS filter we inject into harness eval.sh.
+
+        Default: ignore all warnings to prevent warnings-as-errors from aborting test collection.
+        Set GP_EVAL_SH_PYTHONWARNINGS to override; set it to empty to disable.
+        """
+        default = "ignore"
+        v = str(os.environ.get("GP_EVAL_SH_PYTHONWARNINGS", default) or "").strip()
+        return v
+
+    def _patch_eval_sh_pythonwarnings(self, eval_script: str) -> None:
+        """Best-effort patch: inject an export PYTHONWARNINGS=... line into eval.sh.
+
+        This implements '鏂规3' by modifying the harness-generated script after
+        it is generated/copied, so that warnings-as-errors do not abort test
+        collection.
+        """
+        flt = self._eval_sh_pythonwarnings_filter()
+        if not flt:
+            return
+        path = str(eval_script or "").strip()
+        if not path:
+            return
+        # Only patch if the file exists.
+        if self._exec(f"test -f {path}")[1] != 0:
+            return
+
+        py = r"""
+import pathlib, re, sys
+
+p = pathlib.Path(sys.argv[1])
+flt = sys.argv[2]
+txt = p.read_text(encoding="utf-8", errors="replace")
+
+# Idempotent: only insert missing exports.
+has_pw = re.search(r"(?m)^\s*export\s+PYTHONWARNINGS=", txt)
+has_pa = re.search(r"(?m)^\s*export\s+PYTEST_ADDOPTS=", txt)
+if has_pw and has_pa:
+    sys.exit(0)
+
+lines = txt.splitlines(True)
+
+pw_line = (
+    'export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}'
+    + flt
+    + '"\n'
+)
+pa_line = 'export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-W ignore"\n'
+
+insert_at = 0
+# Prefer: after 'set -euo pipefail'
+for i, ln in enumerate(lines[:60]):
+    if ln.strip().startswith("set ") and "pipefail" in ln:
+        insert_at = i + 1
+        break
+else:
+    # Fallback: after shebang
+    if lines and lines[0].startswith("#!"):
+        insert_at = 1
+
+to_insert = []
+if not has_pw:
+    to_insert.append(pw_line)
+if not has_pa:
+    to_insert.append(pa_line)
+for j, ln in enumerate(to_insert):
+    lines.insert(insert_at + j, ln)
+p.write_text("".join(lines), encoding="utf-8")
+"""
+
+        # Use the system python inside the image and pass argv explicitly.
+        cmd = (
+            f"/opt/miniconda3/bin/python - {shlex.quote(path)} {shlex.quote(flt)} <<'PY'\n"
+            f"{py}\n"
+            "PY"
+        )
+        self._exec(cmd, timeout=60)
+
+    def _ensure_eval_script_from_spec(self) -> None:
+        if not self.cfg.swebench_spec:
+            return
+        eval_list = self.cfg.swebench_spec.get("eval_script_list")
+        if not eval_list:
+            return
+        if self._exec("test -f /work/eval.sh")[1] == 0 or self._exec("test -f /testbed/eval.sh")[1] == 0:
+            return
+        target_dir = "/work" if self._exec("test -d /work")[1] == 0 else "/testbed"
+        lines = [str(line) for line in eval_list if str(line).strip()]
+        if not lines:
+            return
+        warn = self._eval_sh_pythonwarnings_filter()
+        warn_line = ""
+        if warn:
+            warn_line = f"export PYTHONWARNINGS=\"${{PYTHONWARNINGS:+$PYTHONWARNINGS,}}{warn}\"\n"
+        script_body = "#!/usr/bin/env bash\nset -euo pipefail\n" + warn_line + "\n".join(lines) + "\n"
+        heredoc = f"cat >{target_dir}/eval.sh <<'EOF'\n{script_body}EOF\nchmod +x {target_dir}/eval.sh"
+        self._exec(heredoc)
+
+    def _aci_root(self) -> Path:
+        # Host-side cache root for GraphPlanner artifacts
+        # Default: .aci (relative to current working directory)
+        return Path(os.environ.get("GP_ACI_ROOT", "gp_artifacts"))
+
+    def _repo_graph_cache_path(self, repo_id: str) -> Path:
+        rid = (repo_id or "").strip() or "repo"
+        scope = str(os.environ.get("GP_REPO_GRAPH_CACHE_SCOPE") or "image").strip().lower()
+        if scope not in {"repo", "image", "run"}:
+            scope = "image"
+        if scope == "image":
+            image = str(self.cfg.docker_image or "").strip()
+            commit = str(self.cfg.commit_hash or "").strip()
+            # SWE-bench images are instance-specific. Include the image/commit in the
+            # cache key so a graph built for one checked-out snapshot is not reused
+            # for a different task from the same repository.
+            material = "||".join(x for x in (image, commit) if x)
+            if material:
+                slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", material).strip("_")[:120]
+                digest = hashlib.sha1(material.encode("utf-8", "ignore")).hexdigest()[:10]
+                rid = f"{rid}__{slug}__{digest}"
+        elif scope == "run":
+            material = str(self.run_id or "").strip()
+            if material:
+                slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", material).strip("_")[:120]
+                digest = hashlib.sha1(material.encode("utf-8", "ignore")).hexdigest()[:10]
+                rid = f"{rid}__{slug}__{digest}"
+        frontend = str(os.environ.get("GP_REPO_GRAPH_FRONTEND") or os.environ.get("GP_GRAPH_FRONTEND") or "treesitter").strip().lower()
+        if frontend in {"tree-sitter", "tree_sitter", "ts"}:
+            frontend = "treesitter"
+        if frontend not in {"ast", "auto", "treesitter"}:
+            frontend = "treesitter"
+        graph_version = "graph_v6_constructor_call_edges"
+        return self._aci_root() / "subgraphs" / rid / "repo" / frontend / graph_version / "repo_graph.jsonl"
+
+    def _load_repo_graph_jsonl(self, path: Path) -> Dict[str, Any]:
+        nodes: List[Dict[str, Any]] = []
+        edges: List[Dict[str, Any]] = []
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                typ = obj.pop("type", None)
+                if typ == "node":
+                    nodes.append(obj)
+                elif typ == "edge":
+                    edges.append(obj)
+                else:
+                    # best-effort fallback
+                    if "src" in obj and "dst" in obj:
+                        edges.append(obj)
+                    else:
+                        nodes.append(obj)
+        return {"nodes": nodes, "edges": edges}
+
+    def load_repo_graph(self, repo_id: str = "", *, timeout: int = 3600) -> Dict[str, Any]:
+        """Load (or build then load) the full repo_graph as a Python dict {nodes, edges}.
+
+        This is intentionally NOT issue-conditioned: explore/find/expand should operate on the
+        full repo graph for the current SWE container.
+        """
+        if self._mode != "remote_swe":
+            raise RuntimeError(f"load_repo_graph is only supported for backend='remote_swe', got {self._mode!r}")
+        rid = (repo_id or "").strip()
+        if not rid:
+            rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "").strip() or "repo"
+        p = Path(self.build_repo_graph(repo_id=rid, timeout=int(timeout), force=False))
+        return self._load_repo_graph_jsonl(p)
+
+
+    def build_repo_graph(self, repo_id: str = "", *, timeout: int = 3600, force: bool = False) -> str:
+        """Build repo-level graph in remote_swe and cache JSONL on the host.
+
+        Returns the host-side cache path to repo_graph.jsonl.
+        """
+        if self._mode != "remote_swe":
+            raise RuntimeError(f"build_repo_graph is only supported for backend='remote_swe', got {self._mode!r}")
+        if not self._remote:
+            raise RuntimeError("remote_swe backend is not initialized")
+
+        # Ensure remote instance started (idempotent)
+        start_timeout = max(float(timeout), 300.0)
+        self._ensure_remote_started(timeout=start_timeout)
+
+        # Resolve repo id for caching
+        rid = (repo_id or "").strip()
+        if not rid:
+            rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "").strip()
+        if not rid:
+            rid = "repo"
+
+        cache_path = self._repo_graph_cache_path(rid)
+        if cache_path.exists() and not force:
+            return str(cache_path)
+
+        _dbg(f"remote_swe build_repo_graph: repo_id={rid} workdir={self.workdir} image={self.cfg.docker_image}")
+        b64 = self._remote.build_repo_graph(repo_id=rid, timeout=int(timeout), cwd=self.workdir, repo=self.workdir)
+        if not b64:
+            raise RuntimeError("build_repo_graph returned empty base64 payload")
+
+        try:
+            blob = base64.b64decode(b64.encode("ascii"), validate=False)
+            raw = gzip.decompress(blob)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to decode base64+gzip repo graph payload (len={len(b64)} chars)"
+            ) from exc
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            tmp_path.write_bytes(raw)
+            os.replace(str(tmp_path), str(cache_path))
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+        return str(cache_path)
+
+
+    def build_issue_subgraph(
+        self,
+        issue_id: str,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        """Build the working subgraph.
+
+        For backend='remote_swe', we prefer a repo-level graph cached as JSONL on the host
+        (via build_repo_graph). This avoids parsing large JSON over stdout and enables reuse
+        across multiple issues from the same repo.
+
+        For compatibility, if repo-level build fails, we fall back to remote build_graph (JSON).
+        """
+        if self._mode != "remote_swe":
+            raise RuntimeError(
+                f"build_issue_subgraph is only supported for backend='remote_swe', got {self._mode!r}"
+            )
+        if not self._remote:
+            raise RuntimeError("remote_swe backend is not initialized")
+
+        # Try repo-level cached JSONL first
+        try:
+            rid = str((self.cfg.env or {}).get("GP_REPO_ID") or "repo")
+            jsonl_path = Path(self.build_repo_graph(repo_id=rid, timeout=int(timeout), force=False))
+            return self._load_repo_graph_jsonl(jsonl_path)
+        except Exception as e:
+            # Do not silently swallow repo-graph load failures; they are a common root cause of
+            # unexpected fallback to legacy build_graph and missing candidates.
+            if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+                try:
+                    _dbg(f"repo_graph jsonl load failed: {e!r}")
+                except Exception:
+                    pass
+            if os.environ.get("GP_DISABLE_BUILD_GRAPH") == "1":
+                raise
+
+
+        # Fallback: legacy JSON stdout
+        start_timeout = max(float(timeout), 300.0)
+        self._ensure_remote_started(timeout=start_timeout)
+        return self._remote.build_graph(
+            issue_id=issue_id,
+            timeout=float(timeout),
+            cwd=self.workdir,
+            repo=self.workdir,
+        )
+
+    def reset_soft(self) -> None:
+        self._exec("git reset --hard HEAD && git clean -fd")
+
+    def _dependency_hint_from_stdout(self, stdout: str) -> str:
+        text = str(stdout or "")
+        if "concatenate() got an unexpected keyword argument 'dtype'" in text:
+            snap = self._remote_dep_snapshot if isinstance(self._remote_dep_snapshot, Mapping) else {}
+            np_v = str((snap or {}).get("numpy") or "")
+            astropy_v = str((snap or {}).get("astropy") or "")
+            return (
+                "possible-testbed-dependency-skew: "
+                f"numpy={np_v or 'unknown'} astropy={astropy_v or 'unknown'}; "
+                "prefer issue-targeted tests and align testbed dependency pins if needed."
+            )
+        return ""
+
+    def _finalize_test_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        command: str,
+        selector: Tuple[str, ...],
+        duration: float,
+    ) -> Dict[str, Any]:
+        # Mirror execution metadata into the returned payload so planner prompts
+        # can reflect which selectors were actually executed.
+        result["backend"] = self._mode
+        result["command"] = command
+        result["selector"] = list(selector)
+        result["duration_sec"] = round(duration, 3)
+        payload = {
+            "kind": "test_run",
+            "backend": self._mode,
+            "command": command,
+            "selector": list(selector),
+            "duration_sec": round(duration, 3),
+            "result": {
+                "mode": result.get("mode"),
+                "rc": result.get("rc"),
+                "passed": bool(result.get("passed")),
+            },
+            "stdout": result.get("stdout", ""),
+        }
+        dep_hint = self._dependency_hint_from_stdout(result.get("stdout", ""))
+        if dep_hint:
+            result["dependency_hint"] = dep_hint
+            payload["dependency_hint"] = dep_hint
+        if isinstance(self._remote_dep_snapshot, Mapping) and self._remote_dep_snapshot:
+            payload["dependency_snapshot"] = dict(self._remote_dep_snapshot)
+        if self.cfg.workdir:
+            payload["workdir"] = self.cfg.workdir
+        try:
+            telemetry_mod.log_test_result(payload)
+        except Exception as e:
+            # Do not silently swallow repo-graph load failures; they are a common root cause of
+            # unexpected fallback to legacy build_graph and missing candidates.
+            if os.environ.get("DEBUG") or os.environ.get("EBUG"):
+                try:
+                    _dbg(f"repo_graph jsonl load failed: {e!r}")
+                except Exception:
+                    pass
+            if os.environ.get("GP_DISABLE_BUILD_GRAPH") == "1":
+                raise
+
+        return result
+
+    def close(self):
+        if self._mode == "remote_swe":
+            # Stop can be slow/hang when the SSH tunnel is unhealthy.
+            # Do not block teardown for many minutes.
+            try:
+                if self._remote and self._remote_started:
+                    stop_timeout = _safe_int(os.environ.get("GP_REMOTE_STOP_TIMEOUT", 120), 120)
+                    self._remote.stop(timeout=float(stop_timeout))
+            except Exception as e:
+                _dbg(f"remote_swe stop failed (ignored): {e!r}")
+            finally:
+                self._remote_started = False
+            self._remote = None
+        elif self._mode == "apptainer_queue":
+            self._aq = None
+
+    # ---------- 璋冭瘯杈呭姪 ----------
+    @property
+    def exposed_ports(self) -> List[Dict[str, Any]]:
+        return list(self._exposed_ports)
+
+
+class PatchApplier:
+    """Apply unified diffs in a temporary workspace before committing changes."""
+
+    def __init__(self) -> None:
+        self._applied: Dict[str, set[str]] = {}
+
+    def apply_in_temp_then_commit(
+        self,
+        repo_root: Path,
+        patch_text: str,
+        path: str,
+        run_tests: Callable[[Path], Mapping[str, Any]],
+        run_lint: Optional[Callable[[Path], Mapping[str, Any]]] = None,
+        patch_id: Optional[str] = None,
+        *,
+        new_content: Optional[str] = None,
+        stats: Optional[Mapping[str, int]] = None,
+    ) -> Dict[str, Any]:
+        """Validate, trial, and commit a patch atomically.
+
+        Parameters
+        ----------
+        repo_root:
+            Root directory of the working repository on the host filesystem.
+        patch_text:
+            Unified diff text generated from the CGM candidate.
+        path:
+            Relative file path within ``repo_root`` touched by the patch.
+        run_tests / run_lint:
+            Callbacks executed inside the temporary copy. They must accept a
+            ``Path`` argument pointing to the trial workspace and return a
+            mapping containing status flags (``passed``/``ok``) and optional
+            logs. ``run_lint`` is optional.
+        patch_id:
+            Optional deterministic identifier used to detect duplicate
+            applications.
+        new_content:
+            Optional fully materialised file contents. When omitted the diff is
+            applied to the current workspace to derive the new text.
+        stats:
+            Optional telemetry dictionary with ``n_hunks``/``added_lines``/
+            ``removed_lines`` counters.
+        """
+
+        repo_root = Path(repo_root)
+        if not repo_root.exists():
+            raise ProtocolError(CGMPatchErrorCode.PATH_MISSING.value, f"repo root '{repo_root}' does not exist")
+
+        normalized_path = path.strip()
+        if not normalized_path:
+            raise ProtocolError(CGMPatchErrorCode.PATH_MISSING.value, "patch path is empty")
+
+        if patch_id:
+            applied = self._applied.setdefault(normalized_path, set())
+            if patch_id in applied:
+                raise ProtocolError(CGMPatchErrorCode.DUPLICATE_PATCH.value, f"patch {patch_id} already applied to {normalized_path}")
+
+        source_file = repo_root.joinpath(normalized_path)
+        if not source_file.exists():
+            raise ProtocolError(CGMPatchErrorCode.PATH_MISSING.value, f"target file '{normalized_path}' not found")
+
+        try:
+            original_text = normalize_newlines(source_file.read_text(encoding="utf-8"))
+        except UnicodeDecodeError as exc:
+            error = ProtocolError(
+                CGMPatchErrorCode.ENCODING_UNSUPPORTED.value,
+                f"file '{normalized_path}' is not UTF-8 encoded: {exc}",
+            )
+            error.__cause__ = exc
+            raise error
+
+        if new_content is None:
+            analysis = _analyse_diff_fallback(original_text, patch_text, normalized_path)
+            new_text = analysis.new_text
+            computed_stats = {
+                "n_hunks": analysis.n_hunks,
+                "added_lines": analysis.added_lines,
+                "removed_lines": analysis.removed_lines,
+            }
+        else:
+            new_text = normalize_newlines(new_content)
+            computed_stats = {
+                "n_hunks": int((stats or {}).get("n_hunks", 0)),
+                "added_lines": int((stats or {}).get("added_lines", 0)),
+                "removed_lines": int((stats or {}).get("removed_lines", 0)),
+            }
+
+        if CGM_CONTRACT.constraints.get("newline_required") and not new_text.endswith("\n"):
+            raise ProtocolError(CGMPatchErrorCode.NEWLINE_MISSING.value, f"resulting file '{normalized_path}' must end with newline")
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="gp-patch-", dir=str(repo_root.parent)))
+        try:
+            trial_root = temp_dir
+            shutil.copytree(repo_root, trial_root, dirs_exist_ok=True)
+            trial_file = trial_root.joinpath(normalized_path)
+            trial_file.parent.mkdir(parents=True, exist_ok=True)
+            trial_file.write_text(new_text, encoding="utf-8")
+
+            lint_result = run_lint(trial_root) if run_lint else {"ok": True, "stdout": ""}
+            lint_ok = bool(lint_result.get("ok"))
+            if not lint_ok:
+                error = ProtocolError("lint-failed", lint_result.get("stdout", "lint failed"))
+                error.temp_path = temp_dir.name  # type: ignore[attr-defined]
+                error.n_hunks = computed_stats["n_hunks"]  # type: ignore[attr-defined]
+                error.added_lines = computed_stats["added_lines"]  # type: ignore[attr-defined]
+                error.removed_lines = computed_stats["removed_lines"]  # type: ignore[attr-defined]
+                raise error
+
+            tests_result = run_tests(trial_root)
+            tests_passed = bool(tests_result.get("passed"))
+            if not tests_passed:
+                error = ProtocolError("build-failed", tests_result.get("stdout", "tests failed"))
+                error.temp_path = temp_dir.name  # type: ignore[attr-defined]
+                error.n_hunks = computed_stats["n_hunks"]  # type: ignore[attr-defined]
+                error.added_lines = computed_stats["added_lines"]  # type: ignore[attr-defined]
+                error.removed_lines = computed_stats["removed_lines"]  # type: ignore[attr-defined]
+                raise error
+
+            temp_target = trial_file
+            final_path = source_file
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = final_path.parent.joinpath(f".{final_path.name}.gp_tmp")
+            tmp_file.write_text(new_text, encoding="utf-8")
+            with tmp_file.open("rb") as fh:
+                os.fsync(fh.fileno())
+            os.replace(tmp_file, final_path)
+            if patch_id:
+                self._applied.setdefault(normalized_path, set()).add(patch_id)
+            return {
+                "ok": True,
+                "applied": True,
+                "path": normalized_path,
+                "tests_passed": tests_passed,
+                "lint_ok": lint_ok,
+                "tests": tests_result,
+                "lint": lint_result,
+                "n_hunks": computed_stats["n_hunks"],
+                "added_lines": computed_stats["added_lines"],
+                "removed_lines": computed_stats["removed_lines"],
+                "temp_path": temp_dir.name,
+            }
+        except ProtocolError as exc:
+            if not hasattr(exc, "temp_path"):
+                exc.temp_path = temp_dir.name  # type: ignore[attr-defined]
+                exc.n_hunks = computed_stats["n_hunks"]  # type: ignore[attr-defined]
+                exc.added_lines = computed_stats["added_lines"]  # type: ignore[attr-defined]
+                exc.removed_lines = computed_stats["removed_lines"]  # type: ignore[attr-defined]
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            error = ProtocolError(CGMPatchErrorCode.DIRTY_WORKSPACE.value, str(exc))
+            error.temp_path = temp_dir.name  # type: ignore[attr-defined]
+            error.n_hunks = computed_stats["n_hunks"]  # type: ignore[attr-defined]
+            error.added_lines = computed_stats["added_lines"]  # type: ignore[attr-defined]
+            error.removed_lines = computed_stats["removed_lines"]  # type: ignore[attr-defined]
+            raise error
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _analyse_diff_fallback(original_text: str, diff_text: str, path: str) -> "DiffAnalysis":
+    """Fallback diff analysis shared with :class:`PatchApplier`."""
+
+    diff_text = normalize_newlines(diff_text)
+    lines = diff_text.splitlines()
+    added = removed = n_hunks = 0
+    new_lines: List[str] = []
+    original_lines = original_text.splitlines()
+    idx = 0
+    current_orig = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if line.startswith("@@ "):
+            n_hunks += 1
+            idx += 1
+            while idx < len(lines):
+                segment = lines[idx]
+                if segment.startswith("@@ ") or segment.startswith("diff --git") or segment.startswith("--- ") or segment.startswith("+++ "):
+                    break
+                if segment.startswith(" "):
+                    if current_orig < len(original_lines):
+                        new_lines.append(original_lines[current_orig])
+                        current_orig += 1
+                elif segment.startswith("-"):
+                    removed += 1
+                    current_orig += 1
+                elif segment.startswith("+"):
+                    added += 1
+                    new_lines.append(segment[1:])
+                idx += 1
+            continue
+        idx += 1
+    new_lines.extend(original_lines[current_orig:])
+    new_text = "\n".join(new_lines) + "\n"
+    class DiffAnalysis:  # local alias to avoid importing from agents
+        def __init__(self, new_text: str, n_hunks: int, added_lines: int, removed_lines: int) -> None:
+            self.new_text = new_text
+            self.n_hunks = n_hunks
+            self.added_lines = added_lines
+            self.removed_lines = removed_lines
+    return DiffAnalysis(new_text, n_hunks, added, removed)
