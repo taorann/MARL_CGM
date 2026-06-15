@@ -3,6 +3,9 @@
 *.zip
 *.sif
 *.sif.*
+id_ed25519*
+id_rsa*
+*.pem
 
 __pycache__/
 *.py[cod]

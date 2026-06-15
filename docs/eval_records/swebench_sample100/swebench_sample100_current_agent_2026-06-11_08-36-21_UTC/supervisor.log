@@ -1,0 +1,109 @@
+
+## round 1
+/opt/conda/bin/python -m graphplanner_agent.cli.eval_parallel --tasks /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01_tasks.jsonl --parallel 4 --run-dir /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01 --baseline-results /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/clean_baseline.jsonl --baseline-label supervisor_clean_baseline_round_1 --remote-preflight cleanup --stop-after-remote-runner-bugs 2 --stop-after-remote-sandbox-invalid 4 --remote-sandbox-invalid-policy continue --stop-after-planner-network-bugs 8 --max-steps 48 --observation-mode text --cgm-backend http --cgm-endpoint http://127.0.0.1:30003/generate --sandbox-backend remote_swe --sandbox-num-runners 4
+[run] dir=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01
+[run] parallel=4 results=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01/results.jsonl progress=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01/progress.md traces=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01/traces
+[run] shell log suggestion: /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01/run.log
+[remote] preflight {"elapsed": 7.798, "image": "slimshetty/swebench-verified:sweb.eval.x86_64.django__django-11740", "image_ref": "slimshetty/swebench-verified:sweb.eval.x86_64.django__django-11740", "mode": "cleanup", "ok": true, "remote_repo": "/appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM", "runner_count": 4, "ssh_target": "chongbin_cls@127.0.0.1", "steps": [{"name": "layout", "ok": true, "returncode": 0, "stderr": "", "stdout": "remote_repo=/appsnew/home/chongbin_pkuhpc/chongbin_cls/MARL_CGM\nchongbin_cls\nlogin24\nswe_proxy_ok\nrunner_manager_ok\nPython 3.13.2\n"}, {"name": "cleanup_pool", "ok": true, "results": [{"ok": true, "prev_run_id": "", "returncode": 0, "runner_id": 0, "stderr": "no active instance; stop is no-op"}, {"ok": true, "prev_run_id": "", "returncode": 0, "runner_id": 1, "stderr": "no active instance; stop is no-op"}, {"ok": true, "prev_run_id": "", "returncode": 0, "runner_id":...<truncated 261 chars>
+[baseline] {"counts": {"bug": 0, "not_pass": 0, "pass": 0}, "malformed_records": 0, "missing_paths": 0, "paths": ["/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/clean_baseline.jsonl"], "records": 0, "skipped_bug": 0, "skipped_infra_contaminated": 0, "skipped_other_status": 0, "unique_task_count": 0}
+[task:1] start django__django-11740
+[task:2] start django__django-16938
+[task:3] start django__django-13837
+[task:4] start django__django-10554
+[result] 1/100 django__django-16938 status=pass steps=11 verified=True reason=env_done
+[progress] total=1 pass=1 not_pass=0 bug=0 acc=1.000 bug_excl=1.000
+[task:1] start astropy__astropy-13398
+[result] 2/100 django__django-13837 status=pass steps=8 verified=True reason=env_done
+[progress] total=2 pass=2 not_pass=0 bug=0 acc=1.000 bug_excl=1.000
+[task:2] start django__django-13964
+[result] 3/100 django__django-13964 status=pass steps=14 verified=True reason=env_done
+[progress] total=3 pass=3 not_pass=0 bug=0 acc=1.000 bug_excl=1.000
+[task:3] start matplotlib__matplotlib-14623
+[result] 4/100 matplotlib__matplotlib-14623 status=bug steps=0 verified=None reason=RemoteSweError: remote swe_proxy failed rc=1 op='start' runtime=3.4s stdout={"ok": false, "error": "JSONDecodeError('Expecting value: line 1 column 1 (char 0)')"}
+ stderr=
+[progress] total=4 pass=3 not_pass=0 bug=1 acc=0.750 bug_excl=1.000
+[task:4] start django__django-13933
+[result] 5/100 django__django-13933 status=pass steps=5 verified=True reason=env_done
+[progress] total=5 pass=4 not_pass=0 bug=1 acc=0.800 bug_excl=1.000
+[task:1] start django__django-16136
+[result] 6/100 django__django-16136 status=pass steps=6 verified=True reason=env_done
+[progress] total=6 pass=5 not_pass=0 bug=1 acc=0.833 bug_excl=1.000
+[task:2] start django__django-14608
+[result] 7/100 astropy__astropy-13398 status=not_pass steps=48 verified=False reason=max_steps after 2479.8s
+[progress] total=7 pass=5 not_pass=1 bug=1 acc=0.714 bug_excl=0.833
+[task:3] start astropy__astropy-13453
+[result] 8/100 django__django-14608 status=pass steps=18 verified=True reason=env_done
+[progress] total=8 pass=6 not_pass=1 bug=1 acc=0.750 bug_excl=0.857
+[task:4] start django__django-16255
+[result] 9/100 django__django-16255 status=pass steps=5 verified=True reason=env_done
+[progress] total=9 pass=7 not_pass=1 bug=1 acc=0.778 bug_excl=0.875
+[task:1] start django__django-13449
+[result] 10/100 django__django-10554 status=not_pass steps=48 verified=False reason=max_steps after 3833.4s
+[progress] total=10 pass=7 not_pass=2 bug=1 acc=0.700 bug_excl=0.778
+[task:2] start django__django-15930
+[result] 11/100 django__django-11740 status=not_pass steps=48 verified=False reason=max_steps after 4500.3s
+[progress] total=11 pass=7 not_pass=3 bug=1 acc=0.636 bug_excl=0.700
+[task:3] start astropy__astropy-8707
+[result] 12/100 django__django-15930 status=pass steps=11 verified=True reason=env_done
+[progress] total=12 pass=8 not_pass=3 bug=1 acc=0.667 bug_excl=0.727
+[task:4] start django__django-16612
+[result] 13/100 astropy__astropy-13453 status=pass steps=31 verified=True reason=env_done
+[progress] total=13 pass=9 not_pass=3 bug=1 acc=0.692 bug_excl=0.750
+[task:1] start django__django-12419
+[result] 14/100 django__django-16612 status=pass steps=6 verified=True reason=env_done
+[progress] total=14 pass=10 not_pass=3 bug=1 acc=0.714 bug_excl=0.769
+[task:2] start django__django-11206
+[result] 15/100 django__django-12419 status=pass steps=5 verified=True reason=env_done
+[progress] total=15 pass=11 not_pass=3 bug=1 acc=0.733 bug_excl=0.786
+[task:3] start django__django-16493
+[result] 16/100 astropy__astropy-8707 status=pass steps=10 verified=True reason=env_done
+[progress] total=16 pass=12 not_pass=3 bug=1 acc=0.750 bug_excl=0.800
+[task:4] start django__django-13121
+[result] 17/100 django__django-16493 status=pass steps=5 verified=True reason=env_done
+[progress] total=17 pass=13 not_pass=3 bug=1 acc=0.765 bug_excl=0.812
+[task:1] start django__django-15161
+[result] 18/100 django__django-11206 status=pass steps=5 verified=True reason=env_done
+[progress] total=18 pass=14 not_pass=3 bug=1 acc=0.778 bug_excl=0.824
+[task:2] start django__django-15277
+[result] 19/100 django__django-13121 status=pass steps=28 verified=True reason=env_done
+[progress] total=19 pass=15 not_pass=3 bug=1 acc=0.789 bug_excl=0.833
+[task:3] start astropy__astropy-13033
+[result] 20/100 django__django-15277 status=pass steps=8 verified=True reason=env_done
+[progress] total=20 pass=16 not_pass=3 bug=1 acc=0.800 bug_excl=0.842
+[task:4] start django__django-11299
+[result] 21/100 django__django-13449 status=pass steps=35 verified=True reason=env_done
+[progress] total=21 pass=17 not_pass=3 bug=1 acc=0.810 bug_excl=0.850
+[task:1] start django__django-11532
+[result] 22/100 django__django-11532 status=pass steps=12 verified=True reason=env_done
+[progress] total=22 pass=18 not_pass=3 bug=1 acc=0.818 bug_excl=0.857
+[task:2] start django__django-12325
+[result] 23/100 django__django-11299 status=not_pass steps=48 verified=False reason=max_steps after 1964.1s
+[progress] total=23 pass=18 not_pass=4 bug=1 acc=0.783 bug_excl=0.818
+[task:3] start astropy__astropy-7671
+[result] 24/100 django__django-12325 status=pass steps=20 verified=True reason=env_done
+[progress] total=24 pass=19 not_pass=4 bug=1 acc=0.792 bug_excl=0.826
+[task:4] start django__django-11179
+[result] 25/100 astropy__astropy-7671 status=pass steps=6 verified=True reason=env_done
+[progress] total=25 pass=20 not_pass=4 bug=1 acc=0.800 bug_excl=0.833
+[task:1] start django__django-11477
+[result] 26/100 django__django-11179 status=pass steps=6 verified=True reason=env_done
+[progress] total=26 pass=21 not_pass=4 bug=1 acc=0.808 bug_excl=0.840
+[task:2] start django__django-12308
+[result] 27/100 django__django-15161 status=pass steps=38 verified=True reason=env_done
+[progress] total=27 pass=22 not_pass=4 bug=1 acc=0.815 bug_excl=0.846
+[task:3] start django__django-16661
+[result] 28/100 django__django-16661 status=pass steps=8 verified=True reason=env_done
+[progress] total=28 pass=23 not_pass=4 bug=1 acc=0.821 bug_excl=0.852
+[task:4] start django__django-14787
+[result] 29/100 django__django-14787 status=pass steps=7 verified=True reason=env_done
+[progress] total=29 pass=24 not_pass=4 bug=1 acc=0.828 bug_excl=0.857
+[task:1] start django__django-16560
+[result] 30/100 django__django-11477 status=not_pass steps=48 verified=False reason=max_steps after 2715.1s
+[progress] total=30 pass=24 not_pass=5 bug=1 acc=0.800 bug_excl=0.828
+[task:2] start django__django-15127
+[result] 31/100 django__django-12308 status=not_pass steps=48 verified=False reason=max_steps after 2617.5s
+[progress] total=31 pass=24 not_pass=6 bug=1 acc=0.774 bug_excl=0.800
+[task:3] start django__django-13279
+[result] 32/100 django__django-13279 status=pass steps=17 verified=True reason=env_done
+[progress] total=32 pass=25 not_pass=6 bug=1 acc=0.781 bug_excl=0.806
+[task:4] start django__django-13344

@@ -1,0 +1,33 @@
+
+## planner_malformed_response
+
+```json
+{
+  "attempt": 1,
+  "error": "planner HTTP 400: {\"error\":{\"message\":\"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment\",\"type\":\"Arrearage\",\"param\":null,\"code\":\"Arrearage\"},\"id\":\"chatcmpl-52038ace-d5ca-9ff8-b335-ed99c45a48ef\",\"request_id\":\"52038ace-d5ca-9ff8-b335-ed99c45a48ef\"}",
+  "raw_response": null,
+  "step": 1
+}
+```
+
+## planner_malformed_response
+
+```json
+{
+  "attempt": 2,
+  "error": "planner HTTP 400: {\"error\":{\"message\":\"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment\",\"type\":\"Arrearage\",\"param\":null,\"code\":\"Arrearage\"},\"id\":\"chatcmpl-82d33f27-7e66-9fcf-bcd7-4ed4ac87d3c6\",\"request_id\":\"82d33f27-7e66-9fcf-bcd7-4ed4ac87d3c6\"}",
+  "raw_response": null,
+  "step": 1
+}
+```
+
+## planner_malformed_response
+
+```json
+{
+  "attempt": 3,
+  "error": "planner HTTP 400: {\"error\":{\"message\":\"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment\",\"type\":\"Arrearage\",\"param\":null,\"code\":\"Arrearage\"},\"id\":\"chatcmpl-8203f619-595d-90e6-b595-7da6b033b2e7\",\"request_id\":\"8203f619-595d-90e6-b595-7da6b033b2e7\"}",
+  "raw_response": null,
+  "step": 1
+}
+```

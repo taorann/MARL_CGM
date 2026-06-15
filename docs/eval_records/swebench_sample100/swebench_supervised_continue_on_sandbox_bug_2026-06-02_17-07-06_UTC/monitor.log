@@ -1,0 +1,46 @@
+
+===== 2026-06-02 17:17:20 UTC =====
+pid=35918
+    PID STAT     ELAPSED CMD
+  35918 Ss         10:14 python -m graphplanner_agent.cli.eval_supervisor --tasks /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_available_enriched_seed20260601.jsonl --parallel 4 --run-dir /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC --baseline-results /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_clean_baseline_after_retry23_2026-06-02.jsonl --max-rounds 3 --recovery-sleep 3 --cgm-backend http --cgm-endpoint http://127.0.0.1:30003/generate --sandbox-backend remote_swe --sandbox-num-runners 4 --observation-mode text --max-steps 48 --remote-sandbox-invalid-policy continue --stop-after-remote-runner-bugs 1 --stop-after-remote-sandbox-invalid 1
+--- summary ---
+{
+  "accuracy": 0.8490566037735849,
+  "bug_excluded_accuracy": 0.8490566037735849,
+  "clean_record_count": 53,
+  "counts": {
+    "bug": 0,
+    "not_pass": 8,
+    "pass": 45
+  },
+  "remaining_count": 47,
+  "rounds": []
+}
+--- latest round ---
+round_dir=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01
+results_lines=0
+{"counts": {"bug": 0, "not_pass": 0, "pass": 0}, "infra_contaminated": 0}
+# GraphPlanner Progress
+
+- total: 53
+- pass: 45
+- not_pass: 8
+- bug: 0
+- accuracy: 0.849
+- bug_excluded_accuracy: 0.849
+- current_run_total: 0
+- baseline_total: 53
+
+- baseline_label: supervisor_clean_baseline_round_1
+- baseline_counts: `{"bug": 0, "not_pass": 8, "pass": 45}`
+- current_run_counts: `{"bug": 0, "not_pass": 0, "pass": 0}`
+
+## django__django-10554
+
+- phase: running
+- metadata: `{"backend": "remote_swe", "cgm": "http", "graph_edges": 106044, "graph_nodes": 48199, "max_steps": 48, "worker": 1}`
+
+| step | tool | status | elapsed | summary |
+| ---: | --- | --- | ---: | --- |
+| 1 | explore_find | ok | 35.5s | results=12 |
+| 2 | read | ok | 2.4s | function django/db/models/query.py:1066-1073 |

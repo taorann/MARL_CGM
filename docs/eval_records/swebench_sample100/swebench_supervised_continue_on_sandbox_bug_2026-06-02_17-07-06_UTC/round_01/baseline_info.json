@@ -1,0 +1,17 @@
+{
+  "counts": {
+    "bug": 0,
+    "not_pass": 8,
+    "pass": 45
+  },
+  "malformed_records": 0,
+  "missing_paths": 0,
+  "paths": [
+    "/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/clean_baseline.jsonl"
+  ],
+  "records": 53,
+  "skipped_bug": 0,
+  "skipped_infra_contaminated": 0,
+  "skipped_other_status": 0,
+  "unique_task_count": 53
+}

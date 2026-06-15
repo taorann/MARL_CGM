@@ -1,0 +1,129 @@
+
+## round 1
+/opt/conda/bin/python -m graphplanner_agent.cli.eval_parallel --tasks /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01_tasks.jsonl --parallel 4 --run-dir /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01 --baseline-results /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/clean_baseline.jsonl --baseline-label supervisor_clean_baseline_round_1 --remote-cleanup-once --stop-after-remote-runner-bugs 1 --stop-after-remote-sandbox-invalid 1 --remote-sandbox-invalid-policy continue --max-steps 48 --observation-mode text --cgm-backend http --cgm-endpoint http://127.0.0.1:30003/generate --sandbox-backend remote_swe --sandbox-num-runners 4
+[run] dir=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01
+[run] parallel=4 results=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01/results.jsonl progress=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01/progress.md traces=/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01/traces
+[run] shell log suggestion: /root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/round_01/run.log
+[remote] cleanup_once {"cleanup_ok": true, "elapsed": 6.891, "runner_count": 4, "skipped": false}
+[baseline] {"counts": {"bug": 0, "not_pass": 8, "pass": 45}, "malformed_records": 0, "missing_paths": 0, "paths": ["/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_supervised_continue_on_sandbox_bug_2026-06-02_17-07-06_UTC/clean_baseline.jsonl"], "records": 53, "skipped_bug": 0, "skipped_infra_contaminated": 0, "skipped_other_status": 0, "unique_task_count": 53}
+[task:1] start django__django-10554
+[task:2] start django__django-13964
+[task:3] start astropy__astropy-13453
+[task:4] start django__django-11206
+[result] 1/47 django__django-11206 status=pass steps=9 verified=True reason=env_done
+[progress] total=54 pass=46 not_pass=8 bug=0 acc=0.852 bug_excl=0.852
+[task:1] start astropy__astropy-13033
+[result] 2/47 astropy__astropy-13453 status=not_pass steps=48 verified=False reason=max_steps after 2107.8s
+[progress] total=55 pass=46 not_pass=9 bug=0 acc=0.836 bug_excl=0.836
+[task:2] start django__django-12308
+[result] 3/47 django__django-12308 status=pass steps=12 verified=True reason=env_done
+[progress] total=56 pass=47 not_pass=9 bug=0 acc=0.839 bug_excl=0.839
+[task:3] start django__django-16560
+[result] 4/47 django__django-13964 status=not_pass steps=48 verified=False reason=max_steps after 2709.5s
+[progress] total=57 pass=47 not_pass=10 bug=0 acc=0.825 bug_excl=0.825
+[task:4] start django__django-15127
+[result] 5/47 django__django-10554 status=not_pass steps=48 verified=False reason=max_steps after 2784.5s
+[progress] total=58 pass=47 not_pass=11 bug=0 acc=0.810 bug_excl=0.810
+[task:1] start django__django-13344
+[result] 6/47 astropy__astropy-13033 status=not_pass steps=48 verified=False reason=max_steps after 2473.2s
+[progress] total=59 pass=47 not_pass=12 bug=0 acc=0.797 bug_excl=0.797
+[task:2] start django__django-12406
+[result] 7/47 django__django-15127 status=not_pass steps=48 verified=False reason=max_steps after 1185.6s
+[progress] total=60 pass=47 not_pass=13 bug=0 acc=0.783 bug_excl=0.783
+[task:3] start django__django-15503
+[result] 8/47 django__django-15503 status=pass steps=20 verified=True reason=env_done
+[progress] total=61 pass=48 not_pass=13 bug=0 acc=0.787 bug_excl=0.787
+[task:4] start django__django-11265
+[result] 9/47 django__django-12406 status=not_pass steps=48 verified=False reason=max_steps after 1814.2s
+[progress] total=62 pass=48 not_pass=14 bug=0 acc=0.774 bug_excl=0.774
+[task:1] start django__django-12965
+[result] 10/47 django__django-11265 status=bug steps=26 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-a47720d7-3969-9fd0-98eb-1c23dd91eb01","request_id":"a47720d7-3969-9fd0-98eb-1c23dd91eb01"}
+[progress] total=63 pass=48 not_pass=14 bug=1 acc=0.762 bug_excl=0.774
+[task:2] start astropy__astropy-14369
+[result] 11/47 astropy__astropy-14369 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-e31d741a-4a16-99bd-88c3-b0a00f887465","request_id":"e31d741a-4a16-99bd-88c3-b0a00f887465"}
+[progress] total=64 pass=48 not_pass=14 bug=2 acc=0.750 bug_excl=0.774
+[task:3] start django__django-15554
+[result] 12/47 django__django-15554 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-6a240523-0b99-9587-93fa-72de2ae848cc","request_id":"6a240523-0b99-9587-93fa-72de2ae848cc"}
+[progress] total=65 pass=48 not_pass=14 bug=3 acc=0.738 bug_excl=0.774
+[task:4] start django__django-12273
+[result] 13/47 django__django-12273 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-b1d2312e-a015-93d4-940f-a1f0b896697b","request_id":"b1d2312e-a015-93d4-940f-a1f0b896697b"}
+[progress] total=66 pass=48 not_pass=14 bug=4 acc=0.727 bug_excl=0.774
+[task:1] start django__django-12663
+[result] 14/47 django__django-12663 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-5dcf1dee-16c2-9116-9f12-8a4689046ae2","request_id":"5dcf1dee-16c2-9116-9f12-8a4689046ae2"}
+[progress] total=67 pass=48 not_pass=14 bug=5 acc=0.716 bug_excl=0.774
+[task:2] start django__django-11276
+[result] 15/47 django__django-12965 status=bug steps=11 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-7f53abc9-57f8-9dce-a82c-8183de39885d","request_id":"7f53abc9-57f8-9dce-a82c-8183de39885d"}
+[progress] total=68 pass=48 not_pass=14 bug=6 acc=0.706 bug_excl=0.774
+[task:3] start django__django-11820
+[result] 16/47 django__django-11276 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-fe2bfd34-9a8f-939b-87e4-f14650b17f83","request_id":"fe2bfd34-9a8f-939b-87e4-f14650b17f83"}
+[progress] total=69 pass=48 not_pass=14 bug=7 acc=0.696 bug_excl=0.774
+[task:4] start astropy__astropy-13236
+[result] 17/47 django__django-11820 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-2e1a2e5d-c5db-90e7-a0de-3266150a74cd","request_id":"2e1a2e5d-c5db-90e7-a0de-3266150a74cd"}
+[progress] total=70 pass=48 not_pass=14 bug=8 acc=0.686 bug_excl=0.774
+[task:1] start django__django-15375
+[result] 18/47 astropy__astropy-13236 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-7512f8e9-bc50-9373-8b08-9bebf61c2a01","request_id":"7512f8e9-bc50-9373-8b08-9bebf61c2a01"}
+[progress] total=71 pass=48 not_pass=14 bug=9 acc=0.676 bug_excl=0.774
+[task:2] start django__django-16315
+[result] 19/47 django__django-15375 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-7d9c8a52-3695-99bf-b109-7c006e94b1de","request_id":"7d9c8a52-3695-99bf-b109-7c006e94b1de"}
+[progress] total=72 pass=48 not_pass=14 bug=10 acc=0.667 bug_excl=0.774
+[task:3] start django__django-15037
+[result] 20/47 django__django-16315 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-f5c2b89e-ea77-933a-9584-716ea2adf0b4","request_id":"f5c2b89e-ea77-933a-9584-716ea2adf0b4"}
+[progress] total=73 pass=48 not_pass=14 bug=11 acc=0.658 bug_excl=0.774
+[task:4] start django__django-13658
+[result] 21/47 django__django-15037 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-efb8ad27-17fb-9cab-947a-19e2203195f3","request_id":"efb8ad27-17fb-9cab-947a-19e2203195f3"}
+[progress] total=74 pass=48 not_pass=14 bug=12 acc=0.649 bug_excl=0.774
+[task:1] start django__django-16145
+[result] 22/47 django__django-13658 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-0f554585-af8d-9c68-97a4-e0f1810bea38","request_id":"0f554585-af8d-9c68-97a4-e0f1810bea38"}
+[progress] total=75 pass=48 not_pass=14 bug=13 acc=0.640 bug_excl=0.774
+[task:2] start django__django-11400
+[result] 23/47 django__django-13344 status=bug steps=36 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-2399cf5d-fb7d-9064-b2fd-c0f079bc4835","request_id":"2399cf5d-fb7d-9064-b2fd-c0f079bc4835"}
+[progress] total=76 pass=48 not_pass=14 bug=14 acc=0.632 bug_excl=0.774
+[task:3] start django__django-10880
+[result] 24/47 django__django-16145 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-8bc52531-3348-94bf-aad4-0d3b25ed049f","request_id":"8bc52531-3348-94bf-aad4-0d3b25ed049f"}
+[progress] total=77 pass=48 not_pass=14 bug=15 acc=0.623 bug_excl=0.774
+[task:4] start django__django-13028
+[result] 25/47 django__django-11400 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-16f52c36-4711-9f52-8e22-f0d46347de29","request_id":"16f52c36-4711-9f52-8e22-f0d46347de29"}
+[progress] total=78 pass=48 not_pass=14 bug=16 acc=0.615 bug_excl=0.774
+[task:1] start django__django-14315
+[result] 26/47 django__django-10880 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-93153baa-2b5f-9e1a-ac3b-a9b2ed9d8b8a","request_id":"93153baa-2b5f-9e1a-ac3b-a9b2ed9d8b8a"}
+[progress] total=79 pass=48 not_pass=14 bug=17 acc=0.608 bug_excl=0.774
+[task:2] start django__django-15499
+[result] 27/47 django__django-13028 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-a87d2c58-e2fd-9e20-ab50-63fdf84fec62","request_id":"a87d2c58-e2fd-9e20-ab50-63fdf84fec62"}
+[progress] total=80 pass=48 not_pass=14 bug=18 acc=0.600 bug_excl=0.774
+[task:3] start django__django-14311
+[result] 28/47 django__django-14315 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-604df5a7-8a4d-946f-bdec-3a5ffc992609","request_id":"604df5a7-8a4d-946f-bdec-3a5ffc992609"}
+[progress] total=81 pass=48 not_pass=14 bug=19 acc=0.593 bug_excl=0.774
+[task:4] start django__django-10914
+[result] 29/47 django__django-15499 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-050baa36-5ad4-9ad8-a197-1e037d171a7c","request_id":"050baa36-5ad4-9ad8-a197-1e037d171a7c"}
+[progress] total=82 pass=48 not_pass=14 bug=20 acc=0.585 bug_excl=0.774
+[task:1] start django__django-14434
+[result] 30/47 django__django-14311 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-cdaaa7a0-7609-94dd-9aab-e5ef9635e8f8","request_id":"cdaaa7a0-7609-94dd-9aab-e5ef9635e8f8"}
+[progress] total=83 pass=48 not_pass=14 bug=21 acc=0.578 bug_excl=0.774
+[task:2] start django__django-11292
+[result] 31/47 django__django-10914 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-dcd376e6-7d8f-95ed-81c9-e998f9fc1b31","request_id":"dcd376e6-7d8f-95ed-81c9-e998f9fc1b31"}
+[progress] total=84 pass=48 not_pass=14 bug=22 acc=0.571 bug_excl=0.774
+[task:3] start django__django-12039
+[result] 32/47 django__django-14434 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-e5b9142b-174d-947d-a629-f16e12bd1568","request_id":"e5b9142b-174d-947d-a629-f16e12bd1568"}
+[progress] total=85 pass=48 not_pass=14 bug=23 acc=0.565 bug_excl=0.774
+[task:4] start django__django-14376
+[result] 33/47 django__django-11292 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-2d1497d5-acbc-928a-89de-374380542c2f","request_id":"2d1497d5-acbc-928a-89de-374380542c2f"}
+[progress] total=86 pass=48 not_pass=14 bug=24 acc=0.558 bug_excl=0.774
+[task:1] start django__django-16116
+[result] 34/47 django__django-12039 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-66f1a2e4-6ee0-9592-8055-37abdec4d405","request_id":"66f1a2e4-6ee0-9592-8055-37abdec4d405"}
+[progress] total=87 pass=48 not_pass=14 bug=25 acc=0.552 bug_excl=0.774
+[task:2] start django__django-16454
+[result] 35/47 django__django-16560 status=bug steps=28 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-83912bf6-2a78-944a-a7ff-72db75c3f725","request_id":"83912bf6-2a78-944a-a7ff-72db75c3f725"}
+[progress] total=88 pass=48 not_pass=14 bug=26 acc=0.545 bug_excl=0.774
+[task:3] start django__django-7530
+[result] 36/47 django__django-14376 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-57baf3d9-d438-99ab-b9b5-8346fca667f1","request_id":"57baf3d9-d438-99ab-b9b5-8346fca667f1"}
+[progress] total=89 pass=48 not_pass=14 bug=27 acc=0.539 bug_excl=0.774
+[task:4] start django__django-11333
+[result] 37/47 django__django-16116 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-47937e7a-6e42-97e6-8a25-c65c9c2fad23","request_id":"47937e7a-6e42-97e6-8a25-c65c9c2fad23"}
+[progress] total=90 pass=48 not_pass=14 bug=28 acc=0.533 bug_excl=0.774
+[task:1] start django__django-15098
+[result] 38/47 django__django-7530 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-436d559d-651a-9142-bcc9-dc766706c667","request_id":"436d559d-651a-9142-bcc9-dc766706c667"}
+[progress] total=91 pass=48 not_pass=14 bug=29 acc=0.527 bug_excl=0.774
+[task:2] start django__django-14771
+[result] 39/47 django__django-16454 status=bug steps=1 verified=False reason=planner output parse failed: planner HTTP 400: {"error":{"message":"Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment","type":"Arrearage","param":null,"code":"Arrearage"},"id":"chatcmpl-67fff68d-2496-971d-9881-18e5ecefba45","request_id":"67fff68d-2496-971d-9881-18e5ecefba45"}
+[progress] total=92 pass=48 not_pass=14 bug=30 acc=0.522 bug_excl=0.774
+[task:3] start django__django-16899

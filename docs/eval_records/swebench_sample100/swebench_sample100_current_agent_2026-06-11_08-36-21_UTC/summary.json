@@ -1,0 +1,47 @@
+{
+  "accuracy": 0.8518518518518519,
+  "baseline_info": {
+    "counts": {
+      "bug": 0,
+      "not_pass": 4,
+      "pass": 23
+    },
+    "malformed_records": 0,
+    "missing_paths": 0,
+    "paths": [
+      "/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/clean_baseline.jsonl"
+    ],
+    "records": 27,
+    "skipped_bug": 0,
+    "skipped_infra_contaminated": 0,
+    "skipped_other_status": 0,
+    "unique_task_count": 27
+  },
+  "bug_excluded_accuracy": 0.8518518518518519,
+  "clean_baseline_path": "/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/clean_baseline.jsonl",
+  "clean_record_count": 27,
+  "counts": {
+    "bug": 0,
+    "not_pass": 4,
+    "pass": 23
+  },
+  "max_rounds": 3,
+  "remaining_count": 73,
+  "rounds": [
+    {
+      "clean_added_count": 27,
+      "elapsed": 14701.431,
+      "input_task_count": 100,
+      "result_count": 32,
+      "returncode": -9,
+      "round": 1,
+      "round_dir": "/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01",
+      "status_counts": {
+        "bug": 1,
+        "not_pass": 6,
+        "pass": 25
+      },
+      "stop_reason": null
+    }
+  ]
+}

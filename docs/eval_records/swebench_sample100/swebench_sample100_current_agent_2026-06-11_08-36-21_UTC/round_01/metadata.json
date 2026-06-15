@@ -1,0 +1,24 @@
+{
+  "baseline_results": [
+    "/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/clean_baseline.jsonl"
+  ],
+  "cgm_backend": "http",
+  "cgm_endpoint": "http://127.0.0.1:30003/generate",
+  "max_steps": 48,
+  "observation_mode": "text",
+  "parallel": 4,
+  "planner_enable_thinking": false,
+  "planner_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+  "planner_model": "qwen3-coder-480b-a35b-instruct",
+  "planner_tool_calling": false,
+  "remote_cleanup_once": false,
+  "remote_preflight": "cleanup",
+  "resume_from_results": null,
+  "retry_bug_results": false,
+  "sandbox_backend": "remote_swe",
+  "sandbox_num_runners": 4,
+  "task_count": 100,
+  "tasks_path": "/root/private_data/MARL_CGM-main/agent_rebuild/runs/tmp/swebench_sample100_current_agent_2026-06-11_08-36-21_UTC/round_01_tasks.jsonl",
+  "worker_cleanup_disabled": true,
+  "worker_ensure_runners_disabled": true
+}

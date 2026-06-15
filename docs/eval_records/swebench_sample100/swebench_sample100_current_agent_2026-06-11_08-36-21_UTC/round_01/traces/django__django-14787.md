@@ -1,0 +1,835 @@
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {},
+    "tool": "run_failed_test"
+  },
+  "result": {
+    "test": {
+      "command": "<official SWE-bench eval command omitted; contains benchmark harness setup/test patch>",
+      "command_omitted_for_benchmark_hygiene": true,
+      "excerpt": "Actual runtime failure summary (benchmark expected values omitted):\nexception_types: AssertionError\nactual_messages:\n- None != 'method'",
+      "implementation_frames": [],
+      "parser_error": "missing version for SWE-bench log parser",
+      "resolved": null,
+      "returncode": 1,
+      "runtime_observations": {
+        "actual_assertion_values": [],
+        "actual_messages": [
+          "None != 'method'"
+        ],
+        "exception_types": [
+          "AssertionError"
+        ],
+        "failed_selectors": [],
+        "omitted_hidden_expected_values": false,
+        "policy": "actual runtime output only; benchmark test source and hidden expected values are omitted"
+      },
+      "status": "failed",
+      "tests_status": {}
+    },
+    "tool": "run_failed_test"
+  },
+  "step": 1,
+  "visible_thinking": "The issue describes a problem with `method_decorator()` where the function passed to the decorator is a `functools.partial` object that lacks attributes like `__name__` and `__module__`. This causes an `AttributeError` when trying to access these attributes.\nFirst, I need to understand the context better by running the failed test to see the exact behavior. Since no test has been run yet, I'll start by running the failed test to gather the runtime behavior evidence."
+}
+```
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {
+      "find_type": "function",
+      "path_glob": "**/*.py",
+      "query": "method_decorator"
+    },
+    "tool": "explore_find"
+  },
+  "result": {
+    "path_glob": "**/*.py",
+    "result_policy": "function/class/method/assignment results include a small implementation preview in W for orientation only; read the node before memory_commit or repair evidence. file-level results list top symbols instead of full file text",
+    "results": [
+      {
+        "code": "  53: def method_decorator(decorator, name=''):\n  54:     \"\"\"\n  55:     Convert a function decorator into a method decorator\n  56:     \"\"\"\n  57:     # 'obj' can be a class or a function. If 'obj' is a function at the time it\n  58:     # is passed to _dec,  it will eventually be a method of the class it is\n  59:     # defined on. If 'obj' is a class, the 'name' is required to be the name\n  60:     # of the method that will be decorated.\n  61:     def _dec(obj):\n  62:         if not isinstance(obj, type):\n  63:             return _multi_decorate(decorator, obj)\n  64:         if not (name and hasattr(obj, name)):\n  65:             raise ValueError(\n  66:                 \"The keyword argument `name` must be the name of a method \"\n  67:                 \"of the decorated class: %s. Got '%s' instead.\" % (obj, name)\n  68:             )\n  69:         method = getattr(obj, name)\n  70:         if not callable(method):\n  71:             raise TypeError(\n  72:                 \"Cannot decorate '%s' as it isn't a callable attribute of \"\n  73:                 \"%s (%s).\" % (name, obj, method)\n  74:             )\n  75:         _wrapper = _multi_decorate(decorator, method)\n  76:         setattr(obj, name, _wrapper)\n  77:         return obj\n  78: \n  79:     # Don't worry about making _dec look similar to a list/tuple as it's rather\n  80:     # meaningless.",
+        "code_preview_lines": [
+          53,
+          80
+        ],
+        "code_preview_policy": "orientation preview only; call read on this node before memory_commit or repair",
+        "code_preview_truncated": true,
+        "dispatch_relationship_context": [],
+        "dispatch_tables": [],
+        "id": "func:django/utils/decorators.py:method_decorator:53",
+        "kind": "function",
+        "lines": [
+          53,
+          86
+        ],
+        "local_symbol_references": [
+          {
+            "appearance_index": 214,
+            "id": "func:django/utils/decorators.py:method_decorator._dec:61",
+            "kind": "function",
+            "lines": [
+              61,
+              77
+            ],
+            "name": "method_decorator._dec",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_dec"
+          },
+          {
+            "appearance_index": 468,
+            "id": "func:django/utils/decorators.py:_multi_decorate:22",
+            "kind": "function",
+            "lines": [
+              22,
+              50
+            ],
+            "name": "_multi_decorate",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_multi_decorate"
+          },
+          {
+            "appearance_index": 989,
+            "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+            "kind": "function",
+            "lines": [
+              35,
+              43
+            ],
+            "name": "_multi_decorate._wrapper",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_wrapper"
+          }
+        ],
+        "name": "method_decorator",
+        "path": "django/utils/decorators.py",
+        "score": 4.0,
+        "source": "graph",
+        "unread_local_symbol_references": [
+          {
+            "appearance_index": 214,
+            "id": "func:django/utils/decorators.py:method_decorator._dec:61",
+            "kind": "function",
+            "lines": [
+              61,
+              77
+            ],
+            "name": "method_decorator._dec",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_dec"
+          },
+          {
+            "appearance_index": 468,
+            "id": "func:django/utils/decorators.py:_multi_decorate:22",
+            "kind": "function",
+            "lines": [
+              22,
+              50
+            ],
+            "name": "_multi_decorate",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_multi_decorate"
+          },
+          {
+            "appearance_index": 989,
+            "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+            "kind": "function",
+            "lines": [
+              35,
+              43
+            ],
+            "name": "_multi_decorate._wrapper",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_wrapper"
+          }
+        ]
+      },
+      {
+        "code": "  61:     def _dec(obj):\n  62:         if not isinstance(obj, type):\n  63:             return _multi_decorate(decorator, obj)\n  64:         if not (name and hasattr(obj, name)):\n  65:             raise ValueError(\n  66:                 \"The keyword argument `name` must be the name of a method \"\n  67:                 \"of the decorated class: %s. Got '%s' instead.\" % (obj, name)\n  68:             )\n  69:         method = getattr(obj, name)\n  70:         if not callable(method):\n  71:             raise TypeError(\n  72:                 \"Cannot decorate '%s' as it isn't a callable attribute of \"\n  73:                 \"%s (%s).\" % (name, obj, method)\n  74:             )\n  75:         _wrapper = _multi_decorate(decorator, method)\n  76:         setattr(obj, name, _wrapper)\n  77:         return obj",
+        "code_preview_lines": [
+          61,
+          77
+        ],
+        "code_preview_policy": "orientation preview only; call read on this node before memory_commit or repair",
+        "code_preview_truncated": false,
+        "dispatch_relationship_context": [],
+        "dispatch_tables": [],
+        "id": "func:django/utils/decorators.py:method_decorator._dec:61",
+        "kind": "function",
+        "lines": [
+          61,
+          77
+        ],
+        "local_symbol_references": [
+          {
+            "appearance_index": 76,
+            "id": "func:django/utils/decorators.py:_multi_decorate:22",
+            "kind": "function",
+            "lines": [
+              22,
+              50
+            ],
+            "name": "_multi_decorate",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_multi_decorate"
+          },
+          {
+            "appearance_index": 597,
+            "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+            "kind": "function",
+            "lines": [
+              35,
+              43
+            ],
+            "name": "_multi_decorate._wrapper",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_wrapper"
+          }
+        ],
+        "name": "method_decorator._dec",
+        "path": "django/utils/decorators.py",
+        "score": 4.0,
+        "source": "graph",
+        "unread_local_symbol_references": [
+          {
+            "appearance_index": 76,
+            "id": "func:django/utils/decorators.py:_multi_decorate:22",
+            "kind": "function",
+            "lines": [
+              22,
+              50
+            ],
+            "name": "_multi_decorate",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_multi_decorate"
+          },
+          {
+            "appearance_index": 597,
+            "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+            "kind": "function",
+            "lines": [
+              35,
+              43
+            ],
+            "name": "_multi_decorate._wrapper",
+            "path": "django/utils/decorators.py",
+            "read_status": "unread",
+            "relation": "symbol_reference",
+            "source": "referenced in the current implementation snippet",
+            "symbol": "_wrapper"
+          }
+        ]
+      }
+    ],
+    "tool": "explore_find",
+    "warning": null
+  },
+  "step": 2,
+  "visible_thinking": "The issue describes a problem with `method_decorator()` where the function passed to the decorator is a `functools.partial` object that lacks attributes like `__name__` and `__module__`. This causes an `AttributeError` when trying to access these attributes.\nThe error message from the test run is `AssertionError: None != 'method'`, which suggests that there's an assertion failing related to the method name.\nI need to find the implementation of `method_decorator` to understand how it works and where the issue might be occurring. I'll start by searching for the `method_decorator` function."
+}
+```
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {
+      "node_id": "func:django/utils/decorators.py:_multi_decorate:22"
+    },
+    "tool": "read"
+  },
+  "result": {
+    "code": "  22: def _multi_decorate(decorators, method):\n  23:     \"\"\"\n  24:     Decorate `method` with one or more function decorators. `decorators` can be\n  25:     a single decorator or an iterable of decorators.\n  26:     \"\"\"\n  27:     if hasattr(decorators, '__iter__'):\n  28:         # Apply a list/tuple of decorators if 'decorators' is one. Decorator\n  29:         # functions are applied so that the call order is the same as the\n  30:         # order in which they appear in the iterable.\n  31:         decorators = decorators[::-1]\n  32:     else:\n  33:         decorators = [decorators]\n  34: \n  35:     def _wrapper(self, *args, **kwargs):\n  36:         # bound_method has the signature that 'decorator' expects i.e. no\n  37:         # 'self' argument, but it's a closure over self so it can call\n  38:         # 'func'. Also, wrap method.__get__() in a function because new\n  39:         # attributes can't be set on bound method objects, only on functions.\n  40:         bound_method = partial(method.__get__(self, type(self)))\n  41:         for dec in decorators:\n  42:             bound_method = dec(bound_method)\n  43:         return bound_method(*args, **kwargs)\n  44: \n  45:     # Copy any attributes that a decorator adds to the function it decorates.\n  46:     for dec in decorators:\n  47:         _update_method_wrapper(_wrapper, dec)\n  48:     # Preserve any existing attributes of 'method', including the name.\n  49:     update_wrapper(_wrapper, method)\n  50:     return _wrapper",
+    "dispatch_relationship_context": [],
+    "dispatch_tables": [],
+    "local_symbol_references": [
+      {
+        "appearance_index": 526,
+        "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+        "kind": "function",
+        "lines": [
+          35,
+          43
+        ],
+        "name": "_multi_decorate._wrapper",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_wrapper"
+      },
+      {
+        "appearance_index": 1154,
+        "id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+        "kind": "function",
+        "lines": [
+          13,
+          19
+        ],
+        "name": "_update_method_wrapper",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_update_method_wrapper"
+      }
+    ],
+    "node": {
+      "id": "func:django/utils/decorators.py:_multi_decorate:22",
+      "kind": "function",
+      "lines": [
+        22,
+        50
+      ],
+      "name": "_multi_decorate",
+      "path": "django/utils/decorators.py"
+    },
+    "relationship_context_policy": "consumer candidates are auto-added to W as orientation code only; read the exact node before memory_commit/repair evidence",
+    "tool": "read",
+    "unread_local_symbol_references": [
+      {
+        "appearance_index": 526,
+        "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+        "kind": "function",
+        "lines": [
+          35,
+          43
+        ],
+        "name": "_multi_decorate._wrapper",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_wrapper"
+      },
+      {
+        "appearance_index": 1154,
+        "id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+        "kind": "function",
+        "lines": [
+          13,
+          19
+        ],
+        "name": "_update_method_wrapper",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_update_method_wrapper"
+      }
+    ],
+    "value_flow_context": [
+      {
+        "argument_to_parameter": [
+          {
+            "argument": "_wrapper",
+            "parameter": "...",
+            "position": 0
+          },
+          {
+            "argument": "dec",
+            "position": 1
+          }
+        ],
+        "call": "_update_method_wrapper(_wrapper, dec)",
+        "call_line": 26,
+        "relation": "value_flow_downstream",
+        "source": {
+          "id": "func:django/utils/decorators.py:_multi_decorate:22",
+          "kind": "function",
+          "lines": [
+            22,
+            50
+          ],
+          "name": "_multi_decorate",
+          "path": "django/utils/decorators.py"
+        },
+        "source_read_status": "read",
+        "target": {
+          "id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+          "kind": "function",
+          "lines": [
+            13,
+            19
+          ],
+          "name": "_update_method_wrapper",
+          "path": "django/utils/decorators.py"
+        },
+        "target_read_status": "unread",
+        "unmapped_parameters": []
+      },
+      {
+        "argument_to_parameter": [
+          {
+            "argument": "decorator",
+            "parameter": "decorators",
+            "position": 0
+          },
+          {
+            "argument": "obj",
+            "parameter": "method",
+            "position": 1
+          }
+        ],
+        "call": "_multi_decorate(decorator, obj)",
+        "call_line": 3,
+        "relation": "value_flow_upstream",
+        "source": {
+          "id": "func:django/utils/decorators.py:method_decorator._dec:61",
+          "kind": "function",
+          "lines": [
+            61,
+            77
+          ],
+          "name": "method_decorator._dec",
+          "path": "django/utils/decorators.py"
+        },
+        "source_read_status": "unread",
+        "target": {
+          "id": "func:django/utils/decorators.py:_multi_decorate:22",
+          "kind": "function",
+          "lines": [
+            22,
+            50
+          ],
+          "name": "_multi_decorate",
+          "path": "django/utils/decorators.py"
+        },
+        "target_read_status": "read",
+        "unmapped_parameters": []
+      }
+    ],
+    "value_flow_context_policy": "value_flow_context is best-effort implementation evidence from call expressions and signatures; it shows upstream/downstream argument-to-parameter flow but is not a proof of runtime values. Related caller/callee candidates are added to W; read exact nodes before memory_commit/repair."
+  },
+  "step": 3,
+  "visible_thinking": "The issue is that `method_decorator()` is not preserving wrapper assignments when the decorated function is a `functools.partial` object, which lacks attributes like `__name__`, `__module__`, etc. The error occurs when trying to access `func.__name__` in the logger decorator.\nFrom the explore_find results, I can see the `method_decorator` function and its inner `_dec` function. The problem likely lies in how `_multi_decorate` handles the decoration process. I need to examine the `_multi_decorate` function to understand how it wraps the function and where the attribute preservation might be failing.\nI'll start by reading the `_multi_decorate` function since it's referenced in the code I've seen so far."
+}
+```
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {
+      "node_id": "func:django/utils/decorators.py:_update_method_wrapper:13"
+    },
+    "tool": "read"
+  },
+  "result": {
+    "code": "  13: def _update_method_wrapper(_wrapper, decorator):\n  14:     # _multi_decorate()'s bound_method isn't available in this scope. Cheat by\n  15:     # using it on a dummy function.\n  16:     @decorator\n  17:     def dummy(*args, **kwargs):\n  18:         pass\n  19:     update_wrapper(_wrapper, dummy)",
+    "dispatch_relationship_context": [],
+    "dispatch_tables": [],
+    "local_symbol_references": [
+      {
+        "appearance_index": 27,
+        "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+        "kind": "function",
+        "lines": [
+          35,
+          43
+        ],
+        "name": "_multi_decorate._wrapper",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_wrapper"
+      },
+      {
+        "appearance_index": 55,
+        "id": "func:django/utils/decorators.py:_multi_decorate:22",
+        "kind": "function",
+        "lines": [
+          22,
+          50
+        ],
+        "name": "_multi_decorate",
+        "path": "django/utils/decorators.py",
+        "read_status": "read",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_multi_decorate"
+      },
+      {
+        "appearance_index": 148,
+        "id": "func:django/utils/decorators.py:_update_method_wrapper.dummy:17",
+        "kind": "function",
+        "lines": [
+          17,
+          18
+        ],
+        "name": "_update_method_wrapper.dummy",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "dummy"
+      }
+    ],
+    "node": {
+      "id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+      "kind": "function",
+      "lines": [
+        13,
+        19
+      ],
+      "name": "_update_method_wrapper",
+      "path": "django/utils/decorators.py"
+    },
+    "relationship_context_policy": "consumer candidates are auto-added to W as orientation code only; read the exact node before memory_commit/repair evidence",
+    "tool": "read",
+    "unread_local_symbol_references": [
+      {
+        "appearance_index": 27,
+        "id": "func:django/utils/decorators.py:_multi_decorate._wrapper:35",
+        "kind": "function",
+        "lines": [
+          35,
+          43
+        ],
+        "name": "_multi_decorate._wrapper",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "_wrapper"
+      },
+      {
+        "appearance_index": 148,
+        "id": "func:django/utils/decorators.py:_update_method_wrapper.dummy:17",
+        "kind": "function",
+        "lines": [
+          17,
+          18
+        ],
+        "name": "_update_method_wrapper.dummy",
+        "path": "django/utils/decorators.py",
+        "read_status": "unread",
+        "relation": "symbol_reference",
+        "source": "referenced in the current implementation snippet",
+        "symbol": "dummy"
+      }
+    ],
+    "value_flow_context": [
+      {
+        "argument_to_parameter": [
+          {
+            "argument": "_wrapper",
+            "parameter": "_wrapper",
+            "position": 0
+          },
+          {
+            "argument": "dec",
+            "parameter": "decorator",
+            "position": 1
+          }
+        ],
+        "call": "_update_method_wrapper(_wrapper, dec)",
+        "call_line": 26,
+        "relation": "value_flow_upstream",
+        "source": {
+          "id": "func:django/utils/decorators.py:_multi_decorate:22",
+          "kind": "function",
+          "lines": [
+            22,
+            50
+          ],
+          "name": "_multi_decorate",
+          "path": "django/utils/decorators.py"
+        },
+        "source_read_status": "read",
+        "target": {
+          "id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+          "kind": "function",
+          "lines": [
+            13,
+            19
+          ],
+          "name": "_update_method_wrapper",
+          "path": "django/utils/decorators.py"
+        },
+        "target_read_status": "read",
+        "unmapped_parameters": []
+      }
+    ],
+    "value_flow_context_policy": "value_flow_context is best-effort implementation evidence from call expressions and signatures; it shows upstream/downstream argument-to-parameter flow but is not a proof of runtime values. Related caller/callee candidates are added to W; read exact nodes before memory_commit/repair."
+  },
+  "step": 4,
+  "visible_thinking": "The issue is that `method_decorator()` should preserve wrapper assignments, specifically attributes like `__name__`, `__module__`, etc. The error occurs because the function passed to the decorator is a `functools.partial` object which doesn't have these attributes.\nLooking at the code, I can see that `_multi_decorate` function creates a `_wrapper` function and uses `update_wrapper(_wrapper, method)` to preserve attributes. However, the problem seems to be that when `bound_method` is created using `partial(method.__get__(self, type(self)))`, the `partial` object doesn't have the expected attributes.\nI need to examine the `_update_method_wrapper` function and understand how it's supposed to work with the wrapper assignments. Since I have a reference to `_update_method_wrapper` in the unread local symbol references, I should read that function first.\nLet me check the available expansions for `_multi_decorate` to see if there are any related functions I should look at.\nBased on the error and the code structure, I think the issue is in the `_multi_decorate` function where it tries to preserve wrapper assignments but doesn't handle the case where the method is a `partial` object correctly.\nI'll start by reading the `_update_method_wrapper` function since it's referenced in the code I've already read."
+}
+```
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {
+      "note": "Core functions involved in the method_decorator issue where partial objects lose function attributes",
+      "select_ids": [
+        "func:django/utils/decorators.py:_multi_decorate:22",
+        "func:django/utils/decorators.py:_update_method_wrapper:13"
+      ]
+    },
+    "tool": "memory_commit"
+  },
+  "result": {
+    "already_present_ids": [],
+    "committed": [
+      "func:django/utils/decorators.py:_multi_decorate:22",
+      "func:django/utils/decorators.py:_update_method_wrapper:13"
+    ],
+    "dropped_by_keep_ids": [],
+    "explicitly_selected_ids": [
+      "func:django/utils/decorators.py:_multi_decorate:22",
+      "func:django/utils/decorators.py:_update_method_wrapper:13"
+    ],
+    "memory": [
+      {
+        "has_code": true,
+        "id": "func:django/utils/decorators.py:_multi_decorate:22",
+        "kind": "function",
+        "lines": [
+          22,
+          50
+        ],
+        "name": "_multi_decorate",
+        "path": "django/utils/decorators.py"
+      },
+      {
+        "has_code": true,
+        "id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+        "kind": "function",
+        "lines": [
+          13,
+          19
+        ],
+        "name": "_update_method_wrapper",
+        "path": "django/utils/decorators.py"
+      }
+    ],
+    "memory_changed": true,
+    "newly_added_ids": [
+      "func:django/utils/decorators.py:_multi_decorate:22",
+      "func:django/utils/decorators.py:_update_method_wrapper:13"
+    ],
+    "tool": "memory_commit"
+  },
+  "step": 5,
+  "visible_thinking": "The issue is that `method_decorator()` should preserve wrapper assignments, specifically attributes like `__name__`, `__module__`, etc. The error occurs because the function passed to the decorator is a `functools.partial` object which doesn't have these attributes.\nLooking at the code:\n1. In `_multi_decorate()`, a `_wrapper` function is created that uses `partial(method.__get__(self, type(self)))` to create `bound_method`.\n2. This `bound_method` (which is a partial) is then passed to decorators.\n3. When `@wraps(func)` is used in a decorator like `logger`, it tries to access `func.__name__` but the partial object doesn't have this attribute.\nThe problem seems to be in how the wrapper attributes are being handled. Looking at `_update_method_wrapper()`, it creates a dummy function and applies the decorator to it, then uses `update_wrapper(_wrapper, dummy)` to copy attributes. However, this might not be sufficient when dealing with partial objects.\nI need to examine the `_wrapper` function in `_multi_decorate` more closely, and also understand how `update_wrapper` is supposed to work in this context. Let me check if there are any unread references that might help clarify this.\nFirst, I should commit the read nodes to memory since they're part of the evidence chain."
+}
+```
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {
+      "confidence": 0.8,
+      "evidence_chain": [
+        {
+          "evidence": "_multi_decorate creates a _wrapper and uses update_wrapper to copy attributes, but the bound_method created via partial doesn't have the expected function attributes",
+          "node_id": "func:django/utils/decorators.py:_multi_decorate:22",
+          "role": "target"
+        },
+        {
+          "evidence": "_update_method_wrapper applies decorator to a dummy function to get attributes, but this doesn't address the partial object issue",
+          "node_id": "func:django/utils/decorators.py:_update_method_wrapper:13",
+          "role": "target"
+        }
+      ],
+      "failure_seen": "AttributeError: 'functools.partial' object has no attribute '__name__' when using method_decorator with a decorator that accesses func.__name__",
+      "intent_analysis": "The issue arises because functools.partial objects don't have attributes like __name__. The solution is to ensure these attributes are properly set or preserved when creating the bound_method in _multi_decorate, possibly by copying them from the original method before creating the partial object.",
+      "target_nodes": [
+        "func:django/utils/decorators.py:_multi_decorate:22",
+        "func:django/utils/decorators.py:_update_method_wrapper:13"
+      ]
+    },
+    "tool": "repair_propose"
+  },
+  "result": {
+    "cgm_payload": {
+      "cgm_insight_count": 0,
+      "dispatch_table_count": 0,
+      "edge_count": 6,
+      "has_adjacency_list": true,
+      "has_prompt": true,
+      "has_subgraph": true,
+      "issue_body_chars": 1497,
+      "issue_id": "django__django-14787",
+      "issue_title_present": true,
+      "node_count": 6,
+      "node_paths": [
+        "django/utils/decorators.py"
+      ],
+      "pending_patch_present": false,
+      "plan_target_count": 2,
+      "plan_targets": [
+        "django/utils/decorators.py:22-50",
+        "django/utils/decorators.py:13-19"
+      ],
+      "plan_text_chars": 2010,
+      "planner_confidence": 0.8,
+      "prompt_chars": 746,
+      "repair_history_count": 0,
+      "selected_fix_contract_present": false,
+      "serialized_code_count": 2,
+      "snippet_context_count": 0,
+      "snippet_count": 2,
+      "snippet_target_count": 2
+    },
+    "cgm_response": {
+      "model": "qwen3-235b-a22b-thinking-2507",
+      "output_format": "json_patch",
+      "raw_preview": "{\n  \"summary\": \"Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper\",\n  \"edits\": [\n    {\n      \"path\": \"django/utils/decorators.py\",\n      \"start\": 40,\n      \"end\": 42,\n      \"new_text\": \"        def bound_method(*args, **kwargs):\\\\n            return method.__get__(self, type(self))(*args, **kwargs)\\\\n        update_wrapper(bound_method, method)\\\\n        for dec in decorators:\\\\n            bound_method = dec(bound_method)\"\n    }\n  ]\n}",
+      "reasoning_chars": 31300,
+      "reasoning_preview": "We are given an issue: when using `method_decorator` with a decorator that accesses `func.__name__` (or other function attributes), it fails because the `func` passed to the decorator is a `functools.partial` object which doesn't have these attributes.\n\nLooking at the provided code snippets:\n\nIn `django/utils/decorators.py`, the function `_multi_decorate` (lines 22-50) is used to apply decorators to a method. The key part is:\n\n```python\n   40:         bound_method = partial(method.__get__(self, type(self)))\n   41:         for dec in decorators:\n   42:             bound_method = dec(bound_method)\n```\n\nHere, `bound_method` is a `partial` object. When we pass this to a decorator (like the `logger` in the example), the decorator tries to access `func.__name__` but `bound_method` (which is a `partial`) doesn't have `__name__`.\n\nThe problem is that the `partial` object does not have the same attributes as a function. The solution is to ensure that the `bound_method` (which is a `partial`) has the necessary function attributes (like `__name__`, `__module__`, etc.) set appropriately.\n\nHowever, note that the `partial` object itself does not have these attributes. We cannot set them on the `",
+      "thinking_enabled": true
+    },
+    "done": false,
+    "patch_preview": {
+      "edit_count": 1,
+      "edits": [
+        {
+          "end": 42,
+          "new_text": "def bound_method(*args, **kwargs):\n            return method.__get__(self, type(self))(*args, **kwargs)\n        update_wrapper(bound_method, method)\n        for dec in decorators:\n            bound_method = dec(bound_method)",
+          "path": "django/utils/decorators.py",
+          "start": 40
+        }
+      ],
+      "summary": "Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper"
+    },
+    "pending_patch_summary": {
+      "origin": "{\"cgm_response\": {\"model\": \"qwen3-235b-a22b-thinking-2507\", \"output_format\": \"json_patch\", \"raw_preview\": \"{\\n  \\\"summary\\\": \\\"Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper\\\",\\n  \\\"edits\\\": [\\n    {\\n      \\\"path\\\": \\\"django/utils/decorators.py\\\",\\n      \\\"start\\\": 40,\\n      \\\"end\\\": 42,\\n      \\\"new_text\\\": \\\"        def bound_method(*args, **kwargs):\\\\\\\\n            return method.__get__(self, type(self))(*args, **kwargs)\\\\\\\\n        update_wrapper(bound_method, method)\\\\\\\\n        for dec in decorators:\\\\\\\\n            bound_method = dec(bound_method)\\\"\\n    }\\n  ]\\n}\", \"reasoning_chars\": 31300, \"reasoning_preview\": \"We are given an issue: when using `method_decorator` with a decorator that accesses `func.__name__` (or other function attributes), it fails because the `func` passed to the decorator is a `functools.partial` object which doesn't have these attributes.\\n\\nLooking at the provided code snippets:\\n\\nIn `django/utils/decorators.py`, the function `_multi_decorate` (lines 22-50) is used to apply decorators to a method. The key part is:\\n\\n```python\\n   40:         bound_method = partial(method.__get__(self, type(self)))\\n   41:         for dec in decorators:\\n   42:             bound_method = dec(bound_method)\\n```\\n\\nHere, `bound_method` is a `partial` object. When we pass this to a decorator (like the `logger` in the example), the decorator tries to access `func.__name__` but `bound_method` (which is a `partial`) doesn't have `__name__`.\\n\\nThe problem is that the `partial` object does not have the same attributes as a function. The solution is to ensure that the `bound_method` (which is a `partial`) has the necessary function attributes (like `__name__`, `__module__`,...<truncated 1198 chars>",
+      "patch_preview": {
+        "edit_count": 1,
+        "edits": [
+          {
+            "end": 42,
+            "new_text": "def bound_method(*args, **kwargs):\n            return method.__get__(self, type(self))(*args, **kwargs)\n        update_wrapper(bound_method, method)\n        for dec in decorators:\n            bound_method = dec(bound_method)",
+            "path": "django/utils/decorators.py",
+            "start": 40
+          }
+        ],
+        "summary": "Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper"
+      },
+      "summary": "Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper",
+      "touched_paths": [
+        "django/utils/decorators.py"
+      ]
+    },
+    "rolled_back": true,
+    "source_tree_state": "unchanged_pending_patch_saved",
+    "status": "patch_proposed",
+    "summary": "Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper",
+    "tool": "repair_propose",
+    "touched_paths": [
+      "django/utils/decorators.py"
+    ]
+  },
+  "step": 6,
+  "visible_thinking": "The issue is that `method_decorator()` does not preserve wrapper assignments when the decorated function is a `functools.partial` object, which lacks attributes like `__name__` and `__module__`. The error occurs because the `logger` decorator tries to access `func.__name__`, but `func` is a partial object.\nFrom the code I've read, `_multi_decorate` creates a `_wrapper` function and uses `update_wrapper` to copy attributes from the original `method` to `_wrapper`. However, the problem seems to be that when the decorator is applied to a partial object (as done in line 40 with `bound_method = partial(method.__get__(self, type(self)))`), the `bound_method` doesn't have the expected function attributes.\nLooking at `_update_method_wrapper`, it applies the decorator to a dummy function to get attributes, but this might not be sufficient when dealing with partial objects.\nI need to ensure that the wrapper preserves the necessary attributes even when the original function is a partial object. The fix likely involves modifying how attributes are copied or ensuring that the partial object gets the required attributes before being passed to the decorator.\nLet me check if there are any other related functions or mechanisms that handle this.\nSince I have the core functions in memory, I'll proceed with proposing a repair."
+}
+```
+
+## planner_step
+
+```json
+{
+  "action": {
+    "params": {
+      "decision": "The pending patch replaces the functools.partial object with a proper function that has attributes copied via update_wrapper, which should resolve the AttributeError when decorators try to access func.__name__. The patch targets the correct location (_multi_decorate function) where the partial object is created."
+    },
+    "tool": "repair_submit"
+  },
+  "result": {
+    "cgm_response": {
+      "model": "qwen3-235b-a22b-thinking-2507",
+      "output_format": "json_patch",
+      "raw_preview": "{\n  \"summary\": \"Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper\",\n  \"edits\": [\n    {\n      \"path\": \"django/utils/decorators.py\",\n      \"start\": 40,\n      \"end\": 42,\n      \"new_text\": \"        def bound_method(*args, **kwargs):\\\\n            return method.__get__(self, type(self))(*args, **kwargs)\\\\n        update_wrapper(bound_method, method)\\\\n        for dec in decorators:\\\\n            bound_method = dec(bound_method)\"\n    }\n  ]\n}",
+      "reasoning_chars": 31300,
+      "reasoning_preview": "We are given an issue: when using `method_decorator` with a decorator that accesses `func.__name__` (or other function attributes), it fails because the `func` passed to the decorator is a `functools.partial` object which doesn't have these attributes.\n\nLooking at the provided code snippets:\n\nIn `django/utils/decorators.py`, the function `_multi_decorate` (lines 22-50) is used to apply decorators to a method. The key part is:\n\n```python\n   40:         bound_method = partial(method.__get__(self, type(self)))\n   41:         for dec in decorators:\n   42:             bound_method = dec(bound_method)\n```\n\nHere, `bound_method` is a `partial` object. When we pass this to a decorator (like the `logger` in the example), the decorator tries to access `func.__name__` but `bound_method` (which is a `partial`) doesn't have `__name__`.\n\nThe problem is that the `partial` object does not have the same attributes as a function. The solution is to ensure that the `bound_method` (which is a `partial`) has the necessary function attributes (like `__name__`, `__module__`, etc.) set appropriately.\n\nHowever, note that the `partial` object itself does not have these attributes. We cannot set them on the `",
+      "thinking_enabled": true
+    },
+    "done": true,
+    "patch_preview": {
+      "edit_count": 1,
+      "edits": [
+        {
+          "end": 42,
+          "new_text": "def bound_method(*args, **kwargs):\n            return method.__get__(self, type(self))(*args, **kwargs)\n        update_wrapper(bound_method, method)\n        for dec in decorators:\n            bound_method = dec(bound_method)",
+          "path": "django/utils/decorators.py",
+          "start": 40
+        }
+      ],
+      "summary": "Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper"
+    },
+    "rolled_back": false,
+    "status": "passed",
+    "submit_decision": "The pending patch replaces the functools.partial object with a proper function that has attributes copied via update_wrapper, which should resolve the AttributeError when decorators try to access func.__name__. The patch targets the correct location (_multi_decorate function) where the partial object is created.",
+    "summary": "Fix method_decorator to preserve function attributes by replacing partial with a function that has attributes copied via update_wrapper",
+    "test_summary": {
+      "command": "<official SWE-bench eval command omitted; contains benchmark harness setup/test patch>",
+      "command_omitted_for_benchmark_hygiene": true,
+      "excerpt": "Actual runtime failure summary (benchmark expected values omitted):",
+      "implementation_frames": [],
+      "parser_error": "missing version for SWE-bench log parser",
+      "resolved": null,
+      "returncode": 0,
+      "runtime_observations": {
+        "actual_assertion_values": [],
+        "actual_messages": [],
+        "exception_types": [],
+        "failed_selectors": [],
+        "omitted_hidden_expected_values": false,
+        "policy": "actual runtime output only; benchmark test source and hidden expected values are omitted"
+      },
+      "status": "passed",
+      "tests_status": {}
+    },
+    "tool": "repair_submit",
+    "touched_paths": [
+      "django/utils/decorators.py"
+    ]
+  },
+  "step": 7,
+  "visible_thinking": "Let me analyze the current situation:\n\n1. I have a pending patch that was proposed by `repair_propose`\n2. The patch attempts to fix the issue by replacing the `partial` object with a proper function that has attributes copied via `update_wrapper`\n3. The patch modifies the `_multi_decorate` function in `django/utils/decorators.py`\n4. Looking at the proposed patch, it replaces lines 40-42 with a new implementation that creates a proper function instead of using `partial`\n\nLet me examine the current code more carefully to understand if this patch is correct:\n\nIn the `_multi_decorate` function (lines 22-50), the problematic code is at lines 40-42:\n```python\nbound_method = partial(method.__get__(self, type(self)))\nfor dec in decorators:\n    bound_method = dec(bound_method)\n```\n\nThe issue is that `bound_method` is a `functools.partial` object, which doesn't have attributes like `__name__`, `__module__`, etc. When decorators try to access these attributes, they fail.\n\nThe proposed patch replaces this with:\n```python\ndef bound_method(*args, **kwargs):\n    return method.__get__(self, type(self))(*args, **kwargs)\nupdate_wrapper(bound_method, method)\nfor dec in decorators:\n    bound_method = dec(bound_method)\n```\n\nThis approach creates a proper function instead of a partial object, and uses `update_wrapper` to copy attributes from the original method. This should resolve the issue.\n\nHowever, I need to check if this patch is complete and correct. Let me look at the error from the test run - it shows \"None != 'method'\" which suggests there might be some assertion failing, but it's not directly related to the AttributeError we're trying to fix.\n\nSince the patch looks reasonable and addresses the core issue (replacing partial with a proper function that has the required attributes), I should submit it for testing."
+}
+```
